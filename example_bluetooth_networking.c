@@ -1,9 +1,9 @@
 #include <stdio.h>
-#include <stdbool.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <bluetooth/bluetooth.h>
@@ -11,401 +11,372 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 
-#define MAX_DEVICES 10
-#define SCAN_TIME 5
+#define MAX_CONNECTIONS 10
 #define RFCOMM_CHANNEL 1
+#define MAX_NAME 248
+#define SCAN_INTERVAL 10
+#define SERVICE_UUID "00001101-0000-1000-8000-00805F9B34FB" // Serial Port Profile
 
-volatile bool listener_ready = false;
-volatile bool stop_scanning = false;
+typedef struct {
+    int sock;
+    bdaddr_t addr;
+    char name[MAX_NAME];
+    int active;
+    pthread_t thread;
+} connection_t;
 
-// Set adapter to use Just Works (no pairing required)
-int set_simple_pairing_mode(int hci_sock) {
-    struct hci_request rq;
-    uint8_t mode = 0x01; // Enable Simple Pairing
-    uint8_t status;
+typedef struct {
+    connection_t connections[MAX_CONNECTIONS];
+    int conn_count;
+    pthread_mutex_t mutex;
+    int server_sock;
+    int running;
+} node_state_t;
 
-    memset(&rq, 0, sizeof(rq));
-    rq.ogf = OGF_HOST_CTL;
-    rq.ocf = 0x0056; // OCF_WRITE_SIMPLE_PAIRING_MODE
-    rq.cparam = &mode;
-    rq.clen = sizeof(mode);
-    rq.rparam = &status;
-    rq.rlen = 1;
+node_state_t g_state = {0};
 
-    if (hci_send_req(hci_sock, &rq, 1000) < 0) {
-        return -1;
-    }
+// Function prototypes
+void* connection_handler(void* arg);
+void* server_thread(void* arg);
+void* scanner_thread(void* arg);
+void cleanup_connection(connection_t* conn);
+int is_already_connected(bdaddr_t* addr);
+void send_message(int sock, const char* msg);
 
-    return status;
+void signal_handler(int sig) {
+    printf("\nShutting down gracefully...\n");
+    g_state.running = 0;
 }
 
-// Disable authentication requirement
-int set_no_security(int sock) {
-    struct bt_security bt_sec;
-    socklen_t len = sizeof(bt_sec);
-
-    memset(&bt_sec, 0, sizeof(bt_sec));
-    bt_sec.level = BT_SECURITY_LOW; // No authentication/encryption required
-
-    if (setsockopt(sock, SOL_BLUETOOTH, BT_SECURITY, &bt_sec, sizeof(bt_sec)) < 0) {
-        perror("Warning: Could not set security level");
-        return -1;
-    }
-
-    return 0;
-}
-
-// Make adapter discoverable and connectable
-int make_discoverable(int dev_id) {
-    int hci_sock = hci_open_dev(dev_id);
-    if (hci_sock < 0) {
-        return -1;
-    }
-
-    // Enable Simple Pairing (Just Works)
-    if (set_simple_pairing_mode(hci_sock) < 0) {
-        fprintf(stderr, "Note: Could not enable Simple Pairing mode\n");
-    } else {
-        printf("Simple Pairing (Just Works) enabled\n");
-    }
-
-    // Set to discoverable and connectable
-    uint8_t scan_mode = SCAN_PAGE | SCAN_INQUIRY;
-    struct hci_request rq;
-    uint8_t scan_enable = scan_mode;
-
-    memset(&rq, 0, sizeof(rq));
-    rq.ogf = OGF_HOST_CTL;
-    rq.ocf = OCF_WRITE_SCAN_ENABLE;
-    rq.cparam = &scan_enable;
-    rq.clen = sizeof(scan_enable);
-    rq.rparam = NULL;
-    rq.rlen = 0;
-
-    if (hci_send_req(hci_sock, &rq, 1000) < 0) {
-        fprintf(stderr, "Warning: Could not set discoverable mode: %s\n", strerror(errno));
-        close(hci_sock);
-        return -1;
-    }
-
-    printf("Bluetooth adapter set to DISCOVERABLE and CONNECTABLE mode\n");
-    close(hci_sock);
-    return 0;
-}
-
-void* listener_thread(void* arg) {
-    struct sockaddr_rc loc_addr = {0}, rem_addr = {0};
-    char buf[1024] = {0};
-    int s, client, bytes_read;
-    socklen_t opt = sizeof(rem_addr);
-    int dev_id;
-
-    dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("Failed to get device ID");
-        return NULL;
-    }
-
-    int hci_sock = hci_open_dev(dev_id);
-    if (hci_sock >= 0) {
-        struct hci_dev_info di;
-        if (hci_devinfo(dev_id, &di) == 0) {
-            printf("Local device: %s (%s)\n", di.name, batostr(&di.bdaddr));
+void cleanup_connection(connection_t* conn) {
+    if (conn->active) {
+        conn->active = 0;
+        if (conn->sock >= 0) {
+            close(conn->sock);
+            conn->sock = -1;
         }
-        close(hci_sock);
     }
+}
 
-    // Make discoverable
-    make_discoverable(dev_id);
-
-    s = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
-    if (s < 0) {
-        perror("Listener socket creation failed");
-        return NULL;
+int is_already_connected(bdaddr_t* addr) {
+    pthread_mutex_lock(&g_state.mutex);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (g_state.connections[i].active &&
+            bacmp(&g_state.connections[i].addr, addr) == 0) {
+            pthread_mutex_unlock(&g_state.mutex);
+            return 1;
+        }
     }
+    pthread_mutex_unlock(&g_state.mutex);
+    return 0;
+}
 
-    // Set to low security - no pairing required
-    set_no_security(s);
-
-    // Allow socket reuse
-    int reuse = 1;
-    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        perror("setsockopt SO_REUSEADDR failed");
+void send_message(int sock, const char* msg) {
+    if (sock >= 0) {
+        int len = strlen(msg);
+        if (write(sock, msg, len) < 0) {
+            perror("Failed to send message");
+        }
     }
+}
 
-    // Set non-blocking accept with timeout
-    struct timeval tv;
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+void* connection_handler(void* arg) {
+    connection_t* conn = (connection_t*)arg;
+    char buffer[1024];
+    int bytes;
 
-    loc_addr.rc_family = AF_BLUETOOTH;
-    loc_addr.rc_bdaddr = *BDADDR_ANY;
-    loc_addr.rc_channel = RFCOMM_CHANNEL;
+    printf("Connection handler started for %s\n", conn->name);
 
-    if (bind(s, (struct sockaddr *)&loc_addr, sizeof(loc_addr)) < 0) {
-        perror("Listener bind failed");
-        close(s);
-        return NULL;
-    }
+    // Send initial greeting
+    char greeting[256];
+    snprintf(greeting, sizeof(greeting), "HELLO from node\n");
+    send_message(conn->sock, greeting);
 
-    if (listen(s, 5) < 0) {
-        perror("Listener failed");
-        close(s);
-        return NULL;
-    }
+    // Keep connection alive and handle incoming messages
+    while (g_state.running && conn->active) {
+        memset(buffer, 0, sizeof(buffer));
+        bytes = read(conn->sock, buffer, sizeof(buffer) - 1);
 
-    printf("Listening on RFCOMM channel %d (NO PAIRING REQUIRED)\n", RFCOMM_CHANNEL);
-    printf("Ready to accept connections!\n\n");
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            printf("Received from %s: %s\n", conn->name, buffer);
 
-    listener_ready = true;
-
-    while (true) {
-        client = accept(s, (struct sockaddr *)&rem_addr, &opt);
-        if (client < 0) {
+            // Echo back or send acknowledgment
+            char response[1024];
+            snprintf(response, sizeof(response), "ACK: %s", buffer);
+            send_message(conn->sock, response);
+        } else if (bytes == 0) {
+            printf("Connection closed by %s\n", conn->name);
+            break;
+        } else if (bytes < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Timeout - this is normal, continue
+                usleep(100000); // 100ms
                 continue;
             }
+            perror("Read error");
+            break;
+        }
+    }
+
+    printf("Connection handler ending for %s\n", conn->name);
+    cleanup_connection(conn);
+    return NULL;
+}
+
+void* server_thread(void* arg) {
+    struct sockaddr_rc loc_addr = {0}, rem_addr = {0};
+    socklen_t opt = sizeof(rem_addr);
+
+    // Create server socket
+    g_state.server_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if (g_state.server_sock < 0) {
+        perror("Failed to create server socket");
+        return NULL;
+    }
+
+    // Bind to local adapter
+    loc_addr.rc_family = AF_BLUETOOTH;
+    loc_addr.rc_bdaddr = *BDADDR_ANY;
+    loc_addr.rc_channel = (uint8_t)RFCOMM_CHANNEL;
+
+    if (bind(g_state.server_sock, (struct sockaddr*)&loc_addr, sizeof(loc_addr)) < 0) {
+        perror("Failed to bind server socket");
+        close(g_state.server_sock);
+        return NULL;
+    }
+
+    // Listen for connections
+    if (listen(g_state.server_sock, 5) < 0) {
+        perror("Failed to listen");
+        close(g_state.server_sock);
+        return NULL;
+    }
+
+    printf("Server listening on RFCOMM channel %d\n", RFCOMM_CHANNEL);
+
+    while (g_state.running) {
+        int client = accept(g_state.server_sock, (struct sockaddr*)&rem_addr, &opt);
+        if (client < 0) {
+            if (!g_state.running) break;
             perror("Accept failed");
             continue;
         }
 
-        // Got a connection!
-        stop_scanning = true; // Signal to stop scanning when we get a connection
-
-        // Set security on accepted connection too
-        set_no_security(client);
-
-        char addr_str[18];
-        ba2str(&rem_addr.rc_bdaddr, addr_str);
-        printf("\n*** INCOMING CONNECTION from %s ***\n", addr_str);
-
-        memset(buf, 0, sizeof(buf));
-        bytes_read = read(client, buf, sizeof(buf) - 1);
-        if (bytes_read > 0) {
-            buf[bytes_read] = '\0';
-            printf("RECEIVED: %s\n", buf);
-
-            // Send acknowledgment
-            const char *ack = "Message received!";
-            write(client, ack, strlen(ack));
-            printf("Sent acknowledgment\n");
-        } else if (bytes_read == 0) {
-            printf("Connection closed by %s\n", addr_str);
-        } else {
-            perror("Read failed");
+        // Check if already connected
+        if (is_already_connected(&rem_addr.rc_bdaddr)) {
+            printf("Already connected to this device\n");
+            close(client);
+            continue;
         }
 
-        close(client);
-        printf("*** Connection closed ***\n\n");
+        // Find free slot
+        pthread_mutex_lock(&g_state.mutex);
+        int slot = -1;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (!g_state.connections[i].active) {
+                slot = i;
+                break;
+            }
+        }
 
-        stop_scanning = false;
+        if (slot >= 0) {
+            connection_t* conn = &g_state.connections[slot];
+            conn->sock = client;
+            conn->addr = rem_addr.rc_bdaddr;
+            conn->active = 1;
+            ba2str(&rem_addr.rc_bdaddr, conn->name);
+
+            printf("Accepted connection from %s\n", conn->name);
+
+            pthread_create(&conn->thread, NULL, connection_handler, conn);
+            pthread_detach(conn->thread);
+        } else {
+            printf("No free connection slots\n");
+            close(client);
+        }
+        pthread_mutex_unlock(&g_state.mutex);
     }
 
-    close(s);
+    close(g_state.server_sock);
     return NULL;
 }
 
-int scan_devices(inquiry_info **devices, int dev_id) {
-    int sock, num_rsp;
-    int max_rsp = MAX_DEVICES;
-    int flags = IREQ_CACHE_FLUSH;
-
-    sock = hci_open_dev(dev_id);
-    if (sock < 0) {
-        perror("Opening HCI socket for scan");
-        return -1;
-    }
-
-    *devices = (inquiry_info*)malloc(max_rsp * sizeof(inquiry_info));
-    printf("Scanning for devices (%d sec)...\n", SCAN_TIME);
-
-    // Temporarily disable discoverable mode during scan
-    uint8_t scan_mode = SCAN_PAGE; // Only page scan (connectable but not discoverable)
-    struct hci_request rq;
-    memset(&rq, 0, sizeof(rq));
-    rq.ogf = OGF_HOST_CTL;
-    rq.ocf = OCF_WRITE_SCAN_ENABLE;
-    rq.cparam = &scan_mode;
-    rq.clen = sizeof(scan_mode);
-    hci_send_req(sock, &rq, 1000);
-
-    num_rsp = hci_inquiry(dev_id, SCAN_TIME, max_rsp, NULL, devices, flags);
-
-    // Re-enable discoverable mode after scan
-    make_discoverable(dev_id);
-
-    if (num_rsp < 0) {
-        perror("HCI inquiry failed");
-        close(sock);
-        free(*devices);
-        return -1;
-    }
-
-    printf("Found %d device(s)\n", num_rsp);
-
-    for (int i = 0; i < num_rsp; i++) {
-        char addr[19] = {0};
-        char name[248] = {0};
-
-        ba2str(&((*devices)[i].bdaddr), addr);
-
-        if (hci_read_remote_name(sock, &((*devices)[i].bdaddr), sizeof(name), name, 0) < 0) {
-            strcpy(name, "[unknown]");
-        }
-
-        printf("  [%d] %s - %s\n", i, addr, name);
-    }
-
-    close(sock);
-    return num_rsp;
-}
-
-int send_message(bdaddr_t *dest_addr, const char *message) {
-    struct sockaddr_rc addr = {0};
-    int sock;
-    char addr_str[18];
-    char buf[1024] = {0};
-
-    ba2str(dest_addr, addr_str);
-    printf("\n>>> Connecting to %s on channel %d...\n", addr_str, RFCOMM_CHANNEL);
-
-    sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
-    if (sock < 0) {
-        perror("Send socket creation failed");
-        return -1;
-    }
-
-    // Set to low security - no pairing required
-    set_no_security(sock);
-
-    // Set connection timeout
-    struct timeval timeout;
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-    addr.rc_family = AF_BLUETOOTH;
-    addr.rc_channel = RFCOMM_CHANNEL;
-    addr.rc_bdaddr = *dest_addr;
-
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        printf("Could not connect to %s: %s\n", addr_str, strerror(errno));
-        close(sock);
-        return -1;
-    }
-
-    printf(">>> Connected! Sending message...\n");
-
-    if (write(sock, message, strlen(message)) < 0) {
-        perror("Send failed");
-        close(sock);
-        return -1;
-    }
-
-    printf(">>> Message sent: \"%s\"\n", message);
-
-    // Wait for response
-    int bytes_read = read(sock, buf, sizeof(buf) - 1);
-    if (bytes_read > 0) {
-        buf[bytes_read] = '\0';
-        printf(">>> Response: %s\n", buf);
-    } else if (bytes_read == 0) {
-        printf(">>> Connection closed by remote device\n");
-    }
-
-    close(sock);
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        printf("Usage: %s \"message\" [bluetooth_address]\n", argv[0]);
-        printf("  If bluetooth_address is provided, will only send to that device\n");
-        printf("  Otherwise, will scan and send to all discovered devices\n");
-        return EXIT_FAILURE;
-    }
-
-    const char *message = argv[1];
-    const char *target_addr = (argc >= 3) ? argv[2] : NULL;
-    pthread_t listener;
-    int dev_id;
-
-    printf("===========================================\n");
-    printf("Bluetooth RFCOMM Messaging (Just Works)\n");
-    printf("===========================================\n");
-    printf("Message: \"%s\"\n", message);
-    if (target_addr) {
-        printf("Target: %s\n", target_addr);
-    } else {
-        printf("Mode: Scan and broadcast\n");
-    }
-    printf("===========================================\n\n");
+void* scanner_thread(void* arg) {
+    inquiry_info* devices = NULL;
+    int dev_id, sock, num_devices;
+    char addr[19] = {0};
+    char name[MAX_NAME] = {0};
 
     dev_id = hci_get_route(NULL);
     if (dev_id < 0) {
         perror("No Bluetooth adapter found");
-        return EXIT_FAILURE;
+        return NULL;
     }
 
-    printf("Starting listener thread...\n");
-    if (pthread_create(&listener, NULL, listener_thread, NULL) != 0) {
-        perror("Failed to create listener thread");
-        return EXIT_FAILURE;
+    sock = hci_open_dev(dev_id);
+    if (sock < 0) {
+        perror("Failed to open HCI socket");
+        return NULL;
     }
 
-    // Wait for listener to be ready
-    while (!listener_ready) {
-        usleep(100000);
-    }
-    printf("Listener ready!\n\n");
+    printf("Scanner started\n");
 
-    // Wait a bit more to ensure other device can discover us
-    sleep(2);
+    while (g_state.running) {
+        printf("Scanning for devices...\n");
 
-    // If specific address provided, send only to that device
-    if (target_addr) {
-        bdaddr_t dest_addr;
-        if (str2ba(target_addr, &dest_addr) < 0) {
-            fprintf(stderr, "Invalid Bluetooth address: %s\n", target_addr);
-            return EXIT_FAILURE;
+        devices = (inquiry_info*)malloc(255 * sizeof(inquiry_info));
+        if (!devices) {
+            perror("Failed to allocate memory");
+            sleep(SCAN_INTERVAL);
+            continue;
         }
 
-        while (true) {
-            if (!stop_scanning) {
-                send_message(&dest_addr, message);
+        num_devices = hci_inquiry(dev_id, 8, 255, NULL, &devices, IREQ_CACHE_FLUSH);
+        if (num_devices < 0) {
+            perror("Inquiry failed");
+            free(devices);
+            sleep(SCAN_INTERVAL);
+            continue;
+        }
+
+        printf("Found %d device(s)\n", num_devices);
+
+        for (int i = 0; i < num_devices; i++) {
+            ba2str(&devices[i].bdaddr, addr);
+            memset(name, 0, sizeof(name));
+
+            if (hci_read_remote_name(sock, &devices[i].bdaddr, sizeof(name), name, 0) < 0)
+                strcpy(name, "Unknown");
+
+            printf("  %s - %s\n", addr, name);
+
+            // Check if already connected
+            if (is_already_connected(&devices[i].bdaddr)) {
+                continue;
             }
-            sleep(5);
-        }
-    } else {
-        // Scan and send to all devices
-        while (true) {
-            if (!stop_scanning) {
-                inquiry_info *devices = NULL;
-                int num_devices = scan_devices(&devices, dev_id);
 
-                if (num_devices > 0) {
-                    printf("\nSending to %d device(s)...\n", num_devices);
-                    for (int i = 0; i < num_devices && !stop_scanning; i++) {
-                        send_message(&(devices[i].bdaddr), message);
-                        sleep(1);
+            // Try to connect
+            struct sockaddr_rc addr_rc = {0};
+            int client_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+            if (client_sock < 0) continue;
+
+            addr_rc.rc_family = AF_BLUETOOTH;
+            addr_rc.rc_channel = (uint8_t)RFCOMM_CHANNEL;
+            addr_rc.rc_bdaddr = devices[i].bdaddr;
+
+            printf("  Attempting to connect to %s...\n", addr);
+
+            if (connect(client_sock, (struct sockaddr*)&addr_rc, sizeof(addr_rc)) == 0) {
+                printf("  Successfully connected to %s\n", name);
+
+                pthread_mutex_lock(&g_state.mutex);
+                int slot = -1;
+                for (int j = 0; j < MAX_CONNECTIONS; j++) {
+                    if (!g_state.connections[j].active) {
+                        slot = j;
+                        break;
                     }
+                }
+
+                if (slot >= 0) {
+                    connection_t* conn = &g_state.connections[slot];
+                    conn->sock = client_sock;
+                    conn->addr = devices[i].bdaddr;
+                    conn->active = 1;
+                    strncpy(conn->name, name, MAX_NAME - 1);
+
+                    pthread_create(&conn->thread, NULL, connection_handler, conn);
+                    pthread_detach(conn->thread);
                 } else {
-                    printf("No devices found.\n");
+                    close(client_sock);
                 }
-
-                if (devices) {
-                    free(devices);
-                }
+                pthread_mutex_unlock(&g_state.mutex);
+            } else {
+                close(client_sock);
             }
+        }
 
-            printf("\nWaiting 10 seconds...\n\n");
-            sleep(10);
+        free(devices);
+
+        // Wait before next scan
+        for (int i = 0; i < SCAN_INTERVAL && g_state.running; i++) {
+            sleep(1);
         }
     }
 
-    pthread_join(listener, NULL);
-    return EXIT_SUCCESS;
+    close(sock);
+    return NULL;
+}
+
+int main(int argc, char** argv) {
+    pthread_t server_tid, scanner_tid;
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    printf("Bluetooth Mesh Node Starting...\n");
+    printf("This node will scan for and connect to other nodes\n");
+    printf("Press Ctrl+C to exit\n\n");
+
+    // Initialize state
+    pthread_mutex_init(&g_state.mutex, NULL);
+    g_state.running = 1;
+    g_state.server_sock = -1;
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        g_state.connections[i].sock = -1;
+        g_state.connections[i].active = 0;
+    }
+
+    // Start server thread
+    if (pthread_create(&server_tid, NULL, server_thread, NULL) != 0) {
+        perror("Failed to create server thread");
+        return 1;
+    }
+
+    // Start scanner thread
+    if (pthread_create(&scanner_tid, NULL, scanner_thread, NULL) != 0) {
+        perror("Failed to create scanner thread");
+        g_state.running = 0;
+        pthread_join(server_tid, NULL);
+        return 1;
+    }
+
+    // Main loop - could add interactive commands here
+    while (g_state.running) {
+        sleep(1);
+
+        // Optional: Send periodic keepalive or status messages
+        pthread_mutex_lock(&g_state.mutex);
+        int active_count = 0;
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (g_state.connections[i].active) {
+                active_count++;
+            }
+        }
+        pthread_mutex_unlock(&g_state.mutex);
+
+        // Print status every 30 seconds
+        static int counter = 0;
+        if (++counter >= 30) {
+            printf("Active connections: %d\n", active_count);
+            counter = 0;
+        }
+    }
+
+    // Cleanup
+    printf("Cleaning up...\n");
+    pthread_join(scanner_tid, NULL);
+    pthread_join(server_tid, NULL);
+
+    pthread_mutex_lock(&g_state.mutex);
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        cleanup_connection(&g_state.connections[i]);
+    }
+    pthread_mutex_unlock(&g_state.mutex);
+
+    pthread_mutex_destroy(&g_state.mutex);
+
+    printf("Shutdown complete\n");
+    return 0;
 }
