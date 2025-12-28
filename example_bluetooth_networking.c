@@ -6,16 +6,19 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
+#include <bluetooth/sdp.h>
+#include <bluetooth/sdp_lib.h>
 
 #define MAX_CONNECTIONS 10
 #define RFCOMM_CHANNEL 1
 #define MAX_NAME 248
 #define SCAN_INTERVAL 10
-#define SERVICE_UUID "00001101-0000-1000-8000-00805F9B34FB" // Serial Port Profile
+#define SERVICE_UUID "00001101-0000-1000-8000-00805F9B34FB"
 
 typedef struct {
     int sock;
@@ -31,6 +34,7 @@ typedef struct {
     pthread_mutex_t mutex;
     int server_sock;
     int running;
+    sdp_session_t* sdp_session;
 } node_state_t;
 
 node_state_t g_state = {0};
@@ -42,10 +46,105 @@ void* scanner_thread(void* arg);
 void cleanup_connection(connection_t* conn);
 int is_already_connected(bdaddr_t* addr);
 void send_message(int sock, const char* msg);
+sdp_session_t* register_service(uint8_t rfcomm_channel);
+int set_discoverable(int enable);
 
 void signal_handler(int sig) {
     printf("\nShutting down gracefully...\n");
     g_state.running = 0;
+}
+
+int set_discoverable(int enable) {
+    // Use system command as a simple fallback
+    // This requires hciconfig to be installed
+    int result;
+    if (enable) {
+        result = system("hciconfig hci0 piscan 2>/dev/null");
+    } else {
+        result = system("hciconfig hci0 noscan 2>/dev/null");
+    }
+
+    if (result == 0) {
+        printf("Bluetooth adapter set to %s mode\n", enable ? "discoverable" : "non-discoverable");
+        return 0;
+    } else {
+        fprintf(stderr, "Warning: Failed to set scan mode via hciconfig\n");
+        return -1;
+    }
+}
+
+sdp_session_t* register_service(uint8_t rfcomm_channel) {
+    uuid_t root_uuid, l2cap_uuid, rfcomm_uuid, svc_uuid;
+    sdp_list_t *l2cap_list = 0, *rfcomm_list = 0, *root_list = 0, *proto_list = 0, *access_proto_list = 0;
+    sdp_data_t *channel = 0;
+    sdp_record_t *record = sdp_record_alloc();
+
+    // Set service class
+    sdp_uuid128_create(&svc_uuid, &(const uint128_t){{0}});
+    sdp_set_service_id(record, svc_uuid);
+
+    // Set service name
+    sdp_list_t service_class = {0};
+    sdp_uuid16_create(&root_uuid, SERIAL_PORT_SVCLASS_ID);
+    service_class.data = &root_uuid;
+    sdp_set_service_classes(record, &service_class);
+
+    // Set Bluetooth profile
+    sdp_profile_desc_t profile;
+    sdp_uuid16_create(&profile.uuid, SERIAL_PORT_PROFILE_ID);
+    profile.version = 0x0100;
+    sdp_list_t profile_list = {0};
+    profile_list.data = &profile;
+    sdp_set_profile_descs(record, &profile_list);
+
+    // Make service browseable
+    sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
+    root_list = sdp_list_append(0, &root_uuid);
+    sdp_set_browse_groups(record, root_list);
+
+    // Set L2CAP protocol
+    sdp_uuid16_create(&l2cap_uuid, L2CAP_UUID);
+    l2cap_list = sdp_list_append(0, &l2cap_uuid);
+    proto_list = sdp_list_append(0, l2cap_list);
+
+    // Set RFCOMM protocol
+    sdp_uuid16_create(&rfcomm_uuid, RFCOMM_UUID);
+    channel = sdp_data_alloc(SDP_UINT8, &rfcomm_channel);
+    rfcomm_list = sdp_list_append(0, &rfcomm_uuid);
+    sdp_list_append(rfcomm_list, channel);
+    sdp_list_append(proto_list, rfcomm_list);
+
+    access_proto_list = sdp_list_append(0, proto_list);
+    sdp_set_access_protos(record, access_proto_list);
+
+    // Set service name and description
+    sdp_set_info_attr(record, "BT Mesh Node", "Mesh Node", "Mesh networking node");
+
+    // Register service
+    sdp_session_t *session = sdp_connect(BDADDR_ANY, BDADDR_LOCAL, SDP_RETRY_IF_BUSY);
+    if (!session) {
+        perror("Failed to connect to SDP server");
+        sdp_record_free(record);
+        return NULL;
+    }
+
+    if (sdp_record_register(session, record, 0) < 0) {
+        perror("Service registration failed");
+        sdp_close(session);
+        sdp_record_free(record);
+        return NULL;
+    }
+
+    printf("Service registered on RFCOMM channel %d\n", rfcomm_channel);
+
+    // Cleanup
+    sdp_data_free(channel);
+    sdp_list_free(l2cap_list, 0);
+    sdp_list_free(rfcomm_list, 0);
+    sdp_list_free(root_list, 0);
+    sdp_list_free(access_proto_list, 0);
+
+    return session;
 }
 
 void cleanup_connection(connection_t* conn) {
@@ -103,7 +202,9 @@ void* connection_handler(void* arg) {
 
             // Echo back or send acknowledgment
             char response[1024];
-            snprintf(response, sizeof(response), "ACK: %s", buffer);
+            int response_len = snprintf(response, sizeof(response), "ACK: ");
+            int remaining = sizeof(response) - response_len - 1;
+            strncat(response, buffer, remaining);
             send_message(conn->sock, response);
         } else if (bytes == 0) {
             printf("Connection closed by %s\n", conn->name);
@@ -134,6 +235,12 @@ void* server_thread(void* arg) {
         return NULL;
     }
 
+    // Set socket options for reuse
+    int reuse = 1;
+    if (setsockopt(g_state.server_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        perror("Failed to set SO_REUSEADDR");
+    }
+
     // Bind to local adapter
     loc_addr.rc_family = AF_BLUETOOTH;
     loc_addr.rc_bdaddr = *BDADDR_ANY;
@@ -154,6 +261,12 @@ void* server_thread(void* arg) {
 
     printf("Server listening on RFCOMM channel %d\n", RFCOMM_CHANNEL);
 
+    // Register SDP service
+    g_state.sdp_session = register_service(RFCOMM_CHANNEL);
+    if (!g_state.sdp_session) {
+        fprintf(stderr, "Warning: SDP registration failed, connections may not work\n");
+    }
+
     while (g_state.running) {
         int client = accept(g_state.server_sock, (struct sockaddr*)&rem_addr, &opt);
         if (client < 0) {
@@ -161,6 +274,10 @@ void* server_thread(void* arg) {
             perror("Accept failed");
             continue;
         }
+
+        char addr_str[18];
+        ba2str(&rem_addr.rc_bdaddr, addr_str);
+        printf("Incoming connection from %s\n", addr_str);
 
         // Check if already connected
         if (is_already_connected(&rem_addr.rc_bdaddr)) {
@@ -197,6 +314,9 @@ void* server_thread(void* arg) {
         pthread_mutex_unlock(&g_state.mutex);
     }
 
+    if (g_state.sdp_session) {
+        sdp_close(g_state.sdp_session);
+    }
     close(g_state.server_sock);
     return NULL;
 }
@@ -266,7 +386,8 @@ void* scanner_thread(void* arg) {
 
             printf("  Attempting to connect to %s...\n", addr);
 
-            if (connect(client_sock, (struct sockaddr*)&addr_rc, sizeof(addr_rc)) == 0) {
+            int connect_result = connect(client_sock, (struct sockaddr*)&addr_rc, sizeof(addr_rc));
+            if (connect_result == 0) {
                 printf("  Successfully connected to %s\n", name);
 
                 pthread_mutex_lock(&g_state.mutex);
@@ -292,6 +413,15 @@ void* scanner_thread(void* arg) {
                 }
                 pthread_mutex_unlock(&g_state.mutex);
             } else {
+                int err = errno;
+                printf("  Connection failed: %s (errno: %d)\n", strerror(err), err);
+                if (err == ECONNREFUSED) {
+                    printf("  -> Device may not be running the service or not in discoverable mode\n");
+                } else if (err == EHOSTDOWN) {
+                    printf("  -> Device is not reachable\n");
+                } else if (err == EOPNOTSUPP) {
+                    printf("  -> Authentication/pairing may be required\n");
+                }
                 close(client_sock);
             }
         }
@@ -318,10 +448,17 @@ int main(int argc, char** argv) {
     printf("This node will scan for and connect to other nodes\n");
     printf("Press Ctrl+C to exit\n\n");
 
+    // Make adapter discoverable
+    if (set_discoverable(1) < 0) {
+        fprintf(stderr, "Warning: Failed to set discoverable mode\n");
+        fprintf(stderr, "Try manually: sudo hciconfig hci0 piscan\n");
+    }
+
     // Initialize state
     pthread_mutex_init(&g_state.mutex, NULL);
     g_state.running = 1;
     g_state.server_sock = -1;
+    g_state.sdp_session = NULL;
 
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         g_state.connections[i].sock = -1;
@@ -376,6 +513,9 @@ int main(int argc, char** argv) {
     pthread_mutex_unlock(&g_state.mutex);
 
     pthread_mutex_destroy(&g_state.mutex);
+
+    // Restore discoverable mode
+    set_discoverable(0);
 
     printf("Shutdown complete\n");
     return 0;
