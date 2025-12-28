@@ -48,6 +48,8 @@ int is_already_connected(bdaddr_t* addr);
 void send_message(int sock, const char* msg);
 sdp_session_t* register_service(uint8_t rfcomm_channel);
 int set_discoverable(int enable);
+int pair_device(bdaddr_t* addr);
+int set_bluetooth_security(int sock);
 
 void signal_handler(int sig) {
     printf("\nShutting down gracefully...\n");
@@ -71,6 +73,41 @@ int set_discoverable(int enable) {
         fprintf(stderr, "Warning: Failed to set scan mode via hciconfig\n");
         return -1;
     }
+}
+
+int set_bluetooth_security(int sock) {
+    // Set socket to non-secure mode (no pairing required)
+    struct bt_security bt_sec;
+    memset(&bt_sec, 0, sizeof(bt_sec));
+    bt_sec.level = BT_SECURITY_LOW; // No authentication/encryption
+
+    if (setsockopt(sock, SOL_BLUETOOTH, BT_SECURITY, &bt_sec, sizeof(bt_sec)) < 0) {
+        perror("Failed to set BT_SECURITY_LOW");
+        return -1;
+    }
+
+    return 0;
+}
+
+int pair_device(bdaddr_t* addr) {
+    char addr_str[18];
+    ba2str(addr, addr_str);
+
+    // Try to pair using bluetoothctl
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "echo -e 'pair %s\\ntrust %s\\nquit' | bluetoothctl 2>/dev/null",
+             addr_str, addr_str);
+
+    printf("  Attempting to pair with %s...\n", addr_str);
+    int result = system(cmd);
+
+    if (result == 0) {
+        printf("  Pairing initiated\n");
+        sleep(2); // Give it time to complete
+        return 0;
+    }
+
+    return -1;
 }
 
 sdp_session_t* register_service(uint8_t rfcomm_channel) {
@@ -241,6 +278,9 @@ void* server_thread(void* arg) {
         perror("Failed to set SO_REUSEADDR");
     }
 
+    // Set security to LOW (no pairing required)
+    set_bluetooth_security(g_state.server_sock);
+
     // Bind to local adapter
     loc_addr.rc_family = AF_BLUETOOTH;
     loc_addr.rc_bdaddr = *BDADDR_ANY;
@@ -261,10 +301,11 @@ void* server_thread(void* arg) {
 
     printf("Server listening on RFCOMM channel %d\n", RFCOMM_CHANNEL);
 
-    // Register SDP service
+    // Register SDP service (optional - continue even if it fails)
     g_state.sdp_session = register_service(RFCOMM_CHANNEL);
     if (!g_state.sdp_session) {
-        fprintf(stderr, "Warning: SDP registration failed, connections may not work\n");
+        fprintf(stderr, "Note: SDP registration failed - make sure bluetoothd is running\n");
+        fprintf(stderr, "      Connections may still work without SDP\n");
     }
 
     while (g_state.running) {
@@ -380,6 +421,9 @@ void* scanner_thread(void* arg) {
             int client_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
             if (client_sock < 0) continue;
 
+            // Set security to LOW (no pairing required)
+            set_bluetooth_security(client_sock);
+
             addr_rc.rc_family = AF_BLUETOOTH;
             addr_rc.rc_channel = (uint8_t)RFCOMM_CHANNEL;
             addr_rc.rc_bdaddr = devices[i].bdaddr;
@@ -419,8 +463,45 @@ void* scanner_thread(void* arg) {
                     printf("  -> Device may not be running the service or not in discoverable mode\n");
                 } else if (err == EHOSTDOWN) {
                     printf("  -> Device is not reachable\n");
-                } else if (err == EOPNOTSUPP) {
-                    printf("  -> Authentication/pairing may be required\n");
+                } else if (err == EACCES || err == EPERM) {
+                    printf("  -> Permission denied - trying to pair...\n");
+                    // Try pairing and retry connection
+                    if (pair_device(&devices[i].bdaddr) == 0) {
+                        printf("  -> Retrying connection after pairing...\n");
+                        client_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+                        set_bluetooth_security(client_sock);
+                        addr_rc.rc_family = AF_BLUETOOTH;
+                        addr_rc.rc_channel = (uint8_t)RFCOMM_CHANNEL;
+                        addr_rc.rc_bdaddr = devices[i].bdaddr;
+
+                        if (connect(client_sock, (struct sockaddr*)&addr_rc, sizeof(addr_rc)) == 0) {
+                            printf("  -> Successfully connected after pairing!\n");
+
+                            pthread_mutex_lock(&g_state.mutex);
+                            int slot = -1;
+                            for (int j = 0; j < MAX_CONNECTIONS; j++) {
+                                if (!g_state.connections[j].active) {
+                                    slot = j;
+                                    break;
+                                }
+                            }
+
+                            if (slot >= 0) {
+                                connection_t* conn = &g_state.connections[slot];
+                                conn->sock = client_sock;
+                                conn->addr = devices[i].bdaddr;
+                                conn->active = 1;
+                                strncpy(conn->name, name, MAX_NAME - 1);
+
+                                pthread_create(&conn->thread, NULL, connection_handler, conn);
+                                pthread_detach(conn->thread);
+                            } else {
+                                close(client_sock);
+                            }
+                            pthread_mutex_unlock(&g_state.mutex);
+                            continue; // Skip the close below
+                        }
+                    }
                 }
                 close(client_sock);
             }
@@ -447,6 +528,13 @@ int main(int argc, char** argv) {
     printf("Bluetooth Mesh Node Starting...\n");
     printf("This node will scan for and connect to other nodes\n");
     printf("Press Ctrl+C to exit\n\n");
+
+    // Check if bluetoothd is running
+    int bt_status = system("systemctl is-active --quiet bluetooth");
+    if (bt_status != 0) {
+        fprintf(stderr, "Warning: bluetooth service may not be running\n");
+        fprintf(stderr, "Try: sudo systemctl start bluetooth\n\n");
+    }
 
     // Make adapter discoverable
     if (set_discoverable(1) < 0) {
