@@ -1,0 +1,1 @@
+/usr/bin/cc CMakeFiles/protocol_tests.dir/protocol/protocol.c.o CMakeFiles/protocol_tests.dir/tests/test_protocol.c.o -o protocol_tests 

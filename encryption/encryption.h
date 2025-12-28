@@ -1,0 +1,5 @@
+#ifndef LOCALNET_ENCRYPTION_H
+#define LOCALNET_ENCRYPTION_H
+
+
+#endif
