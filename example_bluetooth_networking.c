@@ -1,9 +1,9 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
+#include <string.h>
 #include <pthread.h>
-#include <signal.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -11,600 +11,245 @@
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
-#include <bluetooth/sdp.h>
-#include <bluetooth/sdp_lib.h>
 
-#define MAX_CONNECTIONS 10
-#define RFCOMM_CHANNEL 1
-#define MAX_NAME 248
-#define SCAN_INTERVAL 10
-#define SERVICE_UUID "00001101-0000-1000-8000-00805F9B34FB"
+#define MAX_DEVICES 10
+#define SCAN_TIME 5
 
-typedef struct {
-    int sock;
-    bdaddr_t addr;
-    char name[MAX_NAME];
-    int active;
-    pthread_t thread;
-} connection_t;
-
-typedef struct {
-    connection_t connections[MAX_CONNECTIONS];
-    int conn_count;
-    pthread_mutex_t mutex;
-    int server_sock;
-    int running;
-    sdp_session_t* sdp_session;
-} node_state_t;
-
-node_state_t g_state = {0};
-
-// Function prototypes
-void* connection_handler(void* arg);
-void* server_thread(void* arg);
-void* scanner_thread(void* arg);
-void cleanup_connection(connection_t* conn);
-int is_already_connected(bdaddr_t* addr);
-void send_message(int sock, const char* msg);
-sdp_session_t* register_service(uint8_t rfcomm_channel);
-int set_discoverable(int enable);
-int pair_device(bdaddr_t* addr);
-int set_bluetooth_security(int sock);
-
-void signal_handler(int sig) {
-    printf("\nShutting down gracefully...\n");
-    g_state.running = 0;
-}
-
-int set_discoverable(int enable) {
-    // Use system command as a simple fallback
-    // This requires hciconfig to be installed
-    int result;
-    if (enable) {
-        result = system("hciconfig hci0 piscan 2>/dev/null");
-    } else {
-        result = system("hciconfig hci0 noscan 2>/dev/null");
-    }
-
-    if (result == 0) {
-        printf("Bluetooth adapter set to %s mode\n", enable ? "discoverable" : "non-discoverable");
-        return 0;
-    } else {
-        fprintf(stderr, "Warning: Failed to set scan mode via hciconfig\n");
-        return -1;
-    }
-}
-
-int set_bluetooth_security(int sock) {
-    // Set socket to non-secure mode (no pairing required)
-    struct bt_security bt_sec;
-    memset(&bt_sec, 0, sizeof(bt_sec));
-    bt_sec.level = BT_SECURITY_LOW; // No authentication/encryption
-
-    if (setsockopt(sock, SOL_BLUETOOTH, BT_SECURITY, &bt_sec, sizeof(bt_sec)) < 0) {
-        perror("Failed to set BT_SECURITY_LOW");
-        return -1;
-    }
-
-    return 0;
-}
-
-int pair_device(bdaddr_t* addr) {
-    char addr_str[18];
-    ba2str(addr, addr_str);
-
-    // Try to pair using bluetoothctl
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "echo -e 'pair %s\\ntrust %s\\nquit' | bluetoothctl 2>/dev/null",
-             addr_str, addr_str);
-
-    printf("  Attempting to pair with %s...\n", addr_str);
-    int result = system(cmd);
-
-    if (result == 0) {
-        printf("  Pairing initiated\n");
-        sleep(2); // Give it time to complete
-        return 0;
-    }
-
-    return -1;
-}
-
-sdp_session_t* register_service(uint8_t rfcomm_channel) {
-    uuid_t root_uuid, l2cap_uuid, rfcomm_uuid, svc_uuid;
-    sdp_list_t *l2cap_list = 0, *rfcomm_list = 0, *root_list = 0, *proto_list = 0, *access_proto_list = 0;
-    sdp_data_t *channel = 0;
-    sdp_record_t *record = sdp_record_alloc();
-
-    // Set service class
-    sdp_uuid128_create(&svc_uuid, &(const uint128_t){{0}});
-    sdp_set_service_id(record, svc_uuid);
-
-    // Set service name
-    sdp_list_t service_class = {0};
-    sdp_uuid16_create(&root_uuid, SERIAL_PORT_SVCLASS_ID);
-    service_class.data = &root_uuid;
-    sdp_set_service_classes(record, &service_class);
-
-    // Set Bluetooth profile
-    sdp_profile_desc_t profile;
-    sdp_uuid16_create(&profile.uuid, SERIAL_PORT_PROFILE_ID);
-    profile.version = 0x0100;
-    sdp_list_t profile_list = {0};
-    profile_list.data = &profile;
-    sdp_set_profile_descs(record, &profile_list);
-
-    // Make service browseable
-    sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
-    root_list = sdp_list_append(0, &root_uuid);
-    sdp_set_browse_groups(record, root_list);
-
-    // Set L2CAP protocol
-    sdp_uuid16_create(&l2cap_uuid, L2CAP_UUID);
-    l2cap_list = sdp_list_append(0, &l2cap_uuid);
-    proto_list = sdp_list_append(0, l2cap_list);
-
-    // Set RFCOMM protocol
-    sdp_uuid16_create(&rfcomm_uuid, RFCOMM_UUID);
-    channel = sdp_data_alloc(SDP_UINT8, &rfcomm_channel);
-    rfcomm_list = sdp_list_append(0, &rfcomm_uuid);
-    sdp_list_append(rfcomm_list, channel);
-    sdp_list_append(proto_list, rfcomm_list);
-
-    access_proto_list = sdp_list_append(0, proto_list);
-    sdp_set_access_protos(record, access_proto_list);
-
-    // Set service name and description
-    sdp_set_info_attr(record, "BT Mesh Node", "Mesh Node", "Mesh networking node");
-
-    // Register service
-    sdp_session_t *session = sdp_connect(BDADDR_ANY, BDADDR_LOCAL, SDP_RETRY_IF_BUSY);
-    if (!session) {
-        perror("Failed to connect to SDP server");
-        sdp_record_free(record);
-        return NULL;
-    }
-
-    if (sdp_record_register(session, record, 0) < 0) {
-        perror("Service registration failed");
-        sdp_close(session);
-        sdp_record_free(record);
-        return NULL;
-    }
-
-    printf("Service registered on RFCOMM channel %d\n", rfcomm_channel);
-
-    // Cleanup
-    sdp_data_free(channel);
-    sdp_list_free(l2cap_list, 0);
-    sdp_list_free(rfcomm_list, 0);
-    sdp_list_free(root_list, 0);
-    sdp_list_free(access_proto_list, 0);
-
-    return session;
-}
-
-void cleanup_connection(connection_t* conn) {
-    if (conn->active) {
-        conn->active = 0;
-        if (conn->sock >= 0) {
-            close(conn->sock);
-            conn->sock = -1;
-        }
-    }
-}
-
-int is_already_connected(bdaddr_t* addr) {
-    pthread_mutex_lock(&g_state.mutex);
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_state.connections[i].active &&
-            bacmp(&g_state.connections[i].addr, addr) == 0) {
-            pthread_mutex_unlock(&g_state.mutex);
-            return 1;
-        }
-    }
-    pthread_mutex_unlock(&g_state.mutex);
-    return 0;
-}
-
-void send_message(int sock, const char* msg) {
-    if (sock >= 0) {
-        int len = strlen(msg);
-        if (write(sock, msg, len) < 0) {
-            perror("Failed to send message");
-        }
-    }
-}
-
-void* connection_handler(void* arg) {
-    connection_t* conn = (connection_t*)arg;
-    char buffer[1024];
-    int bytes;
-
-    printf("Connection handler started for %s\n", conn->name);
-
-    // Send initial greeting
-    char greeting[256];
-    snprintf(greeting, sizeof(greeting), "HELLO from node\n");
-    send_message(conn->sock, greeting);
-
-    // Keep connection alive and handle incoming messages
-    while (g_state.running && conn->active) {
-        memset(buffer, 0, sizeof(buffer));
-        bytes = read(conn->sock, buffer, sizeof(buffer) - 1);
-
-        if (bytes > 0) {
-            buffer[bytes] = '\0';
-            printf("Received from %s: %s\n", conn->name, buffer);
-
-            // Echo back or send acknowledgment
-            char response[1024];
-            int response_len = snprintf(response, sizeof(response), "ACK: ");
-            int remaining = sizeof(response) - response_len - 1;
-            strncat(response, buffer, remaining);
-            send_message(conn->sock, response);
-        } else if (bytes == 0) {
-            printf("Connection closed by %s\n", conn->name);
-            break;
-        } else if (bytes < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100000); // 100ms
-                continue;
-            }
-            perror("Read error");
-            break;
-        }
-    }
-
-    printf("Connection handler ending for %s\n", conn->name);
-    cleanup_connection(conn);
-    return NULL;
-}
-
-void* server_thread(void* arg) {
+void* listener_thread(void* arg) {
     struct sockaddr_rc loc_addr = {0}, rem_addr = {0};
+    char buf[1024] = {0};
+    int s, client, bytes_read;
     socklen_t opt = sizeof(rem_addr);
+    int dev_id, hci_sock;
 
-    // Create server socket
-    g_state.server_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
-    if (g_state.server_sock < 0) {
-        perror("Failed to create server socket");
+    // Retrieve the resource number of the first available Bluetooth adapter https://people.csail.mit.edu/albert/bluez-intro/c404.html
+    dev_id = hci_get_route(NULL);
+    // opens a Bluetooth socket with the specified resource number https://people.csail.mit.edu/albert/bluez-intro/c404.html
+    hci_sock = hci_open_dev(dev_id);
+
+    if (hci_sock >= 0) {
+        struct hci_dev_info di;
+        if (hci_devinfo(dev_id, &di) == 0) {
+            printf("Local device: %s (%s)\n", di.name, batostr(&di.bdaddr));
+        }
+
+        // Just need scan mode  https://people.csail.mit.edu/albert/bluez-intro/x559.html
+        uint8_t scan_mode = SCAN_PAGE | SCAN_INQUIRY;
+        struct {
+            uint8_t scan_enable;
+        } cp;
+
+        cp.scan_enable = scan_mode;
+
+        struct hci_request request;
+        memset(&request, 0, sizeof(request));
+        request.ogf = OGF_HOST_CTL;
+        request.ocf = 0x001A;
+        request.cparam = &cp;
+        request.clen = sizeof(cp);
+        request.rparam = NULL;
+        request.rlen = 0;
+
+        if (hci_send_req(hci_sock, &request, 1000) < 0) {
+            fprintf(stderr, "Warning: Could not set discoverable mode: %s\n", strerror(errno));
+        } else {
+            printf("Bluetooth adapter set to DISCOVERABLE mode\n");
+        }
+
+        close(hci_sock);
+    }
+
+    s = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if (s < 0) {
+        perror("Listener socket creation failed");
         return NULL;
     }
 
-    // Set socket options for reuse
-    int reuse = 1;
-    if (setsockopt(g_state.server_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        perror("Failed to set SO_REUSEADDR");
-    }
-
-    // Set security to LOW (no pairing required)
-    set_bluetooth_security(g_state.server_sock);
-
-    // Bind to local adapter
     loc_addr.rc_family = AF_BLUETOOTH;
     loc_addr.rc_bdaddr = *BDADDR_ANY;
-    loc_addr.rc_channel = (uint8_t)RFCOMM_CHANNEL;
+    loc_addr.rc_channel = (uint8_t)BTPROTO_RFCOMM;
 
-    if (bind(g_state.server_sock, (struct sockaddr*)&loc_addr, sizeof(loc_addr)) < 0) {
-        perror("Failed to bind server socket");
-        close(g_state.server_sock);
+    if (bind(s, (struct sockaddr *)&loc_addr, sizeof(loc_addr)) < 0) {
+        perror("Listener bind failed");
+        close(s);
         return NULL;
     }
 
-    // Listen for connections
-    if (listen(g_state.server_sock, 5) < 0) {
-        perror("Failed to listen");
-        close(g_state.server_sock);
+    if (listen(s, 1) < 0) {
+        perror("Listener failed");
+        close(s);
         return NULL;
     }
 
-    printf("Server listening on RFCOMM channel %d\n", RFCOMM_CHANNEL);
+    printf("Listening on RFCOMM channel %d\n", BTPROTO_RFCOMM);
 
-    // Register SDP service (optional - continue even if it fails)
-    g_state.sdp_session = register_service(RFCOMM_CHANNEL);
-    if (!g_state.sdp_session) {
-        fprintf(stderr, "Note: SDP registration failed - make sure bluetoothd is running\n");
-        fprintf(stderr, "      Connections may still work without SDP\n");
-    }
-
-    while (g_state.running) {
-        int client = accept(g_state.server_sock, (struct sockaddr*)&rem_addr, &opt);
+    while (true) {
+        client = accept(s, (struct sockaddr *)&rem_addr, &opt);
         if (client < 0) {
-            if (!g_state.running) break;
             perror("Accept failed");
             continue;
         }
 
         char addr_str[18];
         ba2str(&rem_addr.rc_bdaddr, addr_str);
-        printf("Incoming connection from %s\n", addr_str);
+        printf("\nConnection from %s\n", addr_str);
 
-        // Check if already connected
-        if (is_already_connected(&rem_addr.rc_bdaddr)) {
-            printf("Already connected to this device\n");
-            close(client);
-            continue;
+        memset(buf, 0, sizeof(buf));
+        bytes_read = read(client, buf, sizeof(buf) - 1);
+        if (bytes_read > 0) {
+            buf[bytes_read] = '\0';
+            printf("\n\nRECEIVED MESSAGE FROM %s:\n", addr_str);
+            printf("%s\n\n", buf);
         }
 
-        // Find free slot
-        pthread_mutex_lock(&g_state.mutex);
-        int slot = -1;
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (!g_state.connections[i].active) {
-                slot = i;
-                break;
-            }
-        }
-
-        if (slot >= 0) {
-            connection_t* conn = &g_state.connections[slot];
-            conn->sock = client;
-            conn->addr = rem_addr.rc_bdaddr;
-            conn->active = 1;
-            ba2str(&rem_addr.rc_bdaddr, conn->name);
-
-            printf("Accepted connection from %s\n", conn->name);
-
-            pthread_create(&conn->thread, NULL, connection_handler, conn);
-            pthread_detach(conn->thread);
-        } else {
-            printf("No free connection slots\n");
-            close(client);
-        }
-        pthread_mutex_unlock(&g_state.mutex);
+        close(client);
     }
 
-    if (g_state.sdp_session) {
-        sdp_close(g_state.sdp_session);
-    }
-    close(g_state.server_sock);
+    close(s);
     return NULL;
 }
 
-void* scanner_thread(void* arg) {
-    inquiry_info* devices = NULL;
-    int dev_id, sock, num_devices;
-    char addr[19] = {0};
-    char name[MAX_NAME] = {0};
+int scan_devices(inquiry_info **devices) {
+    int dev_id, sock, num_rsp;
+    int max_rsp = MAX_DEVICES;
+    int flags = IREQ_CACHE_FLUSH;
 
-    dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("No Bluetooth adapter found");
-        return NULL;
+    dev_id = hci_get_route(NULL); // get device id https://people.csail.mit.edu/albert/bluez-intro/c404.html
+    sock = hci_open_dev(dev_id); // opens a Bluetooth socket with the specified resource number https://people.csail.mit.edu/albert/bluez-intro/c404.html
+
+    if (dev_id < 0 || sock < 0) {
+        perror("Opening HCI socket");
+        return -1;
     }
 
-    sock = hci_open_dev(dev_id);
-    if (sock < 0) {
-        perror("Failed to open HCI socket");
-        return NULL;
+    *devices = (inquiry_info*)malloc(max_rsp * sizeof(inquiry_info));
+    printf("Scanning for devices (%d sec)...\n", SCAN_TIME);
+    // performs a Bluetooth device discovery and returns a list of detected devices and some basic information about them
+    num_rsp = hci_inquiry(dev_id, SCAN_TIME, max_rsp, NULL, devices, flags);
+
+    if (num_rsp < 0) {
+        perror("HCI inquiry failed");
+        close(sock);
+        free(*devices);
+        return -1;
     }
 
-    printf("Scanner started\n");
+    printf("Found %d device(s)\n", num_rsp);
 
-    while (g_state.running) {
-        printf("Scanning for devices...\n");
+    for (int i = 0; i < num_rsp; i++) {
+        char addr[19] = {0};
+        char name[248] = {0};
 
-        devices = (inquiry_info*)malloc(255 * sizeof(inquiry_info));
-        if (!devices) {
-            perror("Failed to allocate memory");
-            sleep(SCAN_INTERVAL);
-            continue;
+        // Conversions between string and bdaddr_t structs https://people.csail.mit.edu/albert/bluez-intro/c404.html
+        ba2str(&((*devices)[i].bdaddr), addr);
+
+        // Determines the user-friendly names associated with those addresses https://people.csail.mit.edu/albert/bluez-intro/c404.html
+        if (hci_read_remote_name(sock, &((*devices)[i].bdaddr), sizeof(name), name, 0) < 0) {
+            strcpy(name, "[unknown]");
         }
 
-        num_devices = hci_inquiry(dev_id, 8, 255, NULL, &devices, IREQ_CACHE_FLUSH);
-        if (num_devices < 0) {
-            perror("Inquiry failed");
-            free(devices);
-            sleep(SCAN_INTERVAL);
-            continue;
-        }
-
-        printf("Found %d device(s)\n", num_devices);
-
-        for (int i = 0; i < num_devices; i++) {
-            ba2str(&devices[i].bdaddr, addr);
-            memset(name, 0, sizeof(name));
-
-            if (hci_read_remote_name(sock, &devices[i].bdaddr, sizeof(name), name, 0) < 0)
-                strcpy(name, "Unknown");
-
-            printf("  %s - %s\n", addr, name);
-
-            // Check if already connected
-            if (is_already_connected(&devices[i].bdaddr)) {
-                continue;
-            }
-
-            // Try to connect
-            struct sockaddr_rc addr_rc = {0};
-            int client_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
-            if (client_sock < 0) continue;
-
-            // Set security to LOW (no pairing required)
-            set_bluetooth_security(client_sock);
-
-            addr_rc.rc_family = AF_BLUETOOTH;
-            addr_rc.rc_channel = (uint8_t)RFCOMM_CHANNEL;
-            addr_rc.rc_bdaddr = devices[i].bdaddr;
-
-            printf("  Attempting to connect to %s...\n", addr);
-
-            int connect_result = connect(client_sock, (struct sockaddr*)&addr_rc, sizeof(addr_rc));
-            if (connect_result == 0) {
-                printf("  Successfully connected to %s\n", name);
-
-                pthread_mutex_lock(&g_state.mutex);
-                int slot = -1;
-                for (int j = 0; j < MAX_CONNECTIONS; j++) {
-                    if (!g_state.connections[j].active) {
-                        slot = j;
-                        break;
-                    }
-                }
-
-                if (slot >= 0) {
-                    connection_t* conn = &g_state.connections[slot];
-                    conn->sock = client_sock;
-                    conn->addr = devices[i].bdaddr;
-                    conn->active = 1;
-                    strncpy(conn->name, name, MAX_NAME - 1);
-
-                    pthread_create(&conn->thread, NULL, connection_handler, conn);
-                    pthread_detach(conn->thread);
-                } else {
-                    close(client_sock);
-                }
-                pthread_mutex_unlock(&g_state.mutex);
-            } else {
-                int err = errno;
-                printf("  Connection failed: %s (errno: %d)\n", strerror(err), err);
-                if (err == ECONNREFUSED) {
-                    printf("  -> Device may not be running the service or not in discoverable mode\n");
-                } else if (err == EHOSTDOWN) {
-                    printf("  -> Device is not reachable\n");
-                } else if (err == EACCES || err == EPERM) {
-                    printf("  -> Permission denied - trying to pair...\n");
-                    // Try pairing and retry connection
-                    if (pair_device(&devices[i].bdaddr) == 0) {
-                        printf("  -> Retrying connection after pairing...\n");
-                        client_sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
-                        set_bluetooth_security(client_sock);
-                        addr_rc.rc_family = AF_BLUETOOTH;
-                        addr_rc.rc_channel = (uint8_t)RFCOMM_CHANNEL;
-                        addr_rc.rc_bdaddr = devices[i].bdaddr;
-
-                        if (connect(client_sock, (struct sockaddr*)&addr_rc, sizeof(addr_rc)) == 0) {
-                            printf("  -> Successfully connected after pairing!\n");
-
-                            pthread_mutex_lock(&g_state.mutex);
-                            int slot = -1;
-                            for (int j = 0; j < MAX_CONNECTIONS; j++) {
-                                if (!g_state.connections[j].active) {
-                                    slot = j;
-                                    break;
-                                }
-                            }
-
-                            if (slot >= 0) {
-                                connection_t* conn = &g_state.connections[slot];
-                                conn->sock = client_sock;
-                                conn->addr = devices[i].bdaddr;
-                                conn->active = 1;
-                                strncpy(conn->name, name, MAX_NAME - 1);
-
-                                pthread_create(&conn->thread, NULL, connection_handler, conn);
-                                pthread_detach(conn->thread);
-                            } else {
-                                close(client_sock);
-                            }
-                            pthread_mutex_unlock(&g_state.mutex);
-                            continue; // Skip the close below
-                        }
-                    }
-                }
-                close(client_sock);
-            }
-        }
-
-        free(devices);
-
-        // Wait before next scan
-        for (int i = 0; i < SCAN_INTERVAL && g_state.running; i++) {
-            sleep(1);
-        }
+        printf("[%d] %s - %s\n", i, addr, name);
     }
 
     close(sock);
-    return NULL;
+    return num_rsp;
 }
 
-int main(int argc, char** argv) {
-    pthread_t server_tid, scanner_tid;
+int send_message(bdaddr_t *dest_addr, const char *message) {
+    struct sockaddr_rc addr = {0};
+    int sock;
+    char addr_str[18];
+    char buf[1024] = {0};
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    // Conversions between string and bdaddr_t structs https://people.csail.mit.edu/albert/bluez-intro/c404.html
+    ba2str(dest_addr, addr_str);
+    printf("Connecting to %s on channel %d...\n", addr_str, BTPROTO_RFCOMM);
 
-    printf("Bluetooth Mesh Node Starting...\n");
-    printf("This node will scan for and connect to other nodes\n");
-    printf("Press Ctrl+C to exit\n\n");
-
-    // Check if bluetoothd is running
-    int bt_status = system("systemctl is-active --quiet bluetooth");
-    if (bt_status != 0) {
-        fprintf(stderr, "Warning: bluetooth service may not be running\n");
-        fprintf(stderr, "Try: sudo systemctl start bluetooth\n\n");
+    sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if (sock < 0) {
+        perror("Send socket creation failed");
+        return -1;
     }
 
-    // Make adapter discoverable
-    if (set_discoverable(1) < 0) {
-        fprintf(stderr, "Warning: Failed to set discoverable mode\n");
-        fprintf(stderr, "Try manually: sudo hciconfig hci0 piscan\n");
+    addr.rc_family = AF_BLUETOOTH;
+    addr.rc_channel = (uint8_t)BTPROTO_RFCOMM;
+    addr.rc_bdaddr = *dest_addr;
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        printf("Could not connect to %s: %s\n", addr_str, strerror(errno));
+        close(sock);
+        return -1;
     }
 
-    // Initialize state
-    pthread_mutex_init(&g_state.mutex, NULL);
-    g_state.running = 1;
-    g_state.server_sock = -1;
-    g_state.sdp_session = NULL;
+    printf("Connected, sending message...\n");
 
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        g_state.connections[i].sock = -1;
-        g_state.connections[i].active = 0;
+    if (write(sock, message, strlen(message)) < 0) {
+        perror("Send failed");
+        close(sock);
+        return -1;
     }
 
-    // Start server thread
-    if (pthread_create(&server_tid, NULL, server_thread, NULL) != 0) {
-        perror("Failed to create server thread");
-        return 1;
+    printf("Message sent to %s\n", addr_str);
+
+    // Wait for response
+    printf("Waiting for response...\n");
+    int bytes_read = read(sock, buf, sizeof(buf) - 1);
+    if (bytes_read > 0) {
+        buf[bytes_read] = '\0';
+        printf("\n\nRECEIVED RESPONSE FROM %s:\n", addr_str);
+        printf("%s\n\n", buf);
+    } else if (bytes_read == 0) {
+        printf("Connection closed by remote device\n");
+    } else {
+        perror("Read failed");
     }
 
-    // Start scanner thread
-    if (pthread_create(&scanner_tid, NULL, scanner_thread, NULL) != 0) {
-        perror("Failed to create scanner thread");
-        g_state.running = 0;
-        pthread_join(server_tid, NULL);
-        return 1;
+    close(sock);
+
+    return EXIT_SUCCESS;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: %s \"message to send\"\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    // Main loop - could add interactive commands here
-    while (g_state.running) {
-        sleep(1);
+    const char *message = argv[1];
+    pthread_t listener;
 
-        // Optional: Send periodic keepalive or status messages
-        pthread_mutex_lock(&g_state.mutex);
-        int active_count = 0;
-        for (int i = 0; i < MAX_CONNECTIONS; i++) {
-            if (g_state.connections[i].active) {
-                active_count++;
+    printf("Bluetooth Prototype\n");
+    printf("Sending Message: \"%s\"\n\n", message);
+
+    if (pthread_create(&listener, NULL, listener_thread, NULL) != 0) {
+        perror("Failed to create listener thread");
+        return EXIT_FAILURE;
+    }
+
+    sleep(5);
+
+    while (true) {
+        inquiry_info *devices = NULL;
+        int num_devices = scan_devices(&devices);
+
+        if (num_devices > 0) {
+            printf("\nSending to discovered devices\n\n");
+            for (int i = 0; i < num_devices; i++) {
+                send_message(&(devices[i].bdaddr), message);
+                sleep(1);
             }
+        } else {
+            printf("No devices found.\n");
         }
-        pthread_mutex_unlock(&g_state.mutex);
 
-        // Print status every 30 seconds
-        static int counter = 0;
-        if (++counter >= 30) {
-            printf("Active connections: %d\n", active_count);
-            counter = 0;
+        if (devices) {
+            free(devices);
         }
+
+        printf("\nWaiting 5 seconds before rescanning...\n\n");
+        sleep(5);
     }
 
-    // Cleanup
-    printf("Cleaning up...\n");
-    pthread_join(scanner_tid, NULL);
-    pthread_join(server_tid, NULL);
-
-    pthread_mutex_lock(&g_state.mutex);
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        cleanup_connection(&g_state.connections[i]);
-    }
-    pthread_mutex_unlock(&g_state.mutex);
-
-    pthread_mutex_destroy(&g_state.mutex);
-
-    // Restore discoverable mode
-    set_discoverable(0);
-
-    printf("Shutdown complete\n");
-    return 0;
+    pthread_join(listener, NULL);
+    return EXIT_SUCCESS;
 }
