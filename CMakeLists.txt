@@ -1,99 +1,69 @@
-cmake_minimum_required(VERSION 3.16)
-project(LocalNet C)
+cmake_minimum_required(VERSION 4.0)
+project(LocalNet)
+set(CMAKE_CXX_STANDARD 20)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+# Point CMake at the custom prefix
+list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/.local")
 
-# Find required packages
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(BLUEZ REQUIRED bluez)
+# Find Binc library
+find_library(BINC_LIB NAMES Binc PATHS "$ENV{HOME}/.local/lib")
+find_path(BINC_INCLUDE_DIR NAMES adapter.h PATH_SUFFIXES binc PATHS "$ENV{HOME}/.local/include")
 
-# Include directories
-include_directories(${CMAKE_SOURCE_DIR})
+# Find GLib using pkg-config
+include(FindPkgConfig)
+pkg_check_modules(GLIB REQUIRED glib-2.0 gio-2.0)
+
+# Print found paths for debugging
+message(STATUS "BINC_LIB: ${BINC_LIB}")
+message(STATUS "BINC_INCLUDE_DIR: ${BINC_INCLUDE_DIR}")
+message(STATUS "GLIB_LIBRARIES: ${GLIB_LIBRARIES}")
+message(STATUS "GLIB_INCLUDE_DIRS: ${GLIB_INCLUDE_DIRS}")
+
+include_directories(${CMAKE_SOURCE_DIR}/bluetooth)
 include_directories(${CMAKE_SOURCE_DIR}/protocol)
 include_directories(${CMAKE_SOURCE_DIR}/encryption)
 include_directories(${CMAKE_SOURCE_DIR}/routing)
 include_directories(${CMAKE_SOURCE_DIR}/utils)
-include_directories(${CMAKE_SOURCE_DIR}/bluetooth)
-include_directories(${CMAKE_SOURCE_DIR}/mesh)
 include_directories(${CMAKE_SOURCE_DIR}/tests)
-include_directories(${BLUEZ_INCLUDE_DIRS})
 
-# Core library sources
-set(LOCALNET_SOURCES
-    protocol/protocol.c
-    routing/routing.c
-    bluetooth/bluetooth_transport.c
-    mesh/mesh_network.c
-    utils/utils.c
+add_executable(LocalNet
+        main.c
+        bluetooth/bluetooth.c
+        protocol/protocol.c
+        encryption/encryption.c
+        routing/routing.c
+        utils/utils.c
+        utils/utils.h
 )
 
-# Create static library
-add_library(localnet_lib STATIC ${LOCALNET_SOURCES})
-target_link_libraries(localnet_lib ${BLUEZ_LIBRARIES} pthread)
-target_include_directories(localnet_lib PUBLIC ${CMAKE_SOURCE_DIR})
+# Add include directories
+target_include_directories(LocalNet PRIVATE
+        ${BINC_INCLUDE_DIR}
+        ${GLIB_INCLUDE_DIRS}
+)
 
-# Main executable
-add_executable(LocalNet main.c)
-target_link_libraries(LocalNet localnet_lib)
+# Link libraries - order matters: Binc, then GLib, then system libs
+target_link_libraries(LocalNet PRIVATE
+        ${BINC_LIB}
+        ${GLIB_LIBRARIES}
+        m
+)
+
+# Add GLib link directories
+target_link_directories(LocalNet PRIVATE ${GLIB_LIBRARY_DIRS})
 
 # Test binary for protocol unit tests
 add_executable(protocol_tests
-    protocol/protocol.c
-    tests/test_protocol.c
+        protocol/protocol.c
+        tests/test_protocol.c
 )
+
 target_include_directories(protocol_tests PRIVATE ${CMAKE_SOURCE_DIR}/protocol)
 
 # Test binary for routing unit tests
 add_executable(routing_tests
-    routing/routing.c
-    tests/test_routing.c
+        routing/routing.c
+        tests/test_routing.c
 )
+
 target_include_directories(routing_tests PRIVATE ${CMAKE_SOURCE_DIR}/routing)
-
-# Test binary for mesh routing tests (Milestone 3)
-add_executable(mesh_routing_tests
-    protocol/protocol.c
-    routing/routing.c
-    tests/test_mesh_routing.c
-)
-target_include_directories(mesh_routing_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/protocol
-    ${CMAKE_SOURCE_DIR}/routing
-)
-
-# Enable testing
-enable_testing()
-add_test(NAME ProtocolTests COMMAND protocol_tests)
-add_test(NAME RoutingTests COMMAND routing_tests)
-add_test(NAME MeshRoutingTests COMMAND mesh_routing_tests)
-
-# Compiler warnings
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(localnet_lib PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(LocalNet PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(protocol_tests PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(routing_tests PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(mesh_routing_tests PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# Installation
-install(TARGETS LocalNet RUNTIME DESTINATION bin)
-install(TARGETS localnet_lib ARCHIVE DESTINATION lib)
-install(FILES
-    mesh/mesh_network.h
-    protocol/protocol.h
-    routing/routing.h
-    bluetooth/bluetooth_transport.h
-    DESTINATION include/localnet
-)
-
-# Print configuration summary
-message(STATUS "")
-message(STATUS "LocalNet Configuration Summary")
-message(STATUS "------------------------------")
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "C Compiler: ${CMAKE_C_COMPILER}")
-message(STATUS "BlueZ Libraries: ${BLUEZ_LIBRARIES}")
-message(STATUS "")
-

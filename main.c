@@ -1,444 +1,221 @@
-/**
- * LocalNet - Bluetooth Mesh Networking Library Example
- *
- * This example demonstrates how developers can use the LocalNet mesh networking
- * library to build decentralized communication applications over Bluetooth.
- *
- * Features demonstrated:
- * - Network initialization and configuration
- * - Message sending (unicast and broadcast)
- * - Route discovery
- * - Event callbacks for network events
- * - Network status monitoring
- *
- * Usage: ./LocalNet [node_type] [command] [args...]
- *   node_type: edge, full, gateway
- *   commands:
- *     scan     - Scan for nearby devices
- *     listen   - Listen for messages
- *     send <id> <message> - Send message to device
- *     broadcast <message> - Broadcast message to all neighbors
- *     status   - Print network status
- *     demo     - Run interactive demo
- */
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <signal.h>
+#include <getopt.h>
 #include <unistd.h>
-#include <stdbool.h>
-#include "mesh/mesh_network.h"
+#include "bluetooth.h"
+#include "protocol.h"
+#include "logger.h"
+#include "utils.h"
+#include "routing.h"
 
-/* Global network instance for signal handler */
-static struct mesh_network *g_network = NULL;
-static volatile bool g_running = true;
+/* Global BLE manager for signal handler */
+static ble_node_manager_t *g_ble_manager = NULL;
 
-/* ============== Callback Functions ============== */
-
-/**
- * Called when a message is received from another node
- */
-void on_message_received(struct mesh_network *network, uint32_t source_id,
-                         const uint8_t *data, size_t len, void *user_data) {
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║            MESSAGE RECEIVED                      ║\n");
-    printf("╠══════════════════════════════════════════════════╣\n");
-    printf("║ From: 0x%08X                                 ║\n", source_id);
-    printf("║ Size: %zu bytes                                   ║\n", len);
-    printf("╠══════════════════════════════════════════════════╣\n");
-    printf("║ Content: ");
-
-    // Print as string if printable, otherwise hex
-    bool printable = true;
-    for (size_t i = 0; i < len && printable; i++) {
-        if (data[i] < 32 || data[i] > 126) printable = false;
-    }
-
-    if (printable) {
-        printf("%.*s", (int)len, data);
-    } else {
-        for (size_t i = 0; i < len && i < 20; i++) {
-            printf("%02X ", data[i]);
-        }
-        if (len > 20) printf("...");
-    }
-    printf("\n");
-    printf("╚══════════════════════════════════════════════════╝\n\n");
+void usage(const char *program_name) {
+    printf("LocalNet Mesh Node\n");
+    printf("==================\n\n");
+    printf("Usage: %s [options]\n\n", program_name);
+    printf("Options:\n");
+    printf("  -t, --type <type>   Node type: 0=EDGE, 1=FULL (default), 2=GATEWAY\n");
+    printf("  -v, --verbose       Enable verbose logging\n");
+    printf("  -h, --help          Show this help message\n\n");
+    printf("Example:\n");
+    printf("  %s                  # Start as a FULL node (default)\n", program_name);
+    printf("  %s -t 2             # Start as a GATEWAY node\n", program_name);
+    printf("  %s -t 0 -v          # Start as EDGE node with verbose logging\n\n", program_name);
 }
 
-/**
- * Called when a new node joins the network (direct connection)
- */
-void on_node_joined(struct mesh_network *network, uint32_t device_id, void *user_data) {
-    printf("\n[+] Node 0x%08X joined the network\n", device_id);
-}
-
-/**
- * Called when a node leaves the network (disconnects)
- */
-void on_node_left(struct mesh_network *network, uint32_t device_id, void *user_data) {
-    printf("\n[-] Node 0x%08X left the network\n", device_id);
-}
-
-/**
- * Called when a route to a destination is discovered
- */
-void on_route_discovered(struct mesh_network *network, uint32_t destination_id,
-                         uint8_t hop_count, void *user_data) {
-    printf("\n[R] Route discovered to 0x%08X (%d hops)\n", destination_id, hop_count);
-}
-
-/**
- * Called when route discovery fails
- */
-void on_route_failed(struct mesh_network *network, uint32_t destination_id, void *user_data) {
-    printf("\n[!] Route discovery failed for 0x%08X\n", destination_id);
-}
-
-/**
- * Delivery status callback for async message sending
- */
-void on_message_delivery(uint32_t destination_id, enum mesh_delivery_status status, void *user_data) {
-    const char *status_str;
-    switch (status) {
-        case MESH_DELIVERY_SUCCESS:   status_str = "SUCCESS"; break;
-        case MESH_DELIVERY_FAILED:    status_str = "FAILED"; break;
-        case MESH_DELIVERY_NO_ROUTE:  status_str = "NO ROUTE"; break;
-        case MESH_DELIVERY_TIMEOUT:   status_str = "TIMEOUT"; break;
-        case MESH_DELIVERY_TTL_EXPIRED: status_str = "TTL EXPIRED"; break;
-        default:                      status_str = "PENDING"; break;
-    }
-    printf("[D] Message to 0x%08X: %s\n", destination_id, status_str);
-}
-
-/* ============== Signal Handler ============== */
-
-void signal_handler(int sig) {
-    printf("\n\nReceived signal %d, shutting down...\n", sig);
-    g_running = false;
-}
-
-/* ============== Command Handlers ============== */
-
-void print_help(const char *program_name) {
-    printf("\n");
-    printf("LocalNet - Bluetooth Mesh Networking Library\n");
-    printf("=============================================\n\n");
-    printf("Usage: %s [node_type] [command] [args...]\n\n", program_name);
-    printf("Node Types:\n");
-    printf("  edge     - Edge node (limited routing, low power)\n");
-    printf("  full     - Full node (full routing capabilities)\n");
-    printf("  gateway  - Gateway node (bridges to external networks)\n\n");
-    printf("Commands:\n");
-    printf("  scan                     - Scan for nearby Bluetooth devices\n");
-    printf("  listen                   - Listen for incoming messages\n");
-    printf("  send <hex_id> <message>  - Send message to specific device\n");
-    printf("  broadcast <message>      - Broadcast to all neighbors\n");
-    printf("  status                   - Print network status\n");
-    printf("  routes                   - Print routing table\n");
-    printf("  connections              - Print connection table\n");
-    printf("  discover <hex_id>        - Discover route to device\n");
-    printf("  demo                     - Run interactive demo\n\n");
-    printf("Examples:\n");
-    printf("  %s full listen\n", program_name);
-    printf("  %s edge send 0x12345678 \"Hello World\"\n", program_name);
-    printf("  %s gateway demo\n\n", program_name);
-}
-
-int parse_node_type(const char *type_str, enum NODE_TYPE *node_type) {
-    if (strcmp(type_str, "edge") == 0) {
-        *node_type = EDGE_NODE;
-        return 0;
-    } else if (strcmp(type_str, "full") == 0) {
-        *node_type = FULL_NODE;
-        return 0;
-    } else if (strcmp(type_str, "gateway") == 0) {
-        *node_type = GATEWAY_NODE;
-        return 0;
-    }
-    return -1;
-}
-
-void print_status(struct mesh_network *network) {
-    char buffer[1024];
-    mesh_get_stats_string(network, buffer, sizeof(buffer));
-    printf("\n%s\n", buffer);
-
-    printf("Neighbors:\n");
-    uint32_t neighbors[32];
-    int count = mesh_get_neighbors(network, neighbors, 32);
-    if (count == 0) {
-        printf("  (no neighbors connected)\n");
-    } else {
-        for (int i = 0; i < count; i++) {
-            int8_t rssi;
-            float quality;
-            mesh_get_neighbor_quality(network, neighbors[i], &rssi, &quality);
-            printf("  0x%08X (RSSI: %d, Quality: %.1f%%)\n",
-                   neighbors[i], rssi, quality * 100);
-        }
-    }
-    printf("\n");
-}
-
-void run_scan(struct mesh_network *network) {
-    printf("Scanning for Bluetooth devices...\n");
-    int found = mesh_scan_for_devices(network);
-    if (found < 0) {
-        printf("Scan failed\n");
-    } else {
-        printf("Found %d device(s)\n", found);
-    }
-}
-
-void run_listen(struct mesh_network *network) {
-    printf("\nListening for messages... (Press Ctrl+C to stop)\n\n");
-
-    // Display local device info
-    printf("Local Device ID: 0x%08X\n\n", mesh_get_local_id(network));
-
-    while (g_running) {
-        sleep(1);
-
-        // Periodic status update
-        static int counter = 0;
-        if (++counter % 30 == 0) {
-            printf("--- Status: %d connections, %d routes ---\n",
-                   mesh_get_connection_count(network),
-                   mesh_get_route_count(network));
+/* Signal handler for graceful shutdown */
+static void signal_handler(const int sig_no) {
+    if (sig_no == SIGINT || sig_no == SIGTERM) {
+        log_info(TAG, "Received signal %d, shutting down...", sig_no);
+        if (g_ble_manager) {
+            ble_quit_main_loop(g_ble_manager);
         }
     }
 }
 
-void run_send(struct mesh_network *network, const char *dest_str, const char *message) {
-    uint32_t dest_id = strtoul(dest_str, NULL, 16);
-    if (dest_id == 0) {
-        printf("Invalid destination ID: %s\n", dest_str);
-        return;
-    }
-
-    printf("Sending message to 0x%08X: \"%s\"\n", dest_id, message);
-
-    int result = mesh_send_message_async(network, dest_id,
-                                         (const uint8_t *)message, strlen(message),
-                                         on_message_delivery, NULL);
-
-    if (result == 0) {
-        printf("Message queued for delivery\n");
-    } else {
-        printf("Failed to queue message\n");
-    }
-
-    // Wait a bit for delivery status
-    sleep(3);
+/* Callback: Node discovered */
+static void on_node_discovered(uint32_t node_id, int8_t rssi) {
+    log_info(TAG, "Discovered node: 0x%08X (RSSI: %d dBm)", node_id, rssi);
 }
 
-void run_broadcast(struct mesh_network *network, const char *message) {
-    printf("Broadcasting message: \"%s\"\n", message);
+/* Callback: Node connected */
+static void on_node_connected(uint32_t node_id) {
+    log_info(TAG, "Connected to node: 0x%08X", node_id);
 
-    int sent = mesh_broadcast_message(network, (const uint8_t *)message, strlen(message));
-    printf("Message sent to %d neighbor(s)\n", sent);
+    if (g_ble_manager) {
+        int connected = ble_get_connected_count(g_ble_manager);
+        log_info(TAG, "Total connected nodes: %d", connected);
+    }
 }
 
-void run_discover(struct mesh_network *network, const char *dest_str) {
-    uint32_t dest_id = strtoul(dest_str, NULL, 16);
-    if (dest_id == 0) {
-        printf("Invalid destination ID: %s\n", dest_str);
-        return;
+/* Callback: Node disconnected */
+static void on_node_disconnected(uint32_t node_id) {
+    log_info(TAG, "Disconnected from node: 0x%08X", node_id);
+
+    if (g_ble_manager) {
+        int connected = ble_get_connected_count(g_ble_manager);
+        log_info(TAG, "Remaining connected nodes: %d", connected);
     }
+}
 
-    printf("Initiating route discovery to 0x%08X...\n", dest_id);
+/* Callback: Data received */
+static void on_data_received(uint32_t sender_id, const uint8_t *data, size_t len) {
+    log_debug(TAG, "Received %zu bytes from node 0x%08X", len, sender_id);
 
-    int request_id = mesh_discover_route(network, dest_id);
-    if (request_id > 0) {
-        printf("Route request initiated (ID: %d)\n", request_id);
-
-        // Wait for discovery
-        for (int i = 0; i < 10; i++) {
-            sleep(1);
-            if (mesh_has_route(network, dest_id)) {
-                uint32_t next_hop;
-                uint8_t hop_count;
-                mesh_get_route_info(network, dest_id, &next_hop, &hop_count);
-                printf("Route found! Next hop: 0x%08X, Hops: %d\n", next_hop, hop_count);
-                return;
+    /* Parse the header to determine message type */
+    if (len >= sizeof(struct header)) {
+        struct header hdr;
+        if (parse_header(data, len, &hdr) == 0) {
+            switch (hdr.message_type) {
+                case MSG_DISCOVERY:
+                    log_debug(TAG, "Received discovery message");
+                    break;
+                case MSG_HEARTBEAT:
+                    log_debug(TAG, "Received heartbeat from 0x%08X", sender_id);
+                    break;
+                case MSG_DATA:
+                    log_debug(TAG, "Received data message");
+                    break;
+                case MSG_ROUTE_REQUEST:
+                    log_debug(TAG, "Received route request");
+                    break;
+                case MSG_ROUTE_REPLY:
+                    log_debug(TAG, "Received route reply");
+                    break;
+                default:
+                    log_debug(TAG, "Received unknown message type: %d", hdr.message_type);
+                    break;
             }
         }
-        printf("Route discovery timed out\n");
-    } else {
-        printf("Failed to initiate route discovery\n");
     }
 }
 
-void run_demo(struct mesh_network *network) {
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║        LocalNet Interactive Demo                 ║\n");
-    printf("╠══════════════════════════════════════════════════╣\n");
-    printf("║ Commands:                                        ║\n");
-    printf("║   scan      - Scan for devices                   ║\n");
-    printf("║   status    - Show network status                ║\n");
-    printf("║   routes    - Show routing table                 ║\n");
-    printf("║   conns     - Show connections                   ║\n");
-    printf("║   send <id> - Send message                       ║\n");
-    printf("║   bcast     - Broadcast message                  ║\n");
-    printf("║   quit      - Exit demo                          ║\n");
-    printf("╚══════════════════════════════════════════════════╝\n\n");
-
-    char input[256];
-    char cmd[32];
-    char arg1[128];
-    char arg2[128];
-
-    while (g_running) {
-        printf("[0x%08X]> ", mesh_get_local_id(network));
-        fflush(stdout);
-
-        if (fgets(input, sizeof(input), stdin) == NULL) {
-            break;
-        }
-
-        // Parse command
-        arg1[0] = arg2[0] = '\0';
-        int parsed = sscanf(input, "%31s %127s %127[^\n]", cmd, arg1, arg2);
-        if (parsed < 1) continue;
-
-        if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "exit") == 0) {
-            break;
-        } else if (strcmp(cmd, "scan") == 0) {
-            run_scan(network);
-        } else if (strcmp(cmd, "status") == 0) {
-            print_status(network);
-        } else if (strcmp(cmd, "routes") == 0) {
-            mesh_print_routing_table(network);
-        } else if (strcmp(cmd, "conns") == 0) {
-            mesh_print_connections(network);
-        } else if (strcmp(cmd, "send") == 0 && parsed >= 2) {
-            if (arg2[0] == '\0') {
-                printf("Enter message: ");
-                fgets(arg2, sizeof(arg2), stdin);
-                arg2[strcspn(arg2, "\n")] = 0;
-            }
-            run_send(network, arg1, arg2);
-        } else if (strcmp(cmd, "bcast") == 0) {
-            if (arg1[0] == '\0') {
-                printf("Enter message: ");
-                fgets(arg1, sizeof(arg1), stdin);
-                arg1[strcspn(arg1, "\n")] = 0;
-            }
-            run_broadcast(network, arg1);
-        } else if (strcmp(cmd, "discover") == 0 && parsed >= 2) {
-            run_discover(network, arg1);
-        } else if (strcmp(cmd, "help") == 0) {
-            printf("Available commands: scan, status, routes, conns, send, bcast, discover, quit\n");
-        } else {
-            printf("Unknown command: %s (type 'help' for commands)\n", cmd);
-        }
+const char *node_type_to_string(enum NODE_TYPE type) {
+    switch (type) {
+        case EDGE_NODE: return "EDGE";
+        case FULL_NODE: return "FULL";
+        case GATEWAY_NODE: return "GATEWAY";
+        default: return "UNKNOWN";
     }
 }
 
-/* ============== Main ============== */
+/* Convert MAC address to 32-bit device ID (uses last 4 bytes) */
+static uint32_t mac_to_device_id(const char *mac) {
+    unsigned int bytes[6];
+    if (sscanf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &bytes[0], &bytes[1], &bytes[2],
+               &bytes[3], &bytes[4], &bytes[5]) != 6) {
+        return 0;
+    }
+    /* Use last 4 bytes of MAC for unique 32-bit ID */
+    return (bytes[2] << 24) | (bytes[3] << 16) | (bytes[4] << 8) | bytes[5];
+}
 
 int main(int argc, char *argv[]) {
-    // Print header
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════╗\n");
-    printf("║                 LocalNet v1.0                    ║\n");
-    printf("║        Bluetooth Mesh Networking Library         ║\n");
-    printf("╚══════════════════════════════════════════════════╝\n\n");
+    enum NODE_TYPE node_type = FULL_NODE;  /* Default to FULL */
+    int verbose = 0;
 
-    // Check arguments
-    if (argc < 3) {
-        print_help(argv[0]);
-        return EXIT_FAILURE;
-    }
+    static struct option long_options[] = {
+        {"type",    required_argument, 0, 't'},
+        {"verbose", no_argument,       0, 'v'},
+        {"help",    no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
 
-    // Parse node type
-    enum NODE_TYPE node_type;
-    if (parse_node_type(argv[1], &node_type) != 0) {
-        printf("Error: Invalid node type '%s'\n", argv[1]);
-        printf("Valid types: edge, full, gateway\n");
-        return EXIT_FAILURE;
-    }
-
-    // Set up signal handler
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    // Initialize mesh network
-    printf("Initializing mesh network as %s node...\n", argv[1]);
-    struct mesh_network *network = mesh_network_init(node_type);
-    if (!network) {
-        printf("Error: Failed to initialize mesh network\n");
-        printf("Make sure Bluetooth is enabled and you have proper permissions.\n");
-        return EXIT_FAILURE;
-    }
-
-    g_network = network;
-
-    // Set up callbacks
-    mesh_set_message_callback(network, on_message_received, NULL);
-    mesh_set_node_joined_callback(network, on_node_joined);
-    mesh_set_node_left_callback(network, on_node_left);
-    mesh_set_route_discovered_callback(network, on_route_discovered);
-    mesh_set_route_failed_callback(network, on_route_failed);
-
-    // Start the network
-    printf("Starting mesh network...\n");
-    if (mesh_network_start(network) != 0) {
-        printf("Error: Failed to start mesh network\n");
-        mesh_network_shutdown(network);
-        return EXIT_FAILURE;
-    }
-
-    printf("Network started successfully!\n\n");
-
-    // Execute command
-    const char *command = argv[2];
-
-    if (strcmp(command, "scan") == 0) {
-        run_scan(network);
-    } else if (strcmp(command, "listen") == 0) {
-        run_listen(network);
-    } else if (strcmp(command, "send") == 0) {
-        if (argc < 5) {
-            printf("Usage: %s %s send <dest_id> <message>\n", argv[0], argv[1]);
-        } else {
-            run_send(network, argv[3], argv[4]);
+    int opt;
+    while ((opt = getopt_long(argc, argv, "t:vh", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 't': {
+                long type_val = strtol(optarg, NULL, 10);
+                if (type_val >= 0 && type_val <= 2) {
+                    node_type = (enum NODE_TYPE)type_val;
+                } else {
+                    fprintf(stderr, "Invalid node type: %s (must be 0, 1, or 2)\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                break;
+            }
+            case 'v':
+                verbose = 1;
+                break;
+            case 'h':
+                usage(argv[0]);
+                return EXIT_SUCCESS;
+            default:
+                usage(argv[0]);
+                return EXIT_FAILURE;
         }
-    } else if (strcmp(command, "broadcast") == 0) {
-        if (argc < 4) {
-            printf("Usage: %s %s broadcast <message>\n", argv[0], argv[1]);
-        } else {
-            run_broadcast(network, argv[3]);
-        }
-    } else if (strcmp(command, "status") == 0) {
-        print_status(network);
-    } else if (strcmp(command, "routes") == 0) {
-        mesh_print_routing_table(network);
-    } else if (strcmp(command, "connections") == 0) {
-        mesh_print_connections(network);
-    } else if (strcmp(command, "discover") == 0) {
-        if (argc < 4) {
-            printf("Usage: %s %s discover <dest_id>\n", argv[0], argv[1]);
-        } else {
-            run_discover(network, argv[3]);
-        }
-    } else if (strcmp(command, "demo") == 0) {
-        run_demo(network);
-    } else {
-        printf("Unknown command: %s\n", command);
-        print_help(argv[0]);
     }
 
-    // Cleanup
-    printf("\nShutting down mesh network...\n");
-    mesh_network_shutdown(network);
+    /* Enable logging */
+    log_enabled(TRUE);
+    log_set_level(verbose ? LOG_DEBUG : LOG_INFO);
 
-    printf("Goodbye!\n");
+    log_debug(TAG, "LocalNet starting...");
 
+    /* Get adapter MAC address */
+    char mac_address[18] = {0};
+    if (ble_get_adapter_address(mac_address, sizeof(mac_address)) != 0) {
+        log_error(TAG, "Failed to get Bluetooth adapter address");
+        return EXIT_FAILURE;
+    }
+
+    /* Convert MAC to device ID */
+    uint32_t device_id = mac_to_device_id(mac_address);
+    if (device_id == 0) {
+        log_error(TAG, "Failed to parse MAC address: %s", mac_address);
+        return EXIT_FAILURE;
+    }
+
+    log_info(TAG, "Starting LocalNet node:");
+    log_info(TAG, "  Adapter: %s", mac_address);
+    log_info(TAG, "  Device ID: 0x%08X", device_id);
+    log_info(TAG, "  Node Type: %s", node_type_to_string(node_type));
+    log_info(TAG, "  Max Connections: %d", get_max_connections(node_type));
+
+    /* Setup signal handlers */
+    if (signal(SIGINT, signal_handler) == SIG_ERR) {
+        log_error(TAG, "Cannot set SIGINT handler");
+    }
+    if (signal(SIGTERM, signal_handler) == SIG_ERR) {
+        log_error(TAG, "Cannot set SIGTERM handler");
+    }
+
+    /* Initialize BLE node manager */
+    g_ble_manager = ble_init(device_id, node_type);
+    if (!g_ble_manager) {
+        log_error(TAG, "Failed to initialize BLE node manager");
+        return EXIT_FAILURE;
+    }
+
+    /* Set up callbacks */
+    ble_set_discovered_callback(g_ble_manager, on_node_discovered);
+    ble_set_connected_callback(g_ble_manager, on_node_connected);
+    ble_set_disconnected_callback(g_ble_manager, on_node_disconnected);
+    ble_set_data_callback(g_ble_manager, on_data_received);
+
+    /* Start the BLE node */
+    if (ble_start(g_ble_manager) != 0) {
+        log_error(TAG, "Failed to start BLE node manager");
+        ble_cleanup(g_ble_manager);
+        return EXIT_FAILURE;
+    }
+
+    log_info(TAG, "Node is running. Press Ctrl+C to exit.");
+    log_info(TAG, "Advertising as: LocalNet-%08X", device_id);
+    log_info(TAG, "Scanning for other LocalNet nodes...");
+
+    /* Run the main loop (blocks until quit) */
+    ble_run_main_loop(g_ble_manager);
+
+    /* Cleanup */
+    log_info(TAG, "Shutting down...");
+    ble_cleanup(g_ble_manager);
+    g_ble_manager = NULL;
+
+    log_info(TAG, "LocalNet node stopped");
     return EXIT_SUCCESS;
 }
-

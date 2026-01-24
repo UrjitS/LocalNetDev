@@ -1,1 +1,0 @@
-/usr/bin/cc CMakeFiles/mesh_routing_tests.dir/protocol/protocol.c.o CMakeFiles/mesh_routing_tests.dir/routing/routing.c.o CMakeFiles/mesh_routing_tests.dir/tests/test_mesh_routing.c.o -o mesh_routing_tests 

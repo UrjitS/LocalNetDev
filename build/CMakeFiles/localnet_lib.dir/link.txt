@@ -1,2 +1,0 @@
-/usr/bin/ar qc liblocalnet_lib.a CMakeFiles/localnet_lib.dir/protocol/protocol.c.o CMakeFiles/localnet_lib.dir/routing/routing.c.o CMakeFiles/localnet_lib.dir/bluetooth/bluetooth_transport.c.o CMakeFiles/localnet_lib.dir/mesh/mesh_network.c.o CMakeFiles/localnet_lib.dir/utils/utils.c.o
-/usr/bin/ranlib liblocalnet_lib.a
