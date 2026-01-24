@@ -4,13 +4,13 @@
 static ble_node_manager_t *g_manager = NULL;
 
 /* Forward declarations for internal callbacks */
-static void on_scan_result(Adapter *adapter, Device *device);
+static void on_scan_result(Device *device);
 static void on_connection_state_changed(Device *device, ConnectionState state, const GError *error);
 static void on_services_resolved(Device *device);
 static void on_read_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_notify_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray);
-static gboolean on_request_authorization(Device *device);
+static gboolean on_request_authorization(const Device *device);
 static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid,
                                        const char* char_uuid, const guint16 offset, const guint16 mtu);
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid,
@@ -21,6 +21,7 @@ static gboolean periodic_heartbeat_callback(gpointer user_data);
 static gboolean delayed_discovery_start(gpointer user_data);
 static gboolean delayed_advertising_start(gpointer user_data);
 static gboolean delayed_app_registration(gpointer user_data);
+static void on_adapter_powered_state_changed(Adapter *adapter, gboolean powered);
 
 /* Maximum time to wait for adapter to become ready (in milliseconds) */
 #define ADAPTER_READY_DELAY_MS 3000
@@ -38,7 +39,7 @@ uint32_t ble_extract_device_id(const char *device_name) {
     return (uint32_t)g_ascii_strtoull(id_str, NULL, 16);
 }
 
-char *ble_generate_device_name(uint32_t device_id) {
+char *ble_generate_device_name(const uint32_t device_id) {
     return g_strdup_printf("%s%08X", LOCAL_NET_DEVICE_PREFIX, device_id);
 }
 
@@ -62,6 +63,108 @@ discovered_device_t *ble_find_device_by_ptr(ble_node_manager_t *manager, Device 
         }
     }
     return NULL;
+}
+
+/* Convert MAC address to 32-bit device ID (uses last 4 bytes) */
+uint32_t ble_mac_to_device_id(const char *mac) {
+    if (!mac) return 0;
+    unsigned int bytes[6];
+    if (sscanf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &bytes[0], &bytes[1], &bytes[2],
+               &bytes[3], &bytes[4], &bytes[5]) != 6) {
+        return 0;
+    }
+    /* Use last 4 bytes of MAC for unique 32-bit ID */
+    return (bytes[2] << 24) | (bytes[3] << 16) | (bytes[4] << 8) | bytes[5];
+}
+
+/* Find or add an incoming client by MAC address */
+incoming_client_t *ble_find_or_add_incoming_client(ble_node_manager_t *manager, const char *address) {
+    if (!manager || !address) return NULL;
+
+    /* Search for existing client */
+    for (size_t i = 0; i < manager->incoming_count; i++) {
+        if (g_str_equal(manager->incoming_clients[i].address, address)) {
+            return &manager->incoming_clients[i];
+        }
+    }
+
+    /* Add new client if space available */
+    if (manager->incoming_count >= MAX_INCOMING_CLIENTS) {
+        log_error(BT_TAG, "Maximum incoming clients reached");
+        return NULL;
+    }
+
+    incoming_client_t *client = &manager->incoming_clients[manager->incoming_count];
+    strncpy(client->address, address, sizeof(client->address) - 1);
+    client->address[sizeof(client->address) - 1] = '\0';
+    client->device_id = ble_mac_to_device_id(address);
+    client->last_seen = get_current_timestamp();
+    client->is_connected = FALSE;
+    manager->incoming_count++;
+
+    log_debug(BT_TAG, "Added incoming client: %s (ID: 0x%08X)", address, client->device_id);
+    return client;
+}
+
+/* Print connection table for debugging */
+void ble_print_connection_table(ble_node_manager_t *manager) {
+    if (!manager) return;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                      CONNECTION TABLE                            ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║ Local Node: 0x%08X                                          ║\n",
+           manager->mesh_node ? manager->mesh_node->device_id : 0);
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║ OUTGOING CONNECTIONS (we connected to them):                     ║\n");
+    printf("╠────────────────┬────────────┬────────────┬────────────────────────╣\n");
+    printf("║ Device ID      │ Connected  │ RSSI       │ Last Seen              ║\n");
+    printf("╠────────────────┼────────────┼────────────┼────────────────────────╣\n");
+
+    int outgoing_count = 0;
+    for (size_t i = 0; i < manager->discovered_count; i++) {
+        discovered_device_t *dev = &manager->discovered_devices[i];
+        if (dev->is_connected) {
+            printf("║ 0x%08X     │ %-10s │ %4d dBm   │ %10u             ║\n",
+                   dev->device_id,
+                   dev->is_connected ? "YES" : "NO",
+                   dev->rssi,
+                   dev->last_seen);
+            outgoing_count++;
+        }
+    }
+    if (outgoing_count == 0) {
+        printf("║ (none)                                                           ║\n");
+    }
+
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║ INCOMING CONNECTIONS (they connected to us):                     ║\n");
+    printf("╠────────────────┬────────────┬────────────────────────────────────╣\n");
+    printf("║ Device ID      │ Connected  │ MAC Address                        ║\n");
+    printf("╠────────────────┼────────────┼────────────────────────────────────╣\n");
+
+    int incoming_count = 0;
+    for (size_t i = 0; i < manager->incoming_count; i++) {
+        incoming_client_t *client = &manager->incoming_clients[i];
+        if (client->is_connected) {
+            printf("║ 0x%08X     │ %-10s │ %-34s ║\n",
+                   client->device_id,
+                   client->is_connected ? "YES" : "NO",
+                   client->address);
+            incoming_count++;
+        }
+    }
+    if (incoming_count == 0) {
+        printf("║ (none)                                                           ║\n");
+    }
+
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║ Total: %d outgoing, %d incoming                                   ║\n",
+           outgoing_count, incoming_count);
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
 }
 
 int ble_get_adapter_address(char *address, size_t len) {
@@ -104,7 +207,7 @@ int ble_get_adapter_address(char *address, size_t len) {
     return 0;
 }
 
-static discovered_device_t *add_discovered_device(ble_node_manager_t *manager, Device *device, uint32_t device_id, int8_t rssi) {
+static discovered_device_t *add_discovered_device(ble_node_manager_t *manager, Device *device, const uint32_t device_id, const int8_t rssi) {
     if (!manager || manager->discovered_count >= MAX_DISCOVERED_DEVICES) return NULL;
 
     /* Check if already exists */
@@ -130,7 +233,7 @@ static discovered_device_t *add_discovered_device(ble_node_manager_t *manager, D
 }
 
 /* BLE Initialization */
-ble_node_manager_t *ble_init(uint32_t device_id, enum NODE_TYPE node_type) {
+ble_node_manager_t *ble_init(const uint32_t device_id, const enum NODE_TYPE node_type) {
     ble_node_manager_t *manager = g_new0(ble_node_manager_t, 1);
     if (!manager) return NULL;
 
@@ -147,6 +250,7 @@ ble_node_manager_t *ble_init(uint32_t device_id, enum NODE_TYPE node_type) {
     manager->scanning = FALSE;
     manager->running = FALSE;
     manager->discovered_count = 0;
+    manager->incoming_count = 0;
 
     /* Initialize timer IDs */
     manager->discovery_timer_id = 0;
@@ -256,6 +360,18 @@ int ble_start(ble_node_manager_t *manager) {
 
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
+    /* Check if adapter is powered on, if not power it on */
+    const gboolean is_powered = binc_adapter_get_powered_state(manager->adapter);
+    log_debug(BT_TAG, "Adapter powered state: %s", is_powered ? "ON" : "OFF");
+
+    /* Set up powered state change callback */
+    binc_adapter_set_powered_state_cb(manager->adapter, &on_adapter_powered_state_changed);
+
+    if (!is_powered) {
+        log_info(BT_TAG, "Powering on Bluetooth adapter...");
+        binc_adapter_power_on(manager->adapter);
+    }
+
     /* Create agent for pairing (JustWorks mode) */
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
@@ -354,7 +470,7 @@ void ble_stop_discovery(ble_node_manager_t *manager) {
     }
 }
 
-int ble_is_discovering(ble_node_manager_t *manager) {
+int ble_is_discovering(const ble_node_manager_t *manager) {
     return manager ? manager->scanning : 0;
 }
 
@@ -383,7 +499,7 @@ int ble_start_advertising(ble_node_manager_t *manager) {
 
     manager->advertising = TRUE;
 
-    log_debug(BT_TAG, "Advertising as LocalNet-%08X", manager->mesh_node->device_id);
+    log_info(BT_TAG, "Advertising as LocalNet-%08X", manager->mesh_node->device_id);
 
     return 0;
 }
@@ -402,12 +518,12 @@ void ble_stop_advertising(ble_node_manager_t *manager) {
     manager->advertising = FALSE;
 }
 
-int ble_is_advertising(ble_node_manager_t *manager) {
+int ble_is_advertising(const ble_node_manager_t *manager) {
     return manager ? manager->advertising : 0;
 }
 
 /* Connection management */
-int ble_connect_to_node(ble_node_manager_t *manager, uint32_t device_id) {
+int ble_connect_to_node(ble_node_manager_t *manager, const uint32_t device_id) {
     if (!manager) return -1;
 
     discovered_device_t *discovered = ble_find_discovered_device(manager, device_id);
@@ -457,7 +573,7 @@ int ble_connect_to_node(ble_node_manager_t *manager, uint32_t device_id) {
     return 0;
 }
 
-int ble_disconnect_from_node(ble_node_manager_t *manager, uint32_t device_id) {
+int ble_disconnect_from_node(ble_node_manager_t *manager, const uint32_t device_id) {
     if (!manager) return -1;
 
     discovered_device_t *discovered = ble_find_discovered_device(manager, device_id);
@@ -480,16 +596,26 @@ int ble_get_connected_count(ble_node_manager_t *manager) {
     if (!manager) return 0;
 
     int count = 0;
+
+    /* Count outgoing connections */
     for (size_t i = 0; i < manager->discovered_count; i++) {
         if (manager->discovered_devices[i].is_connected) {
             count++;
         }
     }
+
+    /* Count incoming connections */
+    for (size_t i = 0; i < manager->incoming_count; i++) {
+        if (manager->incoming_clients[i].is_connected) {
+            count++;
+        }
+    }
+
     return count;
 }
 
 /* Data transmission */
-int ble_send_data(ble_node_manager_t *manager, uint32_t dest_id, const uint8_t *data, size_t len) {
+int ble_send_data(ble_node_manager_t *manager, const uint32_t dest_id, const uint8_t *data, const size_t len) {
     if (!manager || !data || len == 0) return -1;
 
     discovered_device_t *discovered = ble_find_discovered_device(manager, dest_id);
@@ -519,7 +645,7 @@ int ble_send_data(ble_node_manager_t *manager, uint32_t dest_id, const uint8_t *
     return 0;
 }
 
-int ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, size_t len) {
+int ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, const size_t len) {
     if (!manager || !data || len == 0) return -1;
 
     int sent_count = 0;
@@ -535,35 +661,35 @@ int ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, size_t 
 }
 
 /* Callback registration */
-void ble_set_data_callback(ble_node_manager_t *manager, on_data_received_cb callback) {
+void ble_set_data_callback(ble_node_manager_t *manager, const on_data_received_cb callback) {
     if (manager) manager->data_callback = callback;
 }
 
-void ble_set_connected_callback(ble_node_manager_t *manager, on_node_connected_cb callback) {
+void ble_set_connected_callback(ble_node_manager_t *manager, const on_node_connected_cb callback) {
     if (manager) manager->connected_callback = callback;
 }
 
-void ble_set_disconnected_callback(ble_node_manager_t *manager, on_node_disconnected_cb callback) {
+void ble_set_disconnected_callback(ble_node_manager_t *manager, const on_node_disconnected_cb callback) {
     if (manager) manager->disconnected_callback = callback;
 }
 
-void ble_set_discovered_callback(ble_node_manager_t *manager, on_node_discovered_cb callback) {
+void ble_set_discovered_callback(ble_node_manager_t *manager, const on_node_discovered_cb callback) {
     if (manager) manager->discovered_callback = callback;
 }
 
 /* Main loop functions */
-GMainLoop *ble_get_main_loop(ble_node_manager_t *manager) {
+GMainLoop *ble_get_main_loop(const ble_node_manager_t *manager) {
     return manager ? manager->main_loop : NULL;
 }
 
-void ble_run_main_loop(ble_node_manager_t *manager) {
+void ble_run_main_loop(const ble_node_manager_t *manager) {
     if (manager && manager->main_loop) {
         log_debug(BT_TAG, "Running main loop");
         g_main_loop_run(manager->main_loop);
     }
 }
 
-void ble_quit_main_loop(ble_node_manager_t *manager) {
+void ble_quit_main_loop(const ble_node_manager_t *manager) {
     if (manager && manager->main_loop) {
         log_debug(BT_TAG, "Quitting main loop");
         g_main_loop_quit(manager->main_loop);
@@ -571,7 +697,7 @@ void ble_quit_main_loop(ble_node_manager_t *manager) {
 }
 
 /* Internal callbacks */
-static void on_scan_result(Adapter *adapter, Device *device) {
+static void on_scan_result(Device *device) {
     if (!g_manager || !device) return;
 
     const char *name = binc_device_get_name(device);
@@ -579,17 +705,17 @@ static void on_scan_result(Adapter *adapter, Device *device) {
         return;  /* Not a LocalNet device */
     }
 
-    uint32_t device_id = ble_extract_device_id(name);
+    const uint32_t device_id = ble_extract_device_id(name);
     if (device_id == 0 || device_id == g_manager->mesh_node->device_id) {
         return;  /* Invalid ID or self */
     }
 
-    int16_t rssi = binc_device_get_rssi(device);
+    const int16_t rssi = binc_device_get_rssi(device);
 
     log_debug(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
 
     /* Add to discovered list */
-    discovered_device_t *discovered = add_discovered_device(g_manager, device, device_id, (int8_t)rssi);
+    const discovered_device_t *discovered = add_discovered_device(g_manager, device, device_id, (int8_t)rssi);
 
     /* Notify callback */
     if (g_manager->discovered_callback) {
@@ -612,7 +738,7 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     }
 }
 
-static void on_connection_state_changed(Device *device, ConnectionState state, const GError *error) {
+static void on_connection_state_changed(Device *device, const ConnectionState state, const GError *error) {
     if (!g_manager || !device) return;
 
     discovered_device_t *discovered = ble_find_device_by_ptr(g_manager, device);
@@ -688,13 +814,13 @@ static void on_services_resolved(Device *device) {
     }
 
     /* Send discovery message to newly connected node */
-    struct discovery_message disc_msg = {
+    const struct discovery_message disc_msg = {
         .available_connections = g_manager->mesh_node->available_connections,
         .timestamp = get_current_timestamp()
     };
 
     uint8_t buffer[32];
-    size_t len = serialize_discovery(&disc_msg, buffer, sizeof(buffer));
+    const size_t len = serialize_discovery(&disc_msg, buffer, sizeof(buffer));
     if (len > 0) {
         ble_send_data(g_manager, discovered->device_id, buffer, len);
     }
@@ -741,7 +867,7 @@ static void on_notify_characteristic(Device *device, Characteristic *characteris
     }
 }
 
-static gboolean on_request_authorization(Device *device) {
+static gboolean on_request_authorization(const Device *device) {
     const char *name = binc_device_get_name(device);
     log_debug(BT_TAG, "Authorizing device: %s", name ? name : "unknown");
     return TRUE;  /* Auto-accept (JustWorks) */
@@ -754,13 +880,13 @@ static const char* on_local_char_read(const Application *app, const char *addres
     if (g_str_equal(service_uuid, LOCAL_NET_SERVICE_UUID)) {
         if (g_str_equal(char_uuid, LOCAL_NET_CTRL_CHAR_UUID)) {
             /* Return node info */
-            struct discovery_message disc_msg = {
+            const struct discovery_message disc_msg = {
                 .available_connections = g_manager->mesh_node->available_connections,
                 .timestamp = get_current_timestamp()
             };
 
             uint8_t buffer[32];
-            size_t len = serialize_discovery(&disc_msg, buffer, sizeof(buffer));
+            const size_t len = serialize_discovery(&disc_msg, buffer, sizeof(buffer));
 
             GByteArray *value = g_byte_array_sized_new(len);
             g_byte_array_append(value, buffer, len);
@@ -780,12 +906,37 @@ static const char* on_local_char_write(const Application *app, const char *addre
 
     if (g_str_equal(service_uuid, LOCAL_NET_SERVICE_UUID)) {
         if (g_str_equal(char_uuid, LOCAL_NET_DATA_CHAR_UUID)) {
-            log_debug(BT_TAG, "Received write from %s: %u bytes", address, byteArray->len);
+            /* Find or add this client to our incoming connections */
+            incoming_client_t *client = ble_find_or_add_incoming_client(g_manager, address);
+            uint32_t sender_id = 0;
 
-            /* Extract device ID from address (this is a placeholder - in real use you'd track by address) */
-            /* For now, notify with a zero ID - the app layer should handle addressing */
+            if (client) {
+                sender_id = client->device_id;
+                client->last_seen = get_current_timestamp();
+
+                /* Check if this is a new connection */
+                if (!client->is_connected) {
+                    client->is_connected = TRUE;
+                    log_info(BT_TAG, "Incoming connection from %s (ID: 0x%08X)", address, sender_id);
+
+                    /* Add to mesh node's connection table */
+                    if (g_manager->mesh_node) {
+                        add_connection(g_manager->mesh_node->connection_table, sender_id, 0);
+                        update_connection_state(g_manager->mesh_node->connection_table, sender_id, STABLE);
+                        g_manager->mesh_node->available_connections--;
+                    }
+
+                    /* Notify callback */
+                    if (g_manager->connected_callback) {
+                        g_manager->connected_callback(sender_id);
+                    }
+                }
+            }
+
+            log_debug(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes", address, sender_id, byteArray->len);
+
             if (g_manager->data_callback) {
-                g_manager->data_callback(0, byteArray->data, byteArray->len);
+                g_manager->data_callback(sender_id, byteArray->data, byteArray->len);
             }
 
             return NULL;
@@ -796,7 +947,7 @@ static const char* on_local_char_write(const Application *app, const char *addre
 }
 
 /* Periodic callbacks */
-static gboolean periodic_discovery_callback(gpointer user_data) {
+static gboolean periodic_discovery_callback(const gpointer user_data) {
     ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
 
     if (!manager || !manager->running) return FALSE;
@@ -822,16 +973,16 @@ static gboolean periodic_discovery_callback(gpointer user_data) {
 }
 
 static gboolean periodic_reconnect_callback(gpointer user_data) {
-    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
+    ble_node_manager_t *manager = user_data;
 
     if (!manager || !manager->running) return FALSE;
 
     /* Try to reconnect to disconnected known devices */
     for (size_t i = 0; i < manager->discovered_count; i++) {
-        discovered_device_t *disc = &manager->discovered_devices[i];
+        const discovered_device_t *disc = &manager->discovered_devices[i];
 
         if (!disc->is_connected && !disc->connection_pending && disc->device) {
-            struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, disc->device_id);
+            const struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, disc->device_id);
 
             if (conn && conn->state == DISCONNECTED) {
                 if (has_available_connections(manager->mesh_node)) {
@@ -932,7 +1083,7 @@ static gboolean delayed_discovery_start(gpointer user_data) {
 
     if (!manager || !manager->running) return FALSE;
 
-    log_debug(BT_TAG, "Starting delayed discovery...");
+    log_info(BT_TAG, "Starting delayed discovery...");
     int result = ble_start_discovery(manager);
     if (result != 0) {
         log_error(BT_TAG, "Failed to start discovery, will retry...");
@@ -942,3 +1093,15 @@ static gboolean delayed_discovery_start(gpointer user_data) {
 
     return FALSE;  /* Don't repeat this one-shot timer */
 }
+
+/* Callback when adapter power state changes */
+static void on_adapter_powered_state_changed(Adapter *adapter, const gboolean powered) {
+    log_info(BT_TAG, "Adapter power state changed: %s", powered ? "ON" : "OFF");
+
+    if (powered && g_manager && g_manager->running && !g_app_registered) {
+        /* Adapter just powered on, start the initialization chain */
+        log_info(BT_TAG, "Adapter powered on, starting initialization...");
+        g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_app_registration, g_manager);
+    }
+}
+

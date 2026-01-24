@@ -25,6 +25,7 @@
 #define DISCOVERY_SCAN_INTERVAL_MS 30000
 #define RECONNECT_ATTEMPT_INTERVAL_MS 10000
 #define MAX_DISCOVERED_DEVICES 32
+#define MAX_INCOMING_CLIENTS 16
 
 /* BLE Connection State */
 typedef enum {
@@ -45,6 +46,14 @@ typedef struct {
     gboolean connection_pending;
 } discovered_device_t;
 
+/* Incoming client entry - tracks devices that connected to our GATT server */
+typedef struct {
+    char address[18];          /* MAC address string */
+    uint32_t device_id;        /* Derived device ID */
+    uint32_t last_seen;        /* Last activity timestamp */
+    gboolean is_connected;     /* Connection state */
+} incoming_client_t;
+
 /* Callback function types */
 typedef void (*on_data_received_cb)(uint32_t sender_id, const uint8_t *data, size_t len);
 typedef void (*on_node_connected_cb)(uint32_t node_id);
@@ -62,9 +71,13 @@ typedef struct {
 
     struct mesh_node *mesh_node;
 
-    /* Discovered devices */
+    /* Discovered devices (outgoing connections) */
     discovered_device_t discovered_devices[MAX_DISCOVERED_DEVICES];
     size_t discovered_count;
+
+    /* Incoming clients (devices connected to our GATT server) */
+    incoming_client_t incoming_clients[MAX_INCOMING_CLIENTS];
+    size_t incoming_count;
 
     /* State */
     ble_state_t state;
@@ -93,12 +106,12 @@ void ble_stop(ble_node_manager_t *manager);
 /* Node discovery */
 int ble_start_discovery(ble_node_manager_t *manager);
 void ble_stop_discovery(ble_node_manager_t *manager);
-int ble_is_discovering(ble_node_manager_t *manager);
+int ble_is_discovering(const ble_node_manager_t *manager);
 
 /* Advertising (peripheral mode) */
 int ble_start_advertising(ble_node_manager_t *manager);
 void ble_stop_advertising(ble_node_manager_t *manager);
-int ble_is_advertising(ble_node_manager_t *manager);
+int ble_is_advertising(const ble_node_manager_t *manager);
 
 /* Connection management */
 int ble_connect_to_node(ble_node_manager_t *manager, uint32_t device_id);
@@ -117,15 +130,20 @@ void ble_set_discovered_callback(ble_node_manager_t *manager, on_node_discovered
 
 /* Utility functions */
 uint32_t ble_extract_device_id(const char *device_name);
+uint32_t ble_mac_to_device_id(const char *mac);
 char *ble_generate_device_name(uint32_t device_id);
 discovered_device_t *ble_find_discovered_device(ble_node_manager_t *manager, uint32_t device_id);
 discovered_device_t *ble_find_device_by_ptr(ble_node_manager_t *manager, Device *device);
+incoming_client_t *ble_find_or_add_incoming_client(ble_node_manager_t *manager, const char *address);
 int ble_get_adapter_address(char *address, size_t len);
 
+/* Connection info for display */
+void ble_print_connection_table(ble_node_manager_t *manager);
+
 /* Main loop integration */
-GMainLoop *ble_get_main_loop(ble_node_manager_t *manager);
-void ble_run_main_loop(ble_node_manager_t *manager);
-void ble_quit_main_loop(ble_node_manager_t *manager);
+GMainLoop *ble_get_main_loop(const ble_node_manager_t *manager);
+void ble_run_main_loop(const ble_node_manager_t *manager);
+void ble_quit_main_loop(const ble_node_manager_t *manager);
 
 #endif //LOCALNET_BLUETOOTH_H
 

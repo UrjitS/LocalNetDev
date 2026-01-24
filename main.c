@@ -3,6 +3,8 @@
 #include <signal.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <string.h>
+#include <ctype.h>
 #include "bluetooth.h"
 #include "protocol.h"
 #include "logger.h"
@@ -11,6 +13,200 @@
 
 /* Global BLE manager for signal handler */
 static ble_node_manager_t *g_ble_manager = NULL;
+static volatile gboolean g_running = TRUE;
+
+/* ============================================================================
+ * MENU COMMAND SYSTEM
+ * ============================================================================ */
+
+/* Command handler function type */
+typedef void (*menu_command_handler)(void);
+
+/* Menu command structure */
+typedef struct {
+    const char *key;           /* Key to press (e.g., "1", "c", "q") */
+    const char *description;   /* Description shown in menu */
+    menu_command_handler handler;
+} menu_command_t;
+
+/* Forward declarations for command handlers */
+static void cmd_show_connections(void);
+static void cmd_show_discovered(void);
+static void cmd_show_node_info(void);
+static void cmd_show_routing_table(void);
+static void cmd_toggle_discovery(void);
+static void cmd_toggle_advertising(void);
+static void cmd_show_help(void);
+static void cmd_quit(void);
+
+/* Define menu commands - easily extendable by adding new entries */
+static const menu_command_t g_menu_commands[] = {
+    { "1", "Show connection table",     cmd_show_connections },
+    { "2", "Show discovered devices",   cmd_show_discovered },
+    { "3", "Show node info",            cmd_show_node_info },
+    { "4", "Show routing table",        cmd_show_routing_table },
+    { "d", "Toggle discovery",          cmd_toggle_discovery },
+    { "a", "Toggle advertising",        cmd_toggle_advertising },
+    { "h", "Show help",                 cmd_show_help },
+    { "q", "Quit",                      cmd_quit },
+    { NULL, NULL, NULL }  /* Sentinel */
+};
+
+/* Command handlers implementation */
+static void cmd_show_connections(void) {
+    if (g_ble_manager) {
+        ble_print_connection_table(g_ble_manager);
+    } else {
+        printf("Error: BLE manager not initialized\n");
+    }
+}
+
+static void cmd_show_discovered(void) {
+    if (!g_ble_manager) {
+        printf("Error: BLE manager not initialized\n");
+        return;
+    }
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                    DISCOVERED DEVICES                            ║\n");
+    printf("╠────────────────┬────────────┬────────────┬────────────────────────╣\n");
+    printf("║ Device ID      │ Connected  │ RSSI       │ Last Seen              ║\n");
+    printf("╠────────────────┼────────────┼────────────┼────────────────────────╣\n");
+
+    /* Access discovered devices directly - we need to expose this or use accessor */
+    /* For now, just indicate how many we know about */
+    printf("║ Total discovered devices: (use verbose mode to see scan results) ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+static void cmd_show_node_info(void) {
+    if (!g_ble_manager) {
+        printf("Error: BLE manager not initialized\n");
+        return;
+    }
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                      NODE INFORMATION                            ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+
+    char mac_address[18] = {0};
+    if (ble_get_adapter_address(mac_address, sizeof(mac_address)) == 0) {
+        printf("║ Adapter MAC:    %-50s ║\n", mac_address);
+    }
+
+    printf("║ Connected nodes: %-49d ║\n", ble_get_connected_count(g_ble_manager));
+    printf("║ Advertising:     %-49s ║\n", ble_is_advertising(g_ble_manager) ? "YES" : "NO");
+    printf("║ Discovering:     %-49s ║\n", ble_is_discovering(g_ble_manager) ? "YES" : "NO");
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+static void cmd_show_routing_table(void) {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                     ROUTING TABLE                                ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║ (Routing table display - to be implemented)                      ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+static void cmd_toggle_discovery(void) {
+    if (!g_ble_manager) {
+        printf("Error: BLE manager not initialized\n");
+        return;
+    }
+
+    if (ble_is_discovering(g_ble_manager)) {
+        ble_stop_discovery(g_ble_manager);
+        printf("Discovery STOPPED\n");
+    } else {
+        ble_start_discovery(g_ble_manager);
+        printf("Discovery STARTED\n");
+    }
+}
+
+static void cmd_toggle_advertising(void) {
+    if (!g_ble_manager) {
+        printf("Error: BLE manager not initialized\n");
+        return;
+    }
+
+    if (ble_is_advertising(g_ble_manager)) {
+        ble_stop_advertising(g_ble_manager);
+        printf("Advertising STOPPED\n");
+    } else {
+        ble_start_advertising(g_ble_manager);
+        printf("Advertising STARTED\n");
+    }
+}
+
+static void cmd_show_help(void) {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                    LOCALNET COMMANDS                             ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+
+    for (int i = 0; g_menu_commands[i].key != NULL; i++) {
+        printf("║  [%s] %-60s ║\n", g_menu_commands[i].key, g_menu_commands[i].description);
+    }
+
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+static void cmd_quit(void) {
+    printf("Quitting...\n");
+    g_running = FALSE;
+    if (g_ble_manager) {
+        ble_quit_main_loop(g_ble_manager);
+    }
+}
+
+/* Process a single command input */
+static void process_command(const char *input) {
+    /* Trim whitespace */
+    while (*input && isspace(*input)) input++;
+
+    if (*input == '\0') return;  /* Empty input */
+
+    /* Find matching command */
+    for (int i = 0; g_menu_commands[i].key != NULL; i++) {
+        if (g_ascii_strcasecmp(input, g_menu_commands[i].key) == 0) {
+            g_menu_commands[i].handler();
+            return;
+        }
+    }
+
+    printf("Unknown command: '%s'. Press 'h' for help.\n", input);
+}
+
+/* Callback for stdin input in GLib main loop */
+static gboolean stdin_callback(GIOChannel *source, GIOCondition condition, gpointer data) {
+    if (condition & G_IO_IN) {
+        gchar *line = NULL;
+        gsize length;
+        GError *error = NULL;
+
+        if (g_io_channel_read_line(source, &line, &length, NULL, &error) == G_IO_STATUS_NORMAL) {
+            if (line) {
+                /* Remove newline */
+                line[strcspn(line, "\n\r")] = '\0';
+                process_command(line);
+                g_free(line);
+            }
+        }
+
+        if (error) {
+            g_error_free(error);
+        }
+    }
+
+    return TRUE;  /* Continue watching */
+}
 
 void usage(const char *program_name) {
     printf("LocalNet Mesh Node\n");
@@ -207,9 +403,20 @@ int main(int argc, char *argv[]) {
     log_info(TAG, "Node is running. Press Ctrl+C to exit.");
     log_info(TAG, "Advertising as: LocalNet-%08X", device_id);
     log_info(TAG, "Scanning for other LocalNet nodes...");
+    log_info(TAG, "Press 'h' for help menu.");
+
+    /* Set up stdin input handling for menu commands */
+    GIOChannel *stdin_channel = g_io_channel_unix_new(STDIN_FILENO);
+    g_io_channel_set_encoding(stdin_channel, NULL, NULL);
+    g_io_channel_set_buffered(stdin_channel, TRUE);
+    guint stdin_watch_id = g_io_add_watch(stdin_channel, G_IO_IN, stdin_callback, NULL);
 
     /* Run the main loop (blocks until quit) */
     ble_run_main_loop(g_ble_manager);
+
+    /* Cleanup stdin channel */
+    g_source_remove(stdin_watch_id);
+    g_io_channel_unref(stdin_channel);
 
     /* Cleanup */
     log_info(TAG, "Shutting down...");
