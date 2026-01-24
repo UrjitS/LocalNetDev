@@ -412,6 +412,14 @@ int ble_connect_to_node(ble_node_manager_t *manager, uint32_t device_id) {
         return -1;
     }
 
+    /* Verify device path is still valid (device may have been removed from adapter) */
+    const char *device_path = binc_device_get_path(discovered->device);
+    if (!device_path) {
+        log_debug(BT_TAG, "Device 0x%08X has invalid path, cannot connect", device_id);
+        discovered->device = NULL;  /* Clear invalid device pointer */
+        return -1;
+    }
+
     if (discovered->is_connected) {
         log_debug(BT_TAG, "Already connected to device 0x%08X", device_id);
         return 0;
@@ -637,6 +645,8 @@ static void on_connection_state_changed(Device *device, ConnectionState state, c
         /* Clean up if not bonded */
         if (binc_device_get_bonding_state(device) != BINC_BONDED) {
             binc_adapter_remove_device(g_manager->adapter, device);
+            /* Clear the device pointer to prevent reconnection attempts with invalid device */
+            discovered->device = NULL;
         }
     }
 }
