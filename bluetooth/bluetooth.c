@@ -4,13 +4,13 @@
 static ble_node_manager_t *g_manager = NULL;
 
 /* Forward declarations for internal callbacks */
-static void on_scan_result(Device *device);
+static void on_scan_result(Adapter *adapter, Device *device);
 static void on_connection_state_changed(Device *device, ConnectionState state, const GError *error);
 static void on_services_resolved(Device *device);
 static void on_read_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_notify_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray);
-static gboolean on_request_authorization(const Device *device);
+static gboolean on_request_authorization(Device *device);
 static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid,
                                        const char* char_uuid, const guint16 offset, const guint16 mtu);
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid,
@@ -697,7 +697,8 @@ void ble_quit_main_loop(const ble_node_manager_t *manager) {
 }
 
 /* Internal callbacks */
-static void on_scan_result(Device *device) {
+static void on_scan_result(Adapter *adapter, Device *device) {
+    (void)adapter;  /* Unused parameter */
     if (!g_manager || !device) return;
 
     const char *name = binc_device_get_name(device);
@@ -867,7 +868,7 @@ static void on_notify_characteristic(Device *device, Characteristic *characteris
     }
 }
 
-static gboolean on_request_authorization(const Device *device) {
+static gboolean on_request_authorization(Device *device) {
     const char *name = binc_device_get_name(device);
     log_debug(BT_TAG, "Authorizing device: %s", name ? name : "unknown");
     return TRUE;  /* Auto-accept (JustWorks) */
