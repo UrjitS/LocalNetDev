@@ -20,9 +20,11 @@ static gboolean periodic_reconnect_callback(gpointer user_data);
 static gboolean periodic_heartbeat_callback(gpointer user_data);
 static gboolean delayed_discovery_start(gpointer user_data);
 static gboolean delayed_advertising_start(gpointer user_data);
+static gboolean delayed_app_registration(gpointer user_data);
 
 /* Maximum time to wait for adapter to become ready (in milliseconds) */
-#define ADAPTER_READY_DELAY_MS 2000
+#define ADAPTER_READY_DELAY_MS 3000
+#define ADAPTER_INIT_RETRY_MS 1000
 
 /* Utility function implementations */
 uint32_t ble_extract_device_id(const char *device_name) {
@@ -258,7 +260,7 @@ int ble_start(ble_node_manager_t *manager) {
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
 
-    /* Setup peripheral (GATT server) */
+    /* Setup peripheral (GATT server) - create but don't register yet */
     manager->app = binc_create_application(manager->adapter);
     binc_application_add_service(manager->app, LOCAL_NET_SERVICE_UUID);
 
@@ -272,20 +274,22 @@ int ble_start(ble_node_manager_t *manager) {
 
     binc_application_set_char_read_cb(manager->app, &on_local_char_read);
     binc_application_set_char_write_cb(manager->app, &on_local_char_write);
-    binc_adapter_register_application(manager->adapter, manager->app);
 
-    /* Setup central (scanner) */
+    /* NOTE: binc_adapter_register_application is now called in delayed_app_registration
+     * to avoid "Resource Not Ready" errors on Raspberry Pi */
+
+    /* Setup central (scanner) callbacks - actual discovery is started later */
     binc_adapter_set_discovery_cb(manager->adapter, &on_scan_result);
-    binc_adapter_set_discovery_filter(manager->adapter, -100, NULL, NULL);  /* -100 dBm minimum RSSI */
 
     manager->running = TRUE;
 
-    /* Delay advertising and discovery to allow adapter to become ready (important for Raspberry Pi) */
+    /* Delay all adapter operations to allow adapter to become ready (important for Raspberry Pi) */
     log_debug(BT_TAG, "Waiting %d ms for adapter to become ready...", ADAPTER_READY_DELAY_MS);
-    g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_advertising_start, manager);
-    g_timeout_add(ADAPTER_READY_DELAY_MS + 500, delayed_discovery_start, manager);
 
-    /* Start periodic discovery */
+    /* Chain the delayed operations: app registration -> advertising -> discovery */
+    g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_app_registration, manager);
+
+    /* Start periodic discovery (will only actually discover when adapter is ready) */
     manager->discovery_timer_id = g_timeout_add(DISCOVERY_SCAN_INTERVAL_MS, periodic_discovery_callback, manager);
 
     /* Start periodic reconnect attempts */
@@ -874,6 +878,35 @@ static gboolean periodic_heartbeat_callback(gpointer user_data) {
 }
 
 /* Delayed startup callbacks for Raspberry Pi compatibility */
+
+/* Track whether app registration succeeded (needed for retry logic) */
+static gboolean g_app_registered = FALSE;
+
+static gboolean delayed_app_registration(gpointer user_data) {
+    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
+
+    if (!manager || !manager->running) return FALSE;
+
+    log_debug(BT_TAG, "Attempting to register GATT application...");
+
+    /* Set the discovery filter first - this may also fail if adapter not ready */
+    binc_adapter_set_discovery_filter(manager->adapter, -100, NULL, NULL);
+
+    /* Register the GATT application */
+    binc_adapter_register_application(manager->adapter, manager->app);
+
+    /* We can't directly check if registration succeeded since binc doesn't return status.
+     * We'll optimistically proceed and let advertising/discovery retry if they fail. */
+    g_app_registered = TRUE;
+
+    log_debug(BT_TAG, "GATT application registration initiated");
+
+    /* Now start advertising after a short additional delay */
+    g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_advertising_start, manager);
+
+    return FALSE;  /* Don't repeat this one-shot timer */
+}
+
 static gboolean delayed_advertising_start(gpointer user_data) {
     ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
 
@@ -884,8 +917,12 @@ static gboolean delayed_advertising_start(gpointer user_data) {
     if (result != 0) {
         log_error(BT_TAG, "Failed to start advertising, will retry...");
         /* Retry after another delay */
-        g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_advertising_start, manager);
+        g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_advertising_start, manager);
+        return FALSE;
     }
+
+    /* Advertising started successfully, now start discovery */
+    g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_discovery_start, manager);
 
     return FALSE;  /* Don't repeat this one-shot timer */
 }
@@ -900,7 +937,7 @@ static gboolean delayed_discovery_start(gpointer user_data) {
     if (result != 0) {
         log_error(BT_TAG, "Failed to start discovery, will retry...");
         /* Retry after another delay */
-        g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_discovery_start, manager);
+        g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_discovery_start, manager);
     }
 
     return FALSE;  /* Don't repeat this one-shot timer */
