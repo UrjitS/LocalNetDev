@@ -18,6 +18,11 @@ static const char* on_local_char_write(const Application *app, const char *addre
 static gboolean periodic_discovery_callback(gpointer user_data);
 static gboolean periodic_reconnect_callback(gpointer user_data);
 static gboolean periodic_heartbeat_callback(gpointer user_data);
+static gboolean delayed_discovery_start(gpointer user_data);
+static gboolean delayed_advertising_start(gpointer user_data);
+
+/* Maximum time to wait for adapter to become ready (in milliseconds) */
+#define ADAPTER_READY_DELAY_MS 2000
 
 /* Utility function implementations */
 uint32_t ble_extract_device_id(const char *device_name) {
@@ -275,8 +280,10 @@ int ble_start(ble_node_manager_t *manager) {
 
     manager->running = TRUE;
 
-    /* Start advertising immediately */
-    ble_start_advertising(manager);
+    /* Delay advertising and discovery to allow adapter to become ready (important for Raspberry Pi) */
+    log_debug(BT_TAG, "Waiting %d ms for adapter to become ready...", ADAPTER_READY_DELAY_MS);
+    g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_advertising_start, manager);
+    g_timeout_add(ADAPTER_READY_DELAY_MS + 500, delayed_discovery_start, manager);
 
     /* Start periodic discovery */
     manager->discovery_timer_id = g_timeout_add(DISCOVERY_SCAN_INTERVAL_MS, periodic_discovery_callback, manager);
@@ -287,8 +294,6 @@ int ble_start(ble_node_manager_t *manager) {
     /* Start heartbeat timer */
     manager->heartbeat_timer_id = g_timeout_add_seconds(HEARTBEAT_INTERVAL_SECONDS, periodic_heartbeat_callback, manager);
 
-    /* Start initial discovery immediately */
-    ble_start_discovery(manager);
 
     log_debug(BT_TAG, "BLE node manager started successfully");
 
@@ -858,3 +863,35 @@ static gboolean periodic_heartbeat_callback(gpointer user_data) {
     return TRUE;  /* Continue timer */
 }
 
+/* Delayed startup callbacks for Raspberry Pi compatibility */
+static gboolean delayed_advertising_start(gpointer user_data) {
+    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
+
+    if (!manager || !manager->running) return FALSE;
+
+    log_debug(BT_TAG, "Starting delayed advertising...");
+    int result = ble_start_advertising(manager);
+    if (result != 0) {
+        log_error(BT_TAG, "Failed to start advertising, will retry...");
+        /* Retry after another delay */
+        g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_advertising_start, manager);
+    }
+
+    return FALSE;  /* Don't repeat this one-shot timer */
+}
+
+static gboolean delayed_discovery_start(gpointer user_data) {
+    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
+
+    if (!manager || !manager->running) return FALSE;
+
+    log_debug(BT_TAG, "Starting delayed discovery...");
+    int result = ble_start_discovery(manager);
+    if (result != 0) {
+        log_error(BT_TAG, "Failed to start discovery, will retry...");
+        /* Retry after another delay */
+        g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_discovery_start, manager);
+    }
+
+    return FALSE;  /* Don't repeat this one-shot timer */
+}
