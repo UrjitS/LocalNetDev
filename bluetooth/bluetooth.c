@@ -510,6 +510,26 @@ int ble_start(ble_node_manager_t *manager) {
         binc_adapter_power_on(manager->adapter);
     }
 
+    /*
+     * Remove all cached/bonded LocalNet devices at startup to prevent stale bond issues.
+     * Stale bonds cause "le-connection-abort-by-local" errors and immediate disconnections.
+     */
+    log_debug(BT_TAG, "Removing stale LocalNet devices from adapter...");
+    GList *cached_devices = binc_adapter_get_devices(manager->adapter);
+    for (GList *iter = cached_devices; iter != NULL; iter = iter->next) {
+        Device *dev = (Device *)iter->data;
+        if (dev) {
+            const char *dev_name = binc_device_get_name(dev);
+            if (dev_name && g_str_has_prefix(dev_name, LOCAL_NET_DEVICE_PREFIX)) {
+                log_debug(BT_TAG, "Removing cached device at startup: %s", dev_name);
+                binc_adapter_remove_device(manager->adapter, dev);
+            }
+        }
+    }
+    if (cached_devices) {
+        g_list_free(cached_devices);
+    }
+
     /* Create agent for pairing (JustWorks mode) */
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
@@ -1056,17 +1076,18 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
               discovered->device_id, binc_device_get_connection_state_name(device));
 
     if (state == BINC_CONNECTED) {
-        /* Wait for services to be resolved before marking as fully connected */
+        /* Wait for services to be resolved before marking as fully connected.
+         * DO NOT restart advertising/discovery here - it can interfere with
+         * service resolution. Wait until on_services_resolved is called. */
         update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, CONNECTING);
 
-        /* Restart advertising and discovery now that connection is established */
-        if (!g_manager->advertising && g_manager->running) {
-            log_debug(BT_TAG, "Restarting advertising after successful connection");
-            ble_start_advertising(g_manager);
-        }
-        if (!g_manager->scanning && g_manager->running) {
-            log_debug(BT_TAG, "Restarting discovery after successful connection");
-            ble_start_discovery(g_manager);
+        /*
+         * For bonded devices, services might already be cached/resolved.
+         * Check if services are already resolved and trigger the callback manually.
+         */
+        if (binc_device_get_services(device) != NULL) {
+            log_debug(BT_TAG, "Services already resolved for bonded device 0x%08X", discovered->device_id);
+            on_services_resolved(device);
         }
     } else if (state == BINC_DISCONNECTED) {
         gboolean was_connected = discovered->is_connected;
@@ -1194,6 +1215,20 @@ static void on_services_resolved(Device *device) {
     /* Notify callback */
     if (g_manager->connected_callback) {
         g_manager->connected_callback(discovered->device_id);
+    }
+
+    /*
+     * NOW it's safe to restart advertising and discovery.
+     * We waited until services were resolved to avoid interfering with
+     * the BLE connection establishment process.
+     */
+    if (!g_manager->advertising && g_manager->running) {
+        log_debug(BT_TAG, "Restarting advertising after services resolved");
+        ble_start_advertising(g_manager);
+    }
+    if (!g_manager->scanning && g_manager->running) {
+        log_debug(BT_TAG, "Restarting discovery after services resolved");
+        ble_start_discovery(g_manager);
     }
 
     /*
