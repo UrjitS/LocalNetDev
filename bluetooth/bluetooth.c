@@ -21,19 +21,10 @@ static const char* on_local_char_read(const Application *app, const char *addres
                                        const char* char_uuid, guint16 offset, guint16 mtu);
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid,
                                         const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
-static gboolean periodic_discovery_callback(gpointer user_data);
-static gboolean periodic_reconnect_callback(gpointer user_data);
 static gboolean periodic_heartbeat_callback(gpointer user_data);
-static gboolean delayed_discovery_start(gpointer user_data);
-static gboolean delayed_advertising_start(gpointer user_data);
-static gboolean delayed_app_registration(gpointer user_data);
-static void on_adapter_powered_state_changed(Adapter *adapter, gboolean powered);
 static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, const GError *error);
 static void on_remote_central_connected(Adapter *adapter, Device *device);
 
-/* Maximum time to wait for adapter to become ready (in milliseconds) */
-#define ADAPTER_READY_DELAY_MS 3000
-#define ADAPTER_INIT_RETRY_MS 1000
 
 /* Utility function implementations */
 uint32_t ble_extract_device_id(const char *device_name) {
@@ -514,11 +505,6 @@ int ble_start(ble_node_manager_t *manager) {
 
     /* Check if adapter is powered on, if not power it on */
     const gboolean is_powered = binc_adapter_get_powered_state(manager->adapter);
-    log_debug(BT_TAG, "Adapter powered state: %s", is_powered ? "ON" : "OFF");
-
-    /* Set up powered state change callback */
-    binc_adapter_set_powered_state_cb(manager->adapter, &on_adapter_powered_state_changed);
-
     if (!is_powered) {
         log_info(BT_TAG, "Powering on Bluetooth adapter...");
         binc_adapter_power_on(manager->adapter);
@@ -528,7 +514,7 @@ int ble_start(ble_node_manager_t *manager) {
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
 
-    /* Setup peripheral (GATT server) - create but don't register yet */
+    /* Setup peripheral (GATT server) */
     manager->app = binc_create_application(manager->adapter);
     binc_application_add_service(manager->app, LOCAL_NET_SERVICE_UUID);
 
@@ -543,10 +529,10 @@ int ble_start(ble_node_manager_t *manager) {
     binc_application_set_char_read_cb(manager->app, &on_local_char_read);
     binc_application_set_char_write_cb(manager->app, &on_local_char_write);
 
-    /* NOTE: binc_adapter_register_application is now called in delayed_app_registration
-     * to avoid "Resource Not Ready" errors on Raspberry Pi */
+    /* Register GATT application immediately */
+    binc_adapter_register_application(manager->adapter, manager->app);
 
-    /* Setup central (scanner) callbacks - actual discovery is started later */
+    /* Setup central (scanner) callbacks */
     binc_adapter_set_discovery_cb(manager->adapter, &on_scan_result);
     binc_adapter_set_discovery_state_cb(manager->adapter, &on_discovery_state_changed);
 
@@ -555,21 +541,15 @@ int ble_start(ble_node_manager_t *manager) {
 
     manager->running = TRUE;
 
-    /* Delay all adapter operations to allow adapter to become ready (important for Raspberry Pi) */
-    log_debug(BT_TAG, "Waiting %d ms for adapter to become ready...", ADAPTER_READY_DELAY_MS);
+    /* Start advertising immediately */
+    ble_start_advertising(manager);
 
-    /* Chain the delayed operations: app registration -> advertising -> discovery */
-    g_timeout_add(ADAPTER_READY_DELAY_MS, delayed_app_registration, manager);
-
-    /* Start periodic discovery (will only actually discover when adapter is ready) */
-    manager->discovery_timer_id = g_timeout_add(DISCOVERY_SCAN_INTERVAL_MS, periodic_discovery_callback, manager);
-
-    /* Start periodic reconnect attempts */
-    manager->reconnect_timer_id = g_timeout_add(RECONNECT_ATTEMPT_INTERVAL_MS, periodic_reconnect_callback, manager);
+    /* Start discovery immediately */
+    binc_adapter_set_discovery_filter(manager->adapter, -100, NULL, NULL);
+    ble_start_discovery(manager);
 
     /* Start heartbeat timer */
     manager->heartbeat_timer_id = g_timeout_add_seconds(HEARTBEAT_INTERVAL_SECONDS, periodic_heartbeat_callback, manager);
-
 
     log_debug(BT_TAG, "BLE node manager started successfully");
 
@@ -962,9 +942,6 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     if (!g_manager || !device) return;
 
     const char *name = binc_device_get_name(device);
-    const char *address = binc_device_get_address(device);
-
-    // log_debug(BT_TAG, "Scan result: %s (%s)", name ? name : "(null)", address ? address : "unknown");
 
     if (!name || !g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
         return;  /* Not a LocalNet device */
@@ -977,13 +954,11 @@ static void on_scan_result(Adapter *adapter, Device *device) {
 
     /* Skip if already connected (via incoming or outgoing connection) */
     if (is_already_connected(g_manager, device_id)) {
-        log_debug(BT_TAG, "Skipping discovery of already-connected node 0x%08X", device_id);
         return;
     }
 
     /* Skip if connection is pending */
     if (is_connection_pending(g_manager, device_id)) {
-        log_debug(BT_TAG, "Skipping discovery of pending-connection node 0x%08X", device_id);
         return;
     }
 
@@ -991,7 +966,7 @@ static void on_scan_result(Adapter *adapter, Device *device) {
 
     log_debug(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
 
-    /* Add to discovered list */
+    /* Add or update discovered device list */
     discovered_device_t *discovered = add_discovered_device(g_manager, device, device_id, (int8_t)rssi);
 
     /* Notify callback */
@@ -1003,36 +978,33 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     if (discovered && !discovered->is_connected && !discovered->connection_pending) {
         if (has_available_connections(g_manager->mesh_node)) {
             /*
-             * Connection arbitration: To prevent both sides from connecting simultaneously
-             * (which causes BlueZ errors and disconnections), only the node with the LOWER
-             * device ID should initiate the outgoing connection. The higher ID node will
-             * wait to receive the incoming connection instead.
+             * Connection arbitration: Only the node with the LOWER device ID
+             * should initiate the outgoing connection.
              */
             if (g_manager->mesh_node->device_id < device_id) {
-                /* We have the lower ID, so WE initiate the connection */
-                log_debug(BT_TAG, "Arbitration: we (0x%08X) initiate connection to 0x%08X",
-                          g_manager->mesh_node->device_id, device_id);
+                log_debug(BT_TAG, "Connecting to 0x%08X (we have lower ID)", device_id);
 
-                /* Add to connection table as discovering */
+                discovered->connection_pending = TRUE;
+                discovered->last_connect_attempt = get_current_timestamp();
+
+                /* Set up device callbacks BEFORE connecting - like ble.c does */
+                binc_device_set_connection_state_change_cb(device, &on_connection_state_changed);
+                binc_device_set_services_resolved_cb(device, &on_services_resolved);
+                binc_device_set_read_char_cb(device, &on_read_characteristic);
+                binc_device_set_write_char_cb(device, &on_write_characteristic);
+                binc_device_set_notify_char_cb(device, &on_notify_characteristic);
+
+                /* Add to connection table */
                 struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
                 if (!conn) {
                     add_connection(g_manager->mesh_node->connection_table, device_id, (int8_t)rssi);
-                    update_connection_state(g_manager->mesh_node->connection_table, device_id, DISCOVERING);
                 }
+                update_connection_state(g_manager->mesh_node->connection_table, device_id, CONNECTING);
 
-                /* Attempt to connect */
-                ble_connect_to_node(g_manager, device_id);
+                /* Connect directly using the device from the callback */
+                binc_device_connect(device);
             } else {
-                /* We have the higher ID, wait for the other node to connect to us */
-                log_debug(BT_TAG, "Arbitration: waiting for 0x%08X to connect to us (0x%08X)",
-                          device_id, g_manager->mesh_node->device_id);
-
-                /* Still add to discovered list but don't actively connect */
-                struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
-                if (!conn) {
-                    add_connection(g_manager->mesh_node->connection_table, device_id, (int8_t)rssi);
-                    update_connection_state(g_manager->mesh_node->connection_table, device_id, DISCOVERING);
-                }
+                log_debug(BT_TAG, "Waiting for 0x%08X to connect to us (they have lower ID)", device_id);
             }
         }
     }
@@ -1327,70 +1299,6 @@ static const char* on_local_char_write(const Application *app, const char *addre
     return BLUEZ_ERROR_REJECTED;
 }
 
-/* Periodic callbacks */
-static gboolean periodic_discovery_callback(gpointer user_data) {
-    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
-
-    if (!manager || !manager->running) return FALSE;
-
-    /* Check if we should be discovering based on mesh node state */
-    if (should_send_discovery(manager->mesh_node, get_current_timestamp())) {
-        if (!manager->scanning) {
-            log_debug(BT_TAG, "Periodic discovery: starting scan");
-            ble_start_discovery(manager);
-        }
-    } else if (manager->scanning) {
-        /* Stop scanning if we have enough connections */
-        if (!has_available_connections(manager->mesh_node)) {
-            log_debug(BT_TAG, "Periodic discovery: stopping scan (connections full)");
-            ble_stop_discovery(manager);
-        }
-    }
-
-    /* Check connection timeouts */
-    check_connection_timeouts(manager->mesh_node->connection_table, get_current_timestamp());
-
-    return TRUE;  /* Continue timer */
-}
-
-static gboolean periodic_reconnect_callback(gpointer user_data) {
-    ble_node_manager_t *manager = user_data;
-
-    if (!manager || !manager->running) return FALSE;
-
-    /* Try to reconnect to disconnected known devices */
-    for (size_t i = 0; i < manager->discovered_count; i++) {
-        discovered_device_t *disc = &manager->discovered_devices[i];
-
-        /* Skip if already connected, pending, or no valid device pointer */
-        if (disc->is_connected || disc->connection_pending || !disc->device) {
-            continue;
-        }
-
-        /* Skip if already connected via incoming connection */
-        if (is_already_connected(manager, disc->device_id)) {
-            continue;
-        }
-
-        const struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, disc->device_id);
-
-        /* Only reconnect if we have a disconnected entry (meaning we were previously connected) */
-        if (conn && conn->state == DISCONNECTED) {
-            if (has_available_connections(manager->mesh_node)) {
-                /*
-                 * Connection arbitration: Only reconnect if we have the lower device ID.
-                 * This prevents both sides from trying to reconnect simultaneously.
-                 */
-                if (manager->mesh_node->device_id < disc->device_id) {
-                    log_debug(BT_TAG, "Attempting reconnection to 0x%08X", disc->device_id);
-                    ble_connect_to_node(manager, disc->device_id);
-                }
-            }
-        }
-    }
-
-    return TRUE;  /* Continue timer */
-}
 
 /* Handle nodes that have timed out via heartbeat - called from heartbeat callback */
 static void handle_heartbeat_timeout_disconnection(ble_node_manager_t *manager, uint32_t device_id) {
@@ -1496,153 +1404,6 @@ static gboolean periodic_heartbeat_callback(gpointer user_data) {
     return TRUE;  /* Continue timer */
 }
 
-/* Delayed startup callbacks for Raspberry Pi compatibility */
-
-/* Track whether app registration succeeded (needed for retry logic) */
-static gboolean g_app_registered = FALSE;
-
-static gboolean delayed_app_registration(gpointer user_data) {
-    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
-
-    if (!manager || !manager->running) return FALSE;
-
-    log_debug(BT_TAG, "Attempting to register GATT application...");
-
-    /* Set the discovery filter first - this may also fail if adapter not ready */
-    binc_adapter_set_discovery_filter(manager->adapter, -100, NULL, NULL);
-
-    /* Register the GATT application */
-    binc_adapter_register_application(manager->adapter, manager->app);
-
-    /* We can't directly check if registration succeeded since binc doesn't return status.
-     * We'll optimistically proceed and let advertising/discovery retry if they fail. */
-    g_app_registered = TRUE;
-
-    log_debug(BT_TAG, "GATT application registration initiated");
-
-    /* Now start advertising after a short additional delay */
-    g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_advertising_start, manager);
-
-    return FALSE;  /* Don't repeat this one-shot timer */
-}
-
-static gboolean delayed_advertising_start(gpointer user_data) {
-    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
-
-    if (!manager || !manager->running) return FALSE;
-
-    log_debug(BT_TAG, "Starting delayed advertising...");
-    int result = ble_start_advertising(manager);
-    if (result != 0) {
-        log_error(BT_TAG, "Failed to start advertising, will retry...");
-        /* Retry after another delay */
-        g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_advertising_start, manager);
-        return FALSE;
-    }
-
-    /* Advertising started successfully, now start discovery */
-    g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_discovery_start, manager);
-
-    return FALSE;  /* Don't repeat this one-shot timer */
-}
-
-static gboolean delayed_discovery_start(gpointer user_data) {
-    ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
-
-    if (!manager || !manager->running) return FALSE;
-
-    log_info(BT_TAG, "Starting delayed discovery...");
-    int result = ble_start_discovery(manager);
-    if (result != 0) {
-        log_error(BT_TAG, "Failed to start discovery, will retry...");
-        /* Retry after another delay */
-        g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_discovery_start, manager);
-    }
-
-    /* Also check for any cached LocalNet devices we already know about */
-    GList *devices = binc_adapter_get_devices(manager->adapter);
-    for (GList *iter = devices; iter != NULL; iter = iter->next) {
-        Device *device = (Device *)iter->data;
-        if (device) {
-            const char *name = binc_device_get_name(device);
-            const char *address = binc_device_get_address(device);
-
-            if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
-                uint32_t device_id = ble_extract_device_id(name);
-                if (device_id != 0 && device_id != manager->mesh_node->device_id) {
-                    /* Skip if already connected via incoming or outgoing connection */
-                    if (is_already_connected(manager, device_id)) {
-                        log_debug(BT_TAG, "Cached device 0x%08X already connected, skipping", device_id);
-                        continue;
-                    }
-
-                    /* Skip if connection is already pending */
-                    if (is_connection_pending(manager, device_id)) {
-                        log_debug(BT_TAG, "Cached device 0x%08X connection pending, skipping", device_id);
-                        continue;
-                    }
-
-                    log_info(BT_TAG, "Found cached LocalNet device: %s (%s)", name, address ? address : "unknown");
-
-                    /* Process it like a scan result */
-                    discovered_device_t *discovered = add_discovered_device(manager, device, device_id, -50);
-
-                    if (manager->discovered_callback) {
-                        manager->discovered_callback(device_id, -50);
-                    }
-
-                    /* Try to connect if not already connected */
-                    if (discovered && !discovered->is_connected && !discovered->connection_pending) {
-                        if (has_available_connections(manager->mesh_node)) {
-                            /*
-                             * Connection arbitration: Only connect if we have the lower device ID.
-                             * This prevents both sides from connecting simultaneously.
-                             */
-                            if (manager->mesh_node->device_id < device_id) {
-                                log_info(BT_TAG, "Attempting to connect to cached device 0x%08X", device_id);
-
-                                /* Check if connection entry already exists */
-                                struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, device_id);
-                                if (!conn) {
-                                    add_connection(manager->mesh_node->connection_table, device_id, -50);
-                                }
-                                update_connection_state(manager->mesh_node->connection_table, device_id, DISCOVERING);
-
-                                int connect_result = ble_connect_to_node(manager, device_id);
-                                if (connect_result != 0) {
-                                    log_error(BT_TAG, "Failed to initiate connection to cached device 0x%08X", device_id);
-                                }
-                            } else {
-                                log_debug(BT_TAG, "Arbitration: waiting for cached device 0x%08X to connect to us", device_id);
-                            }
-                        } else {
-                            log_debug(BT_TAG, "No available connections for cached device 0x%08X", device_id);
-                        }
-                    } else {
-                        log_debug(BT_TAG, "Cached device 0x%08X already connected or pending", device_id);
-                    }
-                }
-            }
-        }
-    }
-    if (devices) {
-        g_list_free(devices);
-    }
-
-    return FALSE;  /* Don't repeat this one-shot timer */
-}
-
-/* Callback when adapter power state changes */
-static void on_adapter_powered_state_changed(Adapter *adapter, const gboolean powered) {
-    (void)adapter;
-    log_info(BT_TAG, "Adapter power state changed: %s", powered ? "ON" : "OFF");
-
-    if (powered && g_manager && g_manager->running && !g_app_registered) {
-        /* Adapter just powered on, start the initialization chain */
-        log_info(BT_TAG, "Adapter powered on, starting initialization...");
-        g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_app_registration, g_manager);
-    }
-}
 
 /* Callback when discovery state changes */
 static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, const GError *error) {
@@ -1669,6 +1430,12 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
     (void)adapter;
 
     if (!g_manager || !device) return;
+
+    /* Verify the device is actually connected before processing */
+    ConnectionState conn_state = binc_device_get_connection_state(device);
+    if (conn_state != BINC_CONNECTED) {
+        return;  /* Ignore if not actually connected */
+    }
 
     const char *name = binc_device_get_name(device);
     const char *address = binc_device_get_address(device);
