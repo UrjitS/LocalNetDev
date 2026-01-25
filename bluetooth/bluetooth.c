@@ -221,6 +221,21 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
         }
     }
 
+    /* Cross-reference with mesh_node connection table for accurate state */
+    if (manager->mesh_node && manager->mesh_node->connection_table) {
+        for (int i = 0; i < total_connections; i++) {
+            struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, connections[i].device_id);
+            if (conn) {
+                /* Use connection table state as source of truth */
+                connections[i].is_connected = (conn->state == STABLE || conn->state == CONNECTING);
+                /* Update RSSI from connection table if we have it */
+                if (conn->rssi != 0) {
+                    connections[i].rssi = conn->rssi;
+                }
+            }
+        }
+    }
+
     /* Count connected */
     int connected_count = 0;
     for (int i = 0; i < total_connections; i++) {
@@ -761,6 +776,19 @@ int ble_disconnect_from_node(ble_node_manager_t *manager, const uint32_t device_
 int ble_get_connected_count(ble_node_manager_t *manager) {
     if (!manager) return 0;
 
+    /* Use the mesh_node connection table as the source of truth */
+    if (manager->mesh_node && manager->mesh_node->connection_table) {
+        int count = 0;
+        for (size_t i = 0; i < manager->mesh_node->connection_table->count; i++) {
+            struct connection_entry *entry = &manager->mesh_node->connection_table->entries[i];
+            if (entry->state == STABLE || entry->state == CONNECTING) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /* Fallback: count from discovered and incoming arrays */
     /* Use a simple array to track unique connected device IDs */
     uint32_t connected_ids[MAX_DISCOVERED_DEVICES + MAX_INCOMING_CLIENTS];
     int unique_count = 0;
@@ -1161,8 +1189,10 @@ static void on_notify_characteristic(Device *device, Characteristic *characteris
 
     log_debug(BT_TAG, "Received notification from 0x%08X: %u bytes", discovered->device_id, byteArray->len);
 
-    /* Update last seen */
-    update_last_seen(g_manager->mesh_node->connection_table, discovered->device_id, get_current_timestamp());
+    /* Update last seen and reset missed heartbeats */
+    uint32_t current_time = get_current_timestamp();
+    update_last_seen(g_manager->mesh_node->connection_table, discovered->device_id, current_time);
+    reset_missed_heartbeats(g_manager->mesh_node->connection_table, discovered->device_id);
 
     /* Notify callback */
     if (g_manager->data_callback) {
@@ -1212,10 +1242,17 @@ static const char* on_local_char_write(const Application *app, const char *addre
             /* Find or add this client to our incoming connections */
             incoming_client_t *client = ble_find_or_add_incoming_client(g_manager, address);
             uint32_t sender_id = 0;
+            uint32_t current_time = get_current_timestamp();
 
             if (client) {
                 sender_id = client->device_id;
-                client->last_seen = get_current_timestamp();
+                client->last_seen = current_time;
+
+                /* Update connection table - update last_seen and reset missed heartbeats */
+                if (g_manager->mesh_node) {
+                    update_last_seen(g_manager->mesh_node->connection_table, sender_id, current_time);
+                    reset_missed_heartbeats(g_manager->mesh_node->connection_table, sender_id);
+                }
 
                 /* Check if we already have an outgoing connection to this device */
                 discovered_device_t *existing_outgoing = ble_find_discovered_device(g_manager, sender_id);
@@ -1319,6 +1356,71 @@ static gboolean periodic_reconnect_callback(gpointer user_data) {
     return TRUE;  /* Continue timer */
 }
 
+/* Handle nodes that have timed out via heartbeat - called from heartbeat callback */
+static void handle_heartbeat_timeout_disconnection(ble_node_manager_t *manager, uint32_t device_id) {
+    if (!manager) return;
+
+    log_info(BT_TAG, "Heartbeat timeout: disconnecting 0x%08X", device_id);
+
+    gboolean was_connected = FALSE;
+
+    /* Check discovered devices (outgoing connections) */
+    for (size_t i = 0; i < manager->discovered_count; i++) {
+        discovered_device_t *disc = &manager->discovered_devices[i];
+        if (disc->device_id == device_id) {
+            if (disc->is_connected) {
+                was_connected = TRUE;
+            }
+            disc->is_connected = FALSE;
+            disc->connection_pending = FALSE;
+
+            /* Disconnect from BlueZ if still connected */
+            if (disc->device) {
+                binc_device_disconnect(disc->device);
+            }
+            break;
+        }
+    }
+
+    /* Check incoming clients */
+    for (size_t i = 0; i < manager->incoming_count; i++) {
+        incoming_client_t *client = &manager->incoming_clients[i];
+        if (client->device_id == device_id) {
+            if (client->is_connected) {
+                was_connected = TRUE;
+            }
+            client->is_connected = FALSE;
+
+            /* Disconnect from BlueZ if still connected */
+            if (client->device) {
+                binc_device_disconnect(client->device);
+            }
+            break;
+        }
+    }
+
+    /* Check if connection table had this node as connected */
+    if (manager->mesh_node && manager->mesh_node->connection_table) {
+        struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, device_id);
+        if (conn && (conn->state == STABLE || conn->state == CONNECTING)) {
+            was_connected = TRUE;
+        }
+        /* State is already set to DISCONNECTED by check_and_get_heartbeat_timeouts */
+    }
+
+    if (was_connected) {
+        /* Update available connections */
+        if (manager->mesh_node && manager->mesh_node->available_connections < get_max_connections(manager->mesh_node->node_type)) {
+            manager->mesh_node->available_connections++;
+        }
+
+        /* Notify callback */
+        if (manager->disconnected_callback) {
+            manager->disconnected_callback(device_id);
+        }
+    }
+}
+
 static gboolean periodic_heartbeat_callback(gpointer user_data) {
     ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
 
@@ -1340,8 +1442,15 @@ static gboolean periodic_heartbeat_callback(gpointer user_data) {
         ble_broadcast_data(manager, buffer, len);
     }
 
-    /* Check for missed heartbeats */
-    check_heartbeat_timeouts(manager->mesh_node, current_time);
+    /* Check for missed heartbeats and get list of timed-out nodes */
+    uint32_t timed_out_ids[MAX_CONNECTION_TABLE_ENTRIES];
+    size_t timeout_count = check_and_get_heartbeat_timeouts(manager->mesh_node, current_time,
+                                                             timed_out_ids, MAX_CONNECTION_TABLE_ENTRIES);
+
+    /* Handle each timed-out node */
+    for (size_t i = 0; i < timeout_count; i++) {
+        handle_heartbeat_timeout_disconnection(manager, timed_out_ids[i]);
+    }
 
     /* Expire old routes */
     expire_routes(manager->mesh_node->routing_table, current_time);
