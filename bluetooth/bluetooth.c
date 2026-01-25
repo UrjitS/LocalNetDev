@@ -817,13 +817,14 @@ void ble_get_connection_table(ble_node_manager_t *manager, uint32_t *devices, gu
 void ble_print_connection_table(ble_node_manager_t *manager) {
     if (!manager) return;
 
-    printf("\n╔════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                           CONNECTION TABLE                                 ║\n");
-    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Local Node: 0x%08X                                                     ║\n", manager->device_id);
-    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Device ID      │ Status     │ RSSI       │ Type       │ MAC Address        ║\n");
-    printf("╠────────────────┼────────────┼────────────┼────────────┼────────────────────╣\n");
+    printf("\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("CONNECTION TABLE\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Local Node: 0x%08X\n", manager->device_id);
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Device ID \t\t Status \t\t RSSI \t\t Type \t\t MAC\n");
+    printf("--------------------------------------------------------------------\n");
 
     guint known = 0, connected = 0;
     for (guint i = 0; i < manager->discovered_count; i++) {
@@ -839,15 +840,15 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
             type = "OUTGOING";
         }
 
-        printf("║ 0x%08X     │ %-10s │ %4d dBm   │ %-10s │ %-18s ║\n",
+        printf("\t 0x%08X \t\t %-10s \t\t %4d dBm \t\t %-10s \t\t %-18s\n",
                tracked->device_id, status, tracked->rssi, type, tracked->mac_address);
     }
 
     if (known == 0) {
-        printf("║                         (no devices)                                       ║\n");
+        printf("\t (no devices)\n");
     }
 
-    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Total: %u known, %u connected                                               ║\n", known, connected);
-    printf("╚════════════════════════════════════════════════════════════════════════════╝\n\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Total: %u known, %u connected\n", known, connected);
+    printf("--------------------------------------------------------------------\n");
 }

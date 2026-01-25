@@ -7,81 +7,74 @@
 #include <ctype.h>
 #include "bluetooth/bluetooth.h"
 #include "protocol/protocol.h"
-#include "utils/utils.h"
 #include "routing/routing.h"
 
 #define TAG "LOCALNET"
 
 /* Global BLE manager for signal handler */
-static ble_node_manager_t *g_ble_manager = NULL;
+static ble_node_manager_t * g_ble_manager = NULL;
 static volatile gboolean g_running = TRUE;
 static uint32_t g_device_id = 0;
-
-/* ============================================================================
- * MENU COMMAND SYSTEM
- * ============================================================================ */
 
 /* Command handler function type */
 typedef void (*menu_command_handler)(void);
 
-/* Menu command structure */
 typedef struct {
-    const char *key;           /* Key to press (e.g., "1", "c", "q") */
-    const char *description;   /* Description shown in menu */
+    const char *key;
+    const char *description;
     menu_command_handler handler;
 } menu_command_t;
 
-/* Forward declarations for command handlers */
+/* Command handlers */
 static void cmd_show_connections(void);
 static void cmd_show_node_info(void);
 static void cmd_show_help(void);
 static void cmd_quit(void);
 
-/* Define menu commands */
+/* Menu commands */
 static const menu_command_t g_menu_commands[] = {
     { "1", "Show connection table",     cmd_show_connections },
-    { "2", "Show node info",            cmd_show_node_info },
+    { "2", "Show Node info",            cmd_show_node_info },
     { "h", "Show help",                 cmd_show_help },
     { "q", "Quit",                      cmd_quit },
-    { NULL, NULL, NULL }  /* Sentinel */
+    { NULL, NULL, NULL }
 };
 
-/* Command handlers implementation */
 static void cmd_show_connections(void) {
     if (g_ble_manager) {
         ble_print_connection_table(g_ble_manager);
     } else {
-        printf("Error: BLE manager not initialized\n");
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
     }
 }
 
 static void cmd_show_node_info(void) {
     if (!g_ble_manager) {
-        printf("Error: BLE manager not initialized\n");
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
         return;
     }
 
     printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("║                      NODE INFORMATION                            ║\n");
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Device ID:       0x%08X                                       ║\n", g_device_id);
-    printf("║ Connected nodes: %-49u ║\n", ble_get_connected_count(g_ble_manager));
-    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("NODE INFORMATION\n");
+    printf("\n");
+    printf("\t Device ID: 0x%08X \n", g_device_id);
+    printf("\t Connected Nodes: %-49u \n", ble_get_connected_count(g_ble_manager));
+    printf("--------------------------------------------------------------------\n");
     printf("\n");
 }
 
 static void cmd_show_help(void) {
     printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("║                    LOCALNET COMMANDS                             ║\n");
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("LOCALNET COMMANDS\n");
+    printf("--------------------------------------------------------------------\n");
 
     for (int i = 0; g_menu_commands[i].key != NULL; i++) {
-        printf("║  [%s] %-60s ║\n", g_menu_commands[i].key, g_menu_commands[i].description);
+        printf("\t [%s] %-60s\n", g_menu_commands[i].key, g_menu_commands[i].description);
     }
 
-    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("--------------------------------------------------------------------\n");
     printf("\n");
 }
 
@@ -112,7 +105,7 @@ static void process_command(const char *input) {
 }
 
 /* Callback for stdin input in GLib main loop */
-static gboolean stdin_callback(GIOChannel *source, GIOCondition condition, gpointer data) {
+static gboolean stdin_callback(GIOChannel *source, const GIOCondition condition, gpointer data) {
     if (condition & G_IO_IN) {
         gchar *line = NULL;
         gsize length;
@@ -136,17 +129,14 @@ static gboolean stdin_callback(GIOChannel *source, GIOCondition condition, gpoin
 }
 
 void usage(const char *program_name) {
+    printf("--------------------------------------------------------------------\n");
     printf("LocalNet Mesh Node\n");
-    printf("==================\n\n");
+    printf("--------------------------------------------------------------------\n");
     printf("Usage: %s [options]\n\n", program_name);
     printf("Options:\n");
-    printf("  -t, --type <type>   Node type: 0=EDGE, 1=FULL (default), 2=GATEWAY\n");
-    printf("  -v, --verbose       Enable verbose logging\n");
-    printf("  -h, --help          Show this help message\n\n");
-    printf("Example:\n");
-    printf("  %s                  # Start as a FULL node (default)\n", program_name);
-    printf("  %s -t 2             # Start as a GATEWAY node\n", program_name);
-    printf("  %s -t 0 -v          # Start as EDGE node with verbose logging\n\n", program_name);
+    printf("\t -t, --type <type>   Node type: 0=EDGE, 1=FULL (default), 2=GATEWAY\n");
+    printf("\t -v, --verbose       Enable verbose logging\n");
+    printf("\t -h, --help          Show help message\n\n");
 }
 
 /* Signal handler for graceful shutdown */
@@ -161,32 +151,32 @@ static void signal_handler(const int sig_no) {
 
 /* Callback: Node discovered */
 static void on_node_discovered(const uint32_t node_id, const int16_t rssi) {
-    log_info(TAG, "Discovered node: 0x%08X (RSSI: %d dBm)", node_id, rssi);
+    log_info(TAG, "Discovered Node: 0x%08X (RSSI: %d dBm)", node_id, rssi);
 }
 
 /* Callback: Node connected */
 static void on_node_connected(const uint32_t node_id) {
-    log_info(TAG, "Connected to node: 0x%08X", node_id);
+    log_info(TAG, "Connected to Node: 0x%08X", node_id);
 
     if (g_ble_manager) {
-        int connected = ble_get_connected_count(g_ble_manager);
-        log_info(TAG, "Total connected nodes: %d", connected);
+        const guint connected = ble_get_connected_count(g_ble_manager);
+        log_info(TAG, "Total connected Nodes: %d", connected);
     }
 }
 
 /* Callback: Node disconnected */
 static void on_node_disconnected(const uint32_t node_id) {
-    log_info(TAG, "Disconnected from node: 0x%08X", node_id);
+    log_info(TAG, "Disconnected from Node: 0x%08X", node_id);
 
     if (g_ble_manager) {
-        const int connected = ble_get_connected_count(g_ble_manager);
-        log_info(TAG, "Remaining connected nodes: %d", connected);
+        const guint connected = ble_get_connected_count(g_ble_manager);
+        log_info(TAG, "Remaining connected Nodes: %d", connected);
     }
 }
 
 /* Callback: Data received */
 static void on_data_received(const uint32_t sender_id, const uint8_t *data, const size_t len) {
-    log_debug(TAG, "Received %zu bytes from node 0x%08X", len, sender_id);
+    log_debug(TAG, "Received %zu bytes from Node 0x%08X", len, sender_id);
 
     /* Parse the message header */
     struct header hdr;
@@ -208,7 +198,7 @@ static void on_data_received(const uint32_t sender_id, const uint8_t *data, cons
     }
 }
 
-const char *node_type_to_string(enum NODE_TYPE type) {
+const char *node_type_to_string(const enum NODE_TYPE type) {
     switch (type) {
         case EDGE_NODE: return "EDGE";
         case FULL_NODE: return "FULL";
@@ -235,8 +225,7 @@ static int get_adapter_address(char *address, size_t len) {
     }
 
     binc_adapter_free(adapter);
-    /* Note: Do NOT call g_dbus_connection_close_sync() - the system bus connection
-     * is shared and closing it would break subsequent DBus operations */
+
     g_object_unref(dbus);
 
     return addr ? 0 : -1;
@@ -255,7 +244,7 @@ static uint32_t mac_to_device_id(const char *mac) {
 }
 
 int main(const int argc, char *argv[]) {
-    enum NODE_TYPE node_type = FULL_NODE;  /* Default to FULL */
+    enum NODE_TYPE node_type = FULL_NODE;
     int verbose = 0;
 
     static struct option long_options[] = {
@@ -269,7 +258,7 @@ int main(const int argc, char *argv[]) {
     while ((opt = getopt_long(argc, argv, "t:vh", long_options, NULL)) != -1) {
         switch (opt) {
             case 't': {
-                long type_val = strtol(optarg, NULL, 10);
+                const long type_val = strtol(optarg, NULL, 10);
                 if (type_val >= 0 && type_val <= 2) {
                     node_type = (enum NODE_TYPE)type_val;
                 } else {
@@ -310,11 +299,11 @@ int main(const int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    log_info(TAG, "Starting LocalNet node:");
-    log_info(TAG, "  Adapter: %s", mac_address);
-    log_info(TAG, "  Device ID: 0x%08X", g_device_id);
-    log_info(TAG, "  Node Type: %s", node_type_to_string(node_type));
-    log_info(TAG, "  Max Connections: %d", get_max_connections(node_type));
+    log_info(TAG, "Starting LocalNet Node:");
+    log_info(TAG, "\t Adapter: %s", mac_address);
+    log_info(TAG, "\t Device ID: 0x%08X", g_device_id);
+    log_info(TAG, "\t Node Type: %s", node_type_to_string(node_type));
+    log_info(TAG, "\t Max Connections: %d", get_max_connections(node_type));
 
     /* Setup signal handlers */
     if (signal(SIGINT, signal_handler) == SIG_ERR) {
@@ -342,16 +331,15 @@ int main(const int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    log_info(TAG, "Node is running. Press Ctrl+C to exit.");
+    log_info(TAG, "Node is running");
     log_info(TAG, "Advertising as: LocalNet-%08X", g_device_id);
-    log_info(TAG, "Scanning for other LocalNet nodes...");
-    log_info(TAG, "Press 'h' for help menu.");
+    log_info(TAG, "Initiating Scanning");
 
     /* Set up stdin input handling for menu commands */
     GIOChannel *stdin_channel = g_io_channel_unix_new(STDIN_FILENO);
     g_io_channel_set_encoding(stdin_channel, NULL, NULL);
     g_io_channel_set_buffered(stdin_channel, TRUE);
-    guint stdin_watch_id = g_io_add_watch(stdin_channel, G_IO_IN, stdin_callback, NULL);
+    const guint stdin_watch_id = g_io_add_watch(stdin_channel, G_IO_IN, stdin_callback, NULL);
 
     /* Run the main loop (blocks until quit) */
     ble_run_loop(g_ble_manager);
@@ -361,10 +349,10 @@ int main(const int argc, char *argv[]) {
     g_io_channel_unref(stdin_channel);
 
     /* Cleanup */
-    log_info(TAG, "Shutting down...");
+    log_info(TAG, "Shutting down");
     ble_cleanup(g_ble_manager);
     g_ble_manager = NULL;
 
-    log_info(TAG, "LocalNet node stopped");
+    log_info(TAG, "LocalNet Node stopped");
     return EXIT_SUCCESS;
 }
