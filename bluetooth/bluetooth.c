@@ -1615,9 +1615,65 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
             }
         }
     } else {
-        /* Unknown device connected - we still might get LocalNet data from it */
-        /* The MAC address will be used to derive the device ID when we get a write */
-        log_debug(BT_TAG, "Non-LocalNet device connected as central: %s", address ? address : "unknown");
+        /*
+         * Device connected with a non-LocalNet name (e.g., "raspberrypi").
+         * This can happen when the device is cached/bonded and BlueZ returns
+         * its system Bluetooth name instead of the advertising name.
+         *
+         * Extract device ID from MAC address and treat it as a LocalNet device.
+         * When we receive a write on our characteristic, we'll confirm it's a LocalNet node.
+         */
+        uint32_t device_id = 0;
+        if (address) {
+            device_id = ble_mac_to_device_id(address);
+        }
+
+        if (device_id != 0 && device_id != g_manager->mesh_node->device_id) {
+            /* Check if we already have this device connected */
+            if (is_already_connected(g_manager, device_id)) {
+                log_debug(BT_TAG, "Already connected to 0x%08X (via MAC), ignoring duplicate", device_id);
+                return;
+            }
+
+            log_info(BT_TAG, "Remote central connected: %s (%s) - extracted ID: 0x%08X",
+                     name ? name : "(unknown)", address ? address : "unknown", device_id);
+
+            /* Add to incoming clients */
+            incoming_client_t *client = ble_find_or_add_incoming_client(g_manager, address);
+            if (client) {
+                if (client->is_connected) {
+                    return;  /* Already connected */
+                }
+
+                client->is_connected = TRUE;
+                client->device_id = device_id;
+                client->device = device;
+
+                /* Set up connection state callback */
+                binc_device_set_connection_state_change_cb(device, &on_incoming_connection_state_changed);
+
+                log_info(BT_TAG, "LocalNet node connected as central: 0x%08X", device_id);
+
+                if (g_manager->mesh_node) {
+                    struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
+                    if (!conn) {
+                        add_connection(g_manager->mesh_node->connection_table, device_id, 0);
+                        update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
+                        if (g_manager->mesh_node->available_connections > 0) {
+                            g_manager->mesh_node->available_connections--;
+                        }
+
+                        if (g_manager->connected_callback) {
+                            g_manager->connected_callback(device_id);
+                        }
+                    } else {
+                        update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
+                    }
+                }
+            }
+        } else {
+            log_debug(BT_TAG, "Unknown device connected as central: %s", address ? address : "unknown");
+        }
     }
 }
 
