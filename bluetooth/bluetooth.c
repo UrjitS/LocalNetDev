@@ -876,10 +876,51 @@ int ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, const s
     if (!manager || !data || len == 0) return -1;
 
     int sent_count = 0;
+
+    /* Send to outgoing connections (devices we connected to) */
     for (size_t i = 0; i < manager->discovered_count; i++) {
         if (manager->discovered_devices[i].is_connected) {
             if (ble_send_data(manager, manager->discovered_devices[i].device_id, data, len) == 0) {
                 sent_count++;
+            }
+        }
+    }
+
+    /*
+     * Send to incoming connections (devices that connected to us) via notifications.
+     * This is critical for sending heartbeats back to nodes that initiated
+     * the connection to us.
+     */
+    if (manager->app && manager->incoming_count > 0) {
+        /* Find connected incoming clients */
+        gboolean has_connected_incoming = FALSE;
+        for (size_t i = 0; i < manager->incoming_count; i++) {
+            if (manager->incoming_clients[i].is_connected) {
+                has_connected_incoming = TRUE;
+                break;
+            }
+        }
+
+        if (has_connected_incoming) {
+            /* Set the characteristic value - this will notify all subscribed clients */
+            GByteArray *byte_array = g_byte_array_sized_new(len);
+            g_byte_array_append(byte_array, data, len);
+
+            binc_application_set_char_value(manager->app, LOCAL_NET_SERVICE_UUID,
+                                           LOCAL_NET_DATA_CHAR_UUID, byte_array);
+            /* Notify is triggered automatically by set_char_value for subscribed clients */
+
+            g_byte_array_free(byte_array, TRUE);
+
+            /* Count incoming clients as sent */
+            for (size_t i = 0; i < manager->incoming_count; i++) {
+                if (manager->incoming_clients[i].is_connected) {
+                    sent_count++;
+                    /* Update last_seen for incoming clients */
+                    update_last_seen(manager->mesh_node->connection_table,
+                                    manager->incoming_clients[i].device_id,
+                                    get_current_timestamp());
+                }
             }
         }
     }
