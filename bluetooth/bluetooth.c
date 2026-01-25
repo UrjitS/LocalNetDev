@@ -22,6 +22,7 @@ static gboolean delayed_discovery_start(gpointer user_data);
 static gboolean delayed_advertising_start(gpointer user_data);
 static gboolean delayed_app_registration(gpointer user_data);
 static void on_adapter_powered_state_changed(Adapter *adapter, gboolean powered);
+static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, const GError *error);
 
 /* Maximum time to wait for adapter to become ready (in milliseconds) */
 #define ADAPTER_READY_DELAY_MS 3000
@@ -396,6 +397,7 @@ int ble_start(ble_node_manager_t *manager) {
 
     /* Setup central (scanner) callbacks - actual discovery is started later */
     binc_adapter_set_discovery_cb(manager->adapter, &on_scan_result);
+    binc_adapter_set_discovery_state_cb(manager->adapter, &on_discovery_state_changed);
 
     manager->running = TRUE;
 
@@ -702,6 +704,10 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     if (!g_manager || !device) return;
 
     const char *name = binc_device_get_name(device);
+    const char *address = binc_device_get_address(device);
+
+    log_debug(BT_TAG, "Scan result: %s (%s)", name ? name : "(null)", address ? address : "unknown");
+
     if (!name || !g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
         return;  /* Not a LocalNet device */
     }
@@ -1097,12 +1103,33 @@ static gboolean delayed_discovery_start(gpointer user_data) {
 
 /* Callback when adapter power state changes */
 static void on_adapter_powered_state_changed(Adapter *adapter, const gboolean powered) {
+    (void)adapter;
     log_info(BT_TAG, "Adapter power state changed: %s", powered ? "ON" : "OFF");
 
     if (powered && g_manager && g_manager->running && !g_app_registered) {
         /* Adapter just powered on, start the initialization chain */
         log_info(BT_TAG, "Adapter powered on, starting initialization...");
         g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_app_registration, g_manager);
+    }
+}
+
+/* Callback when discovery state changes */
+static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, const GError *error) {
+    (void)adapter;
+
+    const char *state_name;
+    switch (state) {
+        case BINC_DISCOVERY_STOPPED: state_name = "STOPPED"; break;
+        case BINC_DISCOVERY_STARTED: state_name = "STARTED"; break;
+        case BINC_DISCOVERY_STARTING: state_name = "STARTING"; break;
+        case BINC_DISCOVERY_STOPPING: state_name = "STOPPING"; break;
+        default: state_name = "UNKNOWN"; break;
+    }
+
+    if (error) {
+        log_error(BT_TAG, "Discovery state changed to %s with error: %s", state_name, error->message);
+    } else {
+        log_info(BT_TAG, "Discovery state changed to %s", state_name);
     }
 }
 
