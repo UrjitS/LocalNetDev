@@ -987,6 +987,21 @@ static void on_scan_result(Adapter *adapter, Device *device) {
                 discovered->connection_pending = TRUE;
                 discovered->last_connect_attempt = get_current_timestamp();
 
+                /*
+                 * IMPORTANT: Stop advertising and discovery before connecting.
+                 * The BLE stack cannot handle simultaneous advertising/discovery and connection
+                 * attempts, which causes "le-connection-abort-by-local" errors.
+                 * They will be restarted after connection succeeds or fails.
+                 */
+                if (g_manager->advertising) {
+                    log_debug(BT_TAG, "Stopping advertising before connection attempt");
+                    ble_stop_advertising(g_manager);
+                }
+                if (g_manager->scanning) {
+                    log_debug(BT_TAG, "Stopping discovery before connection attempt");
+                    ble_stop_discovery(g_manager);
+                }
+
                 /* Set up device callbacks BEFORE connecting - like ble.c does */
                 binc_device_set_connection_state_change_cb(device, &on_connection_state_changed);
                 binc_device_set_services_resolved_cb(device, &on_services_resolved);
@@ -1024,6 +1039,16 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
         if (conn && conn->state == CONNECTING) {
             update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, DISCONNECTED);
         }
+
+        /* Restart advertising and discovery after failed connection attempt */
+        if (!g_manager->advertising && g_manager->running) {
+            log_debug(BT_TAG, "Restarting advertising after connection failure");
+            ble_start_advertising(g_manager);
+        }
+        if (!g_manager->scanning && g_manager->running) {
+            log_debug(BT_TAG, "Restarting discovery after connection failure");
+            ble_start_discovery(g_manager);
+        }
         return;
     }
 
@@ -1033,6 +1058,16 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
     if (state == BINC_CONNECTED) {
         /* Wait for services to be resolved before marking as fully connected */
         update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, CONNECTING);
+
+        /* Restart advertising and discovery now that connection is established */
+        if (!g_manager->advertising && g_manager->running) {
+            log_debug(BT_TAG, "Restarting advertising after successful connection");
+            ble_start_advertising(g_manager);
+        }
+        if (!g_manager->scanning && g_manager->running) {
+            log_debug(BT_TAG, "Restarting discovery after successful connection");
+            ble_start_discovery(g_manager);
+        }
     } else if (state == BINC_DISCONNECTED) {
         gboolean was_connected = discovered->is_connected;
         discovered->is_connected = FALSE;
@@ -1050,6 +1085,16 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
             if (g_manager->disconnected_callback) {
                 g_manager->disconnected_callback(discovered->device_id);
             }
+        }
+
+        /* Restart advertising and discovery if not already running */
+        if (!g_manager->advertising && g_manager->running) {
+            log_debug(BT_TAG, "Restarting advertising after disconnection");
+            ble_start_advertising(g_manager);
+        }
+        if (!g_manager->scanning && g_manager->running) {
+            log_debug(BT_TAG, "Restarting discovery after disconnection");
+            ble_start_discovery(g_manager);
         }
 
         /* Clean up if not bonded */
