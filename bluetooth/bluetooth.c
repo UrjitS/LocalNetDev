@@ -3,6 +3,10 @@
 /* Global reference for callbacks (needed since binc callbacks don't support user_data) */
 static ble_node_manager_t *g_manager = NULL;
 
+/* Forward declarations for internal helper functions */
+static gboolean is_already_connected(ble_node_manager_t *manager, uint32_t device_id);
+static gboolean is_connection_pending(ble_node_manager_t *manager, uint32_t device_id);
+
 /* Forward declarations for internal callbacks */
 static void on_scan_result(Adapter *adapter, Device *device);
 static void on_connection_state_changed(Device *device, ConnectionState state, const GError *error);
@@ -310,6 +314,25 @@ void ble_cleanup(ble_node_manager_t *manager) {
         manager->agent = NULL;
     }
 
+    /* Remove all cached LocalNet devices from the adapter to prevent stale connections on next run */
+    if (manager->adapter) {
+        log_debug(BT_TAG, "Removing cached LocalNet devices from adapter...");
+        GList *devices = binc_adapter_get_devices(manager->adapter);
+        for (GList *iter = devices; iter != NULL; iter = iter->next) {
+            Device *device = (Device *)iter->data;
+            if (device) {
+                const char *name = binc_device_get_name(device);
+                if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
+                    log_debug(BT_TAG, "Removing cached device: %s", name);
+                    binc_adapter_remove_device(manager->adapter, device);
+                }
+            }
+        }
+        if (devices) {
+            g_list_free(devices);
+        }
+    }
+
     if (manager->adapter) {
         binc_adapter_free(manager->adapter);
         manager->adapter = NULL;
@@ -532,6 +555,12 @@ int ble_is_advertising(const ble_node_manager_t *manager) {
 int ble_connect_to_node(ble_node_manager_t *manager, const uint32_t device_id) {
     if (!manager) return -1;
 
+    /* Check if already connected via incoming connection */
+    if (is_already_connected(manager, device_id)) {
+        log_debug(BT_TAG, "Already connected to device 0x%08X (incoming or outgoing)", device_id);
+        return 0;
+    }
+
     discovered_device_t *discovered = ble_find_discovered_device(manager, device_id);
     if (!discovered || !discovered->device) {
         log_debug(BT_TAG, "Device 0x%08X not found in discovered list", device_id);
@@ -702,6 +731,39 @@ void ble_quit_main_loop(const ble_node_manager_t *manager) {
     }
 }
 
+/* Check if we're already connected to a device via incoming or outgoing connection */
+static gboolean is_already_connected(ble_node_manager_t *manager, uint32_t device_id) {
+    if (!manager) return FALSE;
+
+    /* Check outgoing connections */
+    discovered_device_t *discovered = ble_find_discovered_device(manager, device_id);
+    if (discovered && discovered->is_connected) {
+        return TRUE;
+    }
+
+    /* Check incoming connections */
+    for (size_t i = 0; i < manager->incoming_count; i++) {
+        if (manager->incoming_clients[i].device_id == device_id &&
+            manager->incoming_clients[i].is_connected) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/* Check if we have a pending connection to a device */
+static gboolean is_connection_pending(ble_node_manager_t *manager, uint32_t device_id) {
+    if (!manager) return FALSE;
+
+    discovered_device_t *discovered = ble_find_discovered_device(manager, device_id);
+    if (discovered && discovered->connection_pending) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 /* Internal callbacks */
 static void on_scan_result(Adapter *adapter, Device *device) {
     (void)adapter;  /* Unused parameter */
@@ -721,12 +783,24 @@ static void on_scan_result(Adapter *adapter, Device *device) {
         return;  /* Invalid ID or self */
     }
 
+    /* Skip if already connected (via incoming or outgoing connection) */
+    if (is_already_connected(g_manager, device_id)) {
+        log_debug(BT_TAG, "Skipping discovery of already-connected node 0x%08X", device_id);
+        return;
+    }
+
+    /* Skip if connection is pending */
+    if (is_connection_pending(g_manager, device_id)) {
+        log_debug(BT_TAG, "Skipping discovery of pending-connection node 0x%08X", device_id);
+        return;
+    }
+
     const int16_t rssi = binc_device_get_rssi(device);
 
     log_debug(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
 
     /* Add to discovered list */
-    const discovered_device_t *discovered = add_discovered_device(g_manager, device, device_id, (int8_t)rssi);
+    discovered_device_t *discovered = add_discovered_device(g_manager, device, device_id, (int8_t)rssi);
 
     /* Notify callback */
     if (g_manager->discovered_callback) {
@@ -925,16 +999,26 @@ static const char* on_local_char_write(const Application *app, const char *addre
                 sender_id = client->device_id;
                 client->last_seen = get_current_timestamp();
 
-                /* Check if this is a new connection */
-                if (!client->is_connected) {
+                /* Check if we already have an outgoing connection to this device */
+                discovered_device_t *existing_outgoing = ble_find_discovered_device(g_manager, sender_id);
+                if (existing_outgoing && existing_outgoing->is_connected) {
+                    /* We already have an outgoing connection, just update last_seen and process data */
+                    log_debug(BT_TAG, "Received write from 0x%08X via existing outgoing connection", sender_id);
+                } else if (!client->is_connected) {
+                    /* Check if this is a new connection */
                     client->is_connected = TRUE;
                     log_info(BT_TAG, "Incoming connection from %s (ID: 0x%08X)", address, sender_id);
 
-                    /* Add to mesh node's connection table */
+                    /* Add to mesh node's connection table if not already there */
                     if (g_manager->mesh_node) {
-                        add_connection(g_manager->mesh_node->connection_table, sender_id, 0);
+                        struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, sender_id);
+                        if (!conn) {
+                            add_connection(g_manager->mesh_node->connection_table, sender_id, 0);
+                        }
                         update_connection_state(g_manager->mesh_node->connection_table, sender_id, STABLE);
-                        g_manager->mesh_node->available_connections--;
+                        if (g_manager->mesh_node->available_connections > 0) {
+                            g_manager->mesh_node->available_connections--;
+                        }
                     }
 
                     /* Notify callback */
@@ -1113,6 +1197,12 @@ static gboolean delayed_discovery_start(gpointer user_data) {
             if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
                 uint32_t device_id = ble_extract_device_id(name);
                 if (device_id != 0 && device_id != manager->mesh_node->device_id) {
+                    /* Skip if already connected via incoming or outgoing connection */
+                    if (is_already_connected(manager, device_id)) {
+                        log_debug(BT_TAG, "Cached device 0x%08X already connected, skipping", device_id);
+                        continue;
+                    }
+
                     log_info(BT_TAG, "Found cached LocalNet device: %s (%s)", name, address ? address : "unknown");
 
                     /* Process it like a scan result */
@@ -1197,6 +1287,13 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
     if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
         uint32_t device_id = ble_extract_device_id(name);
         if (device_id != 0 && device_id != g_manager->mesh_node->device_id) {
+            /* Check if we already have an outgoing connection to this device */
+            discovered_device_t *existing = ble_find_discovered_device(g_manager, device_id);
+            if (existing && existing->is_connected) {
+                log_debug(BT_TAG, "Already have outgoing connection to 0x%08X, skipping incoming registration", device_id);
+                return;
+            }
+
             /* Add to our incoming clients and mark as connected */
             incoming_client_t *client = ble_find_or_add_incoming_client(g_manager, address);
             if (client && !client->is_connected) {
@@ -1205,9 +1302,15 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
                 log_info(BT_TAG, "LocalNet node connected as central: 0x%08X", device_id);
 
                 if (g_manager->mesh_node) {
-                    add_connection(g_manager->mesh_node->connection_table, device_id, 0);
+                    /* Only add to connection table if not already there */
+                    struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
+                    if (!conn) {
+                        add_connection(g_manager->mesh_node->connection_table, device_id, 0);
+                    }
                     update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
-                    g_manager->mesh_node->available_connections--;
+                    if (g_manager->mesh_node->available_connections > 0) {
+                        g_manager->mesh_node->available_connections--;
+                    }
                 }
 
                 if (g_manager->connected_callback) {
