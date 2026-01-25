@@ -1,17 +1,8 @@
 #include "routing.h"
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <stdio.h>
 
-/* Utility Functions */
-uint32_t get_current_timestamp(void) {
-    return (uint32_t)time(NULL);
-}
-
-uint32_t generate_request_id(void) {
-    return (uint32_t)rand(); // NOLINT(cert-msc30-c, cert-msc50-cpp)
-}
 
 uint8_t get_max_connections(const enum NODE_TYPE node_type) {
     switch (node_type) {

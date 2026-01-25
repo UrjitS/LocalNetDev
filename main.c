@@ -233,12 +233,12 @@ static void signal_handler(const int sig_no) {
 }
 
 /* Callback: Node discovered */
-static void on_node_discovered(uint32_t node_id, int8_t rssi) {
+static void on_node_discovered(const uint32_t node_id, const int8_t rssi) {
     log_info(TAG, "Discovered node: 0x%08X (RSSI: %d dBm)", node_id, rssi);
 }
 
 /* Callback: Node connected */
-static void on_node_connected(uint32_t node_id) {
+static void on_node_connected(const uint32_t node_id) {
     log_info(TAG, "Connected to node: 0x%08X", node_id);
 
     if (g_ble_manager) {
@@ -248,17 +248,17 @@ static void on_node_connected(uint32_t node_id) {
 }
 
 /* Callback: Node disconnected */
-static void on_node_disconnected(uint32_t node_id) {
+static void on_node_disconnected(const uint32_t node_id) {
     log_info(TAG, "Disconnected from node: 0x%08X", node_id);
 
     if (g_ble_manager) {
-        int connected = ble_get_connected_count(g_ble_manager);
+        const int connected = ble_get_connected_count(g_ble_manager);
         log_info(TAG, "Remaining connected nodes: %d", connected);
     }
 }
 
 /* Callback: Data received */
-static void on_data_received(uint32_t sender_id, const uint8_t *data, size_t len) {
+static void on_data_received(const uint32_t sender_id, const uint8_t *data, const size_t len) {
     log_debug(TAG, "Received %zu bytes from node 0x%08X", len, sender_id);
 
     /* Parse the header to determine message type */
@@ -310,7 +310,7 @@ static uint32_t mac_to_device_id(const char *mac) {
     return (bytes[2] << 24) | (bytes[3] << 16) | (bytes[4] << 8) | bytes[5];
 }
 
-int main(int argc, char *argv[]) {
+int main(const int argc, char *argv[]) {
     enum NODE_TYPE node_type = FULL_NODE;  /* Default to FULL */
     int verbose = 0;
 

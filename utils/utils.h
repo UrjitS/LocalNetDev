@@ -7,5 +7,9 @@
 
 #define TAG "LOCALNET"
 
+#include <stdint.h>
+
+uint32_t get_current_timestamp(void);
+uint32_t generate_request_id(void);
 
 #endif //LOCALNET_UTILS_H

@@ -1,4 +1,5 @@
 #include "bluetooth.h"
+#include "utils.h"
 
 /* Global reference for callbacks (needed since binc callbacks don't support user_data) */
 static ble_node_manager_t *g_manager = NULL;
@@ -10,15 +11,16 @@ static gboolean is_connection_pending(ble_node_manager_t *manager, uint32_t devi
 /* Forward declarations for internal callbacks */
 static void on_scan_result(Adapter *adapter, Device *device);
 static void on_connection_state_changed(Device *device, ConnectionState state, const GError *error);
+static void on_incoming_connection_state_changed(Device *device, ConnectionState state, const GError *error);
 static void on_services_resolved(Device *device);
 static void on_read_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_notify_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray);
 static gboolean on_request_authorization(Device *device);
 static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid,
-                                       const char* char_uuid, const guint16 offset, const guint16 mtu);
+                                       const char* char_uuid, guint16 offset, guint16 mtu);
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid,
-                                        const char *char_uuid, GByteArray *byteArray, const guint16 offset, const guint16 mtu);
+                                        const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
 static gboolean periodic_discovery_callback(gpointer user_data);
 static gboolean periodic_reconnect_callback(gpointer user_data);
 static gboolean periodic_heartbeat_callback(gpointer user_data);
@@ -71,6 +73,18 @@ discovered_device_t *ble_find_device_by_ptr(ble_node_manager_t *manager, Device 
     return NULL;
 }
 
+/* Find an incoming client by Device pointer */
+static incoming_client_t *find_incoming_client_by_device(ble_node_manager_t *manager, Device *device) {
+    if (!manager || !device) return NULL;
+
+    for (size_t i = 0; i < manager->incoming_count; i++) {
+        if (manager->incoming_clients[i].device == device) {
+            return &manager->incoming_clients[i];
+        }
+    }
+    return NULL;
+}
+
 /* Convert MAC address to 32-bit device ID (uses last 4 bytes) */
 uint32_t ble_mac_to_device_id(const char *mac) {
     if (!mac) return 0;
@@ -102,6 +116,7 @@ incoming_client_t *ble_find_or_add_incoming_client(ble_node_manager_t *manager, 
     }
 
     incoming_client_t *client = &manager->incoming_clients[manager->incoming_count];
+    client->device = NULL;  /* Will be set when we get the Device object */
     strncpy(client->address, address, sizeof(client->address) - 1);
     client->address[sizeof(client->address) - 1] = '\0';
     client->device_id = ble_mac_to_device_id(address);
@@ -151,13 +166,23 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
             if (dev->is_connected) connections[found].is_connected = TRUE;
             connections[found].rssi = dev->rssi;
             connections[found].last_seen = dev->last_seen;
+            /* Copy address if we have it */
+            if (dev->address[0]) {
+                strncpy(connections[found].address, dev->address, sizeof(connections[found].address) - 1);
+            }
         } else {
             /* Add new entry */
             connections[total_connections].device_id = dev->device_id;
             connections[total_connections].is_connected = dev->is_connected;
             connections[total_connections].rssi = dev->rssi;
             connections[total_connections].last_seen = dev->last_seen;
-            connections[total_connections].address[0] = '\0';
+            /* Copy address from discovered device */
+            if (dev->address[0]) {
+                strncpy(connections[total_connections].address, dev->address, sizeof(connections[total_connections].address) - 1);
+                connections[total_connections].address[sizeof(connections[total_connections].address) - 1] = '\0';
+            } else {
+                connections[total_connections].address[0] = '\0';
+            }
             connections[total_connections].is_outgoing = TRUE;
             connections[total_connections].is_incoming = FALSE;
             total_connections++;
@@ -241,7 +266,7 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
     printf("\n");
 }
 
-int ble_get_adapter_address(char *address, size_t len) {
+int ble_get_adapter_address(char *address, const size_t len) {
     if (!address || len < 18) return -1;  /* Need at least 18 chars for "XX:XX:XX:XX:XX:XX\0" */
 
     /* Get DBus connection */
@@ -284,12 +309,20 @@ int ble_get_adapter_address(char *address, size_t len) {
 static discovered_device_t *add_discovered_device(ble_node_manager_t *manager, Device *device, const uint32_t device_id, const int8_t rssi) {
     if (!manager || manager->discovered_count >= MAX_DISCOVERED_DEVICES) return NULL;
 
+    /* Get the device address */
+    const char *addr = device ? binc_device_get_address(device) : NULL;
+
     /* Check if already exists */
     discovered_device_t *existing = ble_find_discovered_device(manager, device_id);
     if (existing) {
         existing->rssi = rssi;
         existing->last_seen = get_current_timestamp();
         existing->device = device;
+        /* Update address if we have one */
+        if (addr) {
+            strncpy(existing->address, addr, sizeof(existing->address) - 1);
+            existing->address[sizeof(existing->address) - 1] = '\0';
+        }
         return existing;
     }
 
@@ -299,8 +332,18 @@ static discovered_device_t *add_discovered_device(ble_node_manager_t *manager, D
     entry->device_id = device_id;
     entry->rssi = rssi;
     entry->last_seen = get_current_timestamp();
+    entry->last_connect_attempt = 0;
     entry->is_connected = FALSE;
     entry->connection_pending = FALSE;
+
+    /* Store the address */
+    if (addr) {
+        strncpy(entry->address, addr, sizeof(entry->address) - 1);
+        entry->address[sizeof(entry->address) - 1] = '\0';
+    } else {
+        entry->address[0] = '\0';
+    }
+
     manager->discovered_count++;
 
     return entry;
@@ -661,6 +704,17 @@ int ble_connect_to_node(ble_node_manager_t *manager, const uint32_t device_id) {
         return 0;
     }
 
+    /* Check connection cooldown - avoid rapid reconnection attempts */
+    uint32_t current_time = get_current_timestamp();
+    if (discovered->last_connect_attempt > 0) {
+        uint32_t elapsed_ms = (current_time - discovered->last_connect_attempt) * 1000;
+        if (elapsed_ms < CONNECTION_RETRY_COOLDOWN_MS) {
+            log_debug(BT_TAG, "Device 0x%08X in cooldown, %u ms remaining",
+                      device_id, CONNECTION_RETRY_COOLDOWN_MS - elapsed_ms);
+            return 0;
+        }
+    }
+
     /* Check if we have available connections */
     if (!has_available_connections(manager->mesh_node)) {
         log_debug(BT_TAG, "No available connections for device 0x%08X", device_id);
@@ -670,6 +724,7 @@ int ble_connect_to_node(ble_node_manager_t *manager, const uint32_t device_id) {
     log_debug(BT_TAG, "Connecting to device 0x%08X", device_id);
 
     discovered->connection_pending = TRUE;
+    discovered->last_connect_attempt = current_time;
 
     /* Set up device callbacks */
     binc_device_set_connection_state_change_cb(discovered->device, &on_connection_state_changed);
@@ -872,7 +927,7 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     const char *name = binc_device_get_name(device);
     const char *address = binc_device_get_address(device);
 
-    log_debug(BT_TAG, "Scan result: %s (%s)", name ? name : "(null)", address ? address : "unknown");
+    // log_debug(BT_TAG, "Scan result: %s (%s)", name ? name : "(null)", address ? address : "unknown");
 
     if (!name || !g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
         return;  /* Not a LocalNet device */
@@ -970,6 +1025,61 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
             binc_adapter_remove_device(g_manager->adapter, device);
             /* Clear the device pointer to prevent reconnection attempts with invalid device */
             discovered->device = NULL;
+        }
+    }
+}
+
+/* Callback for incoming connection (remote central) state changes - detects disconnection */
+static void on_incoming_connection_state_changed(Device *device, const ConnectionState state, const GError *error) {
+    if (!g_manager || !device) return;
+
+    /* Find the incoming client by device pointer */
+    incoming_client_t *client = find_incoming_client_by_device(g_manager, device);
+    if (!client) {
+        /* Try to find by address */
+        const char *address = binc_device_get_address(device);
+        if (address) {
+            for (size_t i = 0; i < g_manager->incoming_count; i++) {
+                if (g_str_equal(g_manager->incoming_clients[i].address, address)) {
+                    client = &g_manager->incoming_clients[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!client) {
+        log_debug(BT_TAG, "Incoming connection state change for unknown device");
+        return;
+    }
+
+    if (error) {
+        log_error(BT_TAG, "Incoming connection error for 0x%08X: %s", client->device_id, error->message);
+        return;
+    }
+
+    log_debug(BT_TAG, "Incoming connection state changed for 0x%08X: %s",
+              client->device_id, binc_device_get_connection_state_name(device));
+
+    if (state == BINC_DISCONNECTED) {
+        gboolean was_connected = client->is_connected;
+        client->is_connected = FALSE;
+        client->device = NULL;
+
+        /* Update connection table */
+        if (g_manager->mesh_node) {
+            update_connection_state(g_manager->mesh_node->connection_table, client->device_id, DISCONNECTED);
+
+            /* Only update available connections if was actually connected */
+            if (was_connected && g_manager->mesh_node->available_connections < get_max_connections(g_manager->mesh_node->node_type)) {
+                g_manager->mesh_node->available_connections++;
+            }
+        }
+
+        /* Notify callback only for actual disconnections */
+        if (was_connected && g_manager->disconnected_callback) {
+            log_info(BT_TAG, "Incoming connection disconnected: 0x%08X", client->device_id);
+            g_manager->disconnected_callback(client->device_id);
         }
     }
 }
@@ -1151,7 +1261,7 @@ static const char* on_local_char_write(const Application *app, const char *addre
 }
 
 /* Periodic callbacks */
-static gboolean periodic_discovery_callback(const gpointer user_data) {
+static gboolean periodic_discovery_callback(gpointer user_data) {
     ble_node_manager_t *manager = (ble_node_manager_t *)user_data;
 
     if (!manager || !manager->running) return FALSE;
@@ -1412,7 +1522,7 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
 
     /* If this is a LocalNet device, process it */
     if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
-        uint32_t device_id = ble_extract_device_id(name);
+        const uint32_t device_id = ble_extract_device_id(name);
         if (device_id != 0 && device_id != g_manager->mesh_node->device_id) {
             /* Check if we already have this device connected (incoming or outgoing) */
             if (is_already_connected(g_manager, device_id)) {
@@ -1435,6 +1545,11 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
 
                 client->is_connected = TRUE;
                 client->device_id = device_id;
+                client->device = device;  /* Store device pointer for tracking disconnection */
+
+                /* Set up connection state callback to detect disconnection */
+                binc_device_set_connection_state_change_cb(device, &on_incoming_connection_state_changed);
+
                 log_info(BT_TAG, "LocalNet node connected as central: 0x%08X", device_id);
 
                 if (g_manager->mesh_node) {

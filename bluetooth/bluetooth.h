@@ -24,6 +24,7 @@
 #define LOCAL_NET_DEVICE_PREFIX "LocalNet-"
 #define DISCOVERY_SCAN_INTERVAL_MS 30000
 #define RECONNECT_ATTEMPT_INTERVAL_MS 10000
+#define CONNECTION_RETRY_COOLDOWN_MS 15000   /* Wait 15 seconds before retrying a failed connection */
 #define MAX_DISCOVERED_DEVICES 32
 #define MAX_INCOMING_CLIENTS 16
 
@@ -40,14 +41,17 @@ typedef enum {
 typedef struct {
     Device *device;
     uint32_t device_id;
+    char address[18];          /* MAC address string */
     int8_t rssi;
     uint32_t last_seen;
+    uint32_t last_connect_attempt;  /* Timestamp of last connection attempt */
     gboolean is_connected;
     gboolean connection_pending;
 } discovered_device_t;
 
 /* Incoming client entry - tracks devices that connected to our GATT server */
 typedef struct {
+    Device *device;            /* Device object for tracking disconnection */
     char address[18];          /* MAC address string */
     uint32_t device_id;        /* Derived device ID */
     uint32_t last_seen;        /* Last activity timestamp */

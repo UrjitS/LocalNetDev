@@ -155,8 +155,6 @@ int forward_packet(struct mesh_node *node, uint32_t destination_id, uint8_t *ttl
 int should_process_locally(struct mesh_node *node, uint32_t destination_id);
 
 /* Utility Functions */
-uint32_t get_current_timestamp(void);
-uint32_t generate_request_id(void);
 void free_connection_table(struct connection_table *table);
 void free_mesh_node(struct mesh_node *node);
 void free_routing_table(struct routing_table *table);
