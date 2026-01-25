@@ -113,63 +113,131 @@ incoming_client_t *ble_find_or_add_incoming_client(ble_node_manager_t *manager, 
     return client;
 }
 
-/* Print connection table for debugging */
+/* Print connection table for debugging - unified view of all connections */
 void ble_print_connection_table(ble_node_manager_t *manager) {
     if (!manager) return;
 
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("║                      CONNECTION TABLE                            ║\n");
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Local Node: 0x%08X                                          ║\n",
-           manager->mesh_node ? manager->mesh_node->device_id : 0);
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ OUTGOING CONNECTIONS (we connected to them):                     ║\n");
-    printf("╠────────────────┬────────────┬────────────┬────────────────────────╣\n");
-    printf("║ Device ID      │ Connected  │ RSSI       │ Last Seen              ║\n");
-    printf("╠────────────────┼────────────┼────────────┼────────────────────────╣\n");
+    /* Build a unified list of unique device IDs */
+    typedef struct {
+        uint32_t device_id;
+        gboolean is_connected;
+        int8_t rssi;
+        uint32_t last_seen;
+        char address[18];
+        gboolean is_outgoing;
+        gboolean is_incoming;
+    } unified_connection_t;
 
-    int outgoing_count = 0;
+    unified_connection_t connections[MAX_DISCOVERED_DEVICES + MAX_INCOMING_CLIENTS];
+    int total_connections = 0;
+
+    /* Add outgoing connections */
     for (size_t i = 0; i < manager->discovered_count; i++) {
         discovered_device_t *dev = &manager->discovered_devices[i];
-        if (dev->is_connected) {
-            printf("║ 0x%08X     │ %-10s │ %4d dBm   │ %10u             ║\n",
-                   dev->device_id,
-                   dev->is_connected ? "YES" : "NO",
-                   dev->rssi,
-                   dev->last_seen);
-            outgoing_count++;
+        if (dev->device_id == 0) continue;
+
+        /* Check if already in list */
+        int found = -1;
+        for (int j = 0; j < total_connections; j++) {
+            if (connections[j].device_id == dev->device_id) {
+                found = j;
+                break;
+            }
+        }
+
+        if (found >= 0) {
+            /* Update existing entry */
+            connections[found].is_outgoing = TRUE;
+            if (dev->is_connected) connections[found].is_connected = TRUE;
+            connections[found].rssi = dev->rssi;
+            connections[found].last_seen = dev->last_seen;
+        } else {
+            /* Add new entry */
+            connections[total_connections].device_id = dev->device_id;
+            connections[total_connections].is_connected = dev->is_connected;
+            connections[total_connections].rssi = dev->rssi;
+            connections[total_connections].last_seen = dev->last_seen;
+            connections[total_connections].address[0] = '\0';
+            connections[total_connections].is_outgoing = TRUE;
+            connections[total_connections].is_incoming = FALSE;
+            total_connections++;
         }
     }
-    if (outgoing_count == 0) {
-        printf("║ (none)                                                           ║\n");
-    }
 
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ INCOMING CONNECTIONS (they connected to us):                     ║\n");
-    printf("╠────────────────┬────────────┬────────────────────────────────────╣\n");
-    printf("║ Device ID      │ Connected  │ MAC Address                        ║\n");
-    printf("╠────────────────┼────────────┼────────────────────────────────────╣\n");
-
-    int incoming_count = 0;
+    /* Add incoming connections */
     for (size_t i = 0; i < manager->incoming_count; i++) {
         incoming_client_t *client = &manager->incoming_clients[i];
-        if (client->is_connected) {
-            printf("║ 0x%08X     │ %-10s │ %-34s ║\n",
-                   client->device_id,
-                   client->is_connected ? "YES" : "NO",
-                   client->address);
-            incoming_count++;
+        if (client->device_id == 0) continue;
+
+        /* Check if already in list */
+        int found = -1;
+        for (int j = 0; j < total_connections; j++) {
+            if (connections[j].device_id == client->device_id) {
+                found = j;
+                break;
+            }
+        }
+
+        if (found >= 0) {
+            /* Update existing entry */
+            connections[found].is_incoming = TRUE;
+            if (client->is_connected) connections[found].is_connected = TRUE;
+            strncpy(connections[found].address, client->address, sizeof(connections[found].address) - 1);
+        } else {
+            /* Add new entry */
+            connections[total_connections].device_id = client->device_id;
+            connections[total_connections].is_connected = client->is_connected;
+            connections[total_connections].rssi = 0;
+            connections[total_connections].last_seen = client->last_seen;
+            strncpy(connections[total_connections].address, client->address, sizeof(connections[total_connections].address) - 1);
+            connections[total_connections].is_outgoing = FALSE;
+            connections[total_connections].is_incoming = TRUE;
+            total_connections++;
         }
     }
-    if (incoming_count == 0) {
-        printf("║ (none)                                                           ║\n");
+
+    /* Count connected */
+    int connected_count = 0;
+    for (int i = 0; i < total_connections; i++) {
+        if (connections[i].is_connected) connected_count++;
     }
 
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Total: %d outgoing, %d incoming                                   ║\n",
-           outgoing_count, incoming_count);
-    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+    printf("╔════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                           CONNECTION TABLE                                 ║\n");
+    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║ Local Node: 0x%08X                                                     ║\n",
+           manager->mesh_node ? manager->mesh_node->device_id : 0);
+    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║ Device ID      │ Status     │ RSSI       │ Type       │ MAC Address        ║\n");
+    printf("╠────────────────┼────────────┼────────────┼────────────┼────────────────────╣\n");
+
+    for (int i = 0; i < total_connections; i++) {
+        const char *type_str;
+        if (connections[i].is_outgoing && connections[i].is_incoming) {
+            type_str = "BOTH";
+        } else if (connections[i].is_outgoing) {
+            type_str = "OUTGOING";
+        } else {
+            type_str = "INCOMING";
+        }
+
+        printf("║ 0x%08X     │ %-10s │ %4d dBm   │ %-10s │ %-18s ║\n",
+               connections[i].device_id,
+               connections[i].is_connected ? "CONNECTED" : "KNOWN",
+               connections[i].rssi,
+               type_str,
+               connections[i].address[0] ? connections[i].address : "N/A");
+    }
+
+    if (total_connections == 0) {
+        printf("║ (no connections)                                                           ║\n");
+    }
+
+    printf("╠════════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║ Total: %d known, %d connected                                               ║\n",
+           total_connections, connected_count);
+    printf("╚════════════════════════════════════════════════════════════════════════════╝\n");
     printf("\n");
 }
 
@@ -555,9 +623,15 @@ int ble_is_advertising(const ble_node_manager_t *manager) {
 int ble_connect_to_node(ble_node_manager_t *manager, const uint32_t device_id) {
     if (!manager) return -1;
 
-    /* Check if already connected via incoming connection */
+    /* Check if already connected via incoming or outgoing connection */
     if (is_already_connected(manager, device_id)) {
         log_debug(BT_TAG, "Already connected to device 0x%08X (incoming or outgoing)", device_id);
+        return 0;
+    }
+
+    /* Check if connection is already pending */
+    if (is_connection_pending(manager, device_id)) {
+        log_debug(BT_TAG, "Connection to device 0x%08X already pending", device_id);
         return 0;
     }
 
@@ -575,11 +649,13 @@ int ble_connect_to_node(ble_node_manager_t *manager, const uint32_t device_id) {
         return -1;
     }
 
+    /* Double-check is_connected flag on the discovered device */
     if (discovered->is_connected) {
         log_debug(BT_TAG, "Already connected to device 0x%08X", device_id);
         return 0;
     }
 
+    /* Check connection_pending flag on the discovered device */
     if (discovered->connection_pending) {
         log_debug(BT_TAG, "Connection to device 0x%08X already pending", device_id);
         return 0;
@@ -630,23 +706,47 @@ int ble_disconnect_from_node(ble_node_manager_t *manager, const uint32_t device_
 int ble_get_connected_count(ble_node_manager_t *manager) {
     if (!manager) return 0;
 
-    int count = 0;
+    /* Use a simple array to track unique connected device IDs */
+    uint32_t connected_ids[MAX_DISCOVERED_DEVICES + MAX_INCOMING_CLIENTS];
+    int unique_count = 0;
 
     /* Count outgoing connections */
     for (size_t i = 0; i < manager->discovered_count; i++) {
         if (manager->discovered_devices[i].is_connected) {
-            count++;
+            uint32_t dev_id = manager->discovered_devices[i].device_id;
+            /* Check if already counted */
+            gboolean found = FALSE;
+            for (int j = 0; j < unique_count; j++) {
+                if (connected_ids[j] == dev_id) {
+                    found = TRUE;
+                    break;
+                }
+            }
+            if (!found) {
+                connected_ids[unique_count++] = dev_id;
+            }
         }
     }
 
-    /* Count incoming connections */
+    /* Count incoming connections (only if not already counted) */
     for (size_t i = 0; i < manager->incoming_count; i++) {
         if (manager->incoming_clients[i].is_connected) {
-            count++;
+            uint32_t dev_id = manager->incoming_clients[i].device_id;
+            /* Check if already counted */
+            gboolean found = FALSE;
+            for (int j = 0; j < unique_count; j++) {
+                if (connected_ids[j] == dev_id) {
+                    found = TRUE;
+                    break;
+                }
+            }
+            if (!found) {
+                connected_ids[unique_count++] = dev_id;
+            }
         }
     }
 
-    return count;
+    return unique_count;
 }
 
 /* Data transmission */
@@ -832,7 +932,11 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
     if (error) {
         log_error(BT_TAG, "Connection error for 0x%08X: %s", discovered->device_id, error->message);
         discovered->connection_pending = FALSE;
-        update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, DISCONNECTED);
+        /* Only update connection state if there was an actual connection attempt */
+        struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, discovered->device_id);
+        if (conn && conn->state == CONNECTING) {
+            update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, DISCONNECTED);
+        }
         return;
     }
 
@@ -843,18 +947,22 @@ static void on_connection_state_changed(Device *device, const ConnectionState st
         /* Wait for services to be resolved before marking as fully connected */
         update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, CONNECTING);
     } else if (state == BINC_DISCONNECTED) {
+        gboolean was_connected = discovered->is_connected;
         discovered->is_connected = FALSE;
         discovered->connection_pending = FALSE;
 
         /* Update connection table */
         update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, DISCONNECTED);
 
-        /* Update available connections */
-        g_manager->mesh_node->available_connections++;
+        /* Only update available connections and notify callback if was actually connected */
+        if (was_connected) {
+            /* Update available connections */
+            g_manager->mesh_node->available_connections++;
 
-        /* Notify callback */
-        if (g_manager->disconnected_callback) {
-            g_manager->disconnected_callback(discovered->device_id);
+            /* Notify callback only for actual disconnections */
+            if (g_manager->disconnected_callback) {
+                g_manager->disconnected_callback(discovered->device_id);
+            }
         }
 
         /* Clean up if not bonded */
@@ -1005,25 +1113,26 @@ static const char* on_local_char_write(const Application *app, const char *addre
                     /* We already have an outgoing connection, just update last_seen and process data */
                     log_debug(BT_TAG, "Received write from 0x%08X via existing outgoing connection", sender_id);
                 } else if (!client->is_connected) {
-                    /* Check if this is a new connection */
+                    /* This is a NEW incoming connection - mark as connected but don't notify
+                     * The notification should come from on_remote_central_connected instead */
                     client->is_connected = TRUE;
-                    log_info(BT_TAG, "Incoming connection from %s (ID: 0x%08X)", address, sender_id);
+                    log_info(BT_TAG, "Incoming connection established from %s (ID: 0x%08X)", address, sender_id);
 
                     /* Add to mesh node's connection table if not already there */
                     if (g_manager->mesh_node) {
                         struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, sender_id);
                         if (!conn) {
                             add_connection(g_manager->mesh_node->connection_table, sender_id, 0);
-                        }
-                        update_connection_state(g_manager->mesh_node->connection_table, sender_id, STABLE);
-                        if (g_manager->mesh_node->available_connections > 0) {
-                            g_manager->mesh_node->available_connections--;
-                        }
-                    }
+                            update_connection_state(g_manager->mesh_node->connection_table, sender_id, STABLE);
+                            if (g_manager->mesh_node->available_connections > 0) {
+                                g_manager->mesh_node->available_connections--;
+                            }
 
-                    /* Notify callback */
-                    if (g_manager->connected_callback) {
-                        g_manager->connected_callback(sender_id);
+                            /* Only notify callback for genuinely new connections */
+                            if (g_manager->connected_callback) {
+                                g_manager->connected_callback(sender_id);
+                            }
+                        }
                     }
                 }
             }
@@ -1074,16 +1183,25 @@ static gboolean periodic_reconnect_callback(gpointer user_data) {
 
     /* Try to reconnect to disconnected known devices */
     for (size_t i = 0; i < manager->discovered_count; i++) {
-        const discovered_device_t *disc = &manager->discovered_devices[i];
+        discovered_device_t *disc = &manager->discovered_devices[i];
 
-        if (!disc->is_connected && !disc->connection_pending && disc->device) {
-            const struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, disc->device_id);
+        /* Skip if already connected, pending, or no valid device pointer */
+        if (disc->is_connected || disc->connection_pending || !disc->device) {
+            continue;
+        }
 
-            if (conn && conn->state == DISCONNECTED) {
-                if (has_available_connections(manager->mesh_node)) {
-                    log_debug(BT_TAG, "Attempting reconnection to 0x%08X", disc->device_id);
-                    ble_connect_to_node(manager, disc->device_id);
-                }
+        /* Skip if already connected via incoming connection */
+        if (is_already_connected(manager, disc->device_id)) {
+            continue;
+        }
+
+        const struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, disc->device_id);
+
+        /* Only reconnect if we have a disconnected entry (meaning we were previously connected) */
+        if (conn && conn->state == DISCONNECTED) {
+            if (has_available_connections(manager->mesh_node)) {
+                log_debug(BT_TAG, "Attempting reconnection to 0x%08X", disc->device_id);
+                ble_connect_to_node(manager, disc->device_id);
             }
         }
     }
@@ -1203,6 +1321,12 @@ static gboolean delayed_discovery_start(gpointer user_data) {
                         continue;
                     }
 
+                    /* Skip if connection is already pending */
+                    if (is_connection_pending(manager, device_id)) {
+                        log_debug(BT_TAG, "Cached device 0x%08X connection pending, skipping", device_id);
+                        continue;
+                    }
+
                     log_info(BT_TAG, "Found cached LocalNet device: %s (%s)", name, address ? address : "unknown");
 
                     /* Process it like a scan result */
@@ -1216,8 +1340,14 @@ static gboolean delayed_discovery_start(gpointer user_data) {
                     if (discovered && !discovered->is_connected && !discovered->connection_pending) {
                         if (has_available_connections(manager->mesh_node)) {
                             log_info(BT_TAG, "Attempting to connect to cached device 0x%08X", device_id);
-                            add_connection(manager->mesh_node->connection_table, device_id, -50);
+
+                            /* Check if connection entry already exists */
+                            struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, device_id);
+                            if (!conn) {
+                                add_connection(manager->mesh_node->connection_table, device_id, -50);
+                            }
                             update_connection_state(manager->mesh_node->connection_table, device_id, DISCOVERING);
+
                             int connect_result = ble_connect_to_node(manager, device_id);
                             if (connect_result != 0) {
                                 log_error(BT_TAG, "Failed to initiate connection to cached device 0x%08X", device_id);
@@ -1280,23 +1410,29 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
     const char *name = binc_device_get_name(device);
     const char *address = binc_device_get_address(device);
 
-    log_info(BT_TAG, "Remote central connected: %s (%s)",
-             name ? name : "(unknown)", address ? address : "unknown");
-
     /* If this is a LocalNet device, process it */
     if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
         uint32_t device_id = ble_extract_device_id(name);
         if (device_id != 0 && device_id != g_manager->mesh_node->device_id) {
-            /* Check if we already have an outgoing connection to this device */
-            discovered_device_t *existing = ble_find_discovered_device(g_manager, device_id);
-            if (existing && existing->is_connected) {
-                log_debug(BT_TAG, "Already have outgoing connection to 0x%08X, skipping incoming registration", device_id);
+            /* Check if we already have this device connected (incoming or outgoing) */
+            if (is_already_connected(g_manager, device_id)) {
+                log_debug(BT_TAG, "Already connected to 0x%08X, ignoring duplicate central connection", device_id);
                 return;
             }
 
+            /* Log only for new connections */
+            log_info(BT_TAG, "Remote central connected: %s (%s)",
+                     name ? name : "(unknown)", address ? address : "unknown");
+
             /* Add to our incoming clients and mark as connected */
             incoming_client_t *client = ble_find_or_add_incoming_client(g_manager, address);
-            if (client && !client->is_connected) {
+            if (client) {
+                if (client->is_connected) {
+                    /* Already connected, ignore */
+                    log_debug(BT_TAG, "Incoming client 0x%08X already marked as connected", device_id);
+                    return;
+                }
+
                 client->is_connected = TRUE;
                 client->device_id = device_id;
                 log_info(BT_TAG, "LocalNet node connected as central: 0x%08X", device_id);
@@ -1306,22 +1442,26 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
                     struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
                     if (!conn) {
                         add_connection(g_manager->mesh_node->connection_table, device_id, 0);
-                    }
-                    update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
-                    if (g_manager->mesh_node->available_connections > 0) {
-                        g_manager->mesh_node->available_connections--;
-                    }
-                }
+                        update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
+                        if (g_manager->mesh_node->available_connections > 0) {
+                            g_manager->mesh_node->available_connections--;
+                        }
 
-                if (g_manager->connected_callback) {
-                    g_manager->connected_callback(device_id);
+                        /* Only notify for genuinely new connections */
+                        if (g_manager->connected_callback) {
+                            g_manager->connected_callback(device_id);
+                        }
+                    } else {
+                        /* Connection entry exists but update state */
+                        update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
+                    }
                 }
             }
         }
     } else {
         /* Unknown device connected - we still might get LocalNet data from it */
         /* The MAC address will be used to derive the device ID when we get a write */
-        log_debug(BT_TAG, "Non-LocalNet device connected as central, tracking by address");
+        log_debug(BT_TAG, "Non-LocalNet device connected as central: %s", address ? address : "unknown");
     }
 }
 
