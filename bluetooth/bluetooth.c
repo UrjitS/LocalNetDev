@@ -23,6 +23,7 @@ static gboolean delayed_advertising_start(gpointer user_data);
 static gboolean delayed_app_registration(gpointer user_data);
 static void on_adapter_powered_state_changed(Adapter *adapter, gboolean powered);
 static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, const GError *error);
+static void on_remote_central_connected(Adapter *adapter, Device *device);
 
 /* Maximum time to wait for adapter to become ready (in milliseconds) */
 #define ADAPTER_READY_DELAY_MS 3000
@@ -398,6 +399,9 @@ int ble_start(ble_node_manager_t *manager) {
     /* Setup central (scanner) callbacks - actual discovery is started later */
     binc_adapter_set_discovery_cb(manager->adapter, &on_scan_result);
     binc_adapter_set_discovery_state_cb(manager->adapter, &on_discovery_state_changed);
+
+    /* Setup callback for when remote devices connect to us as a peripheral */
+    binc_adapter_set_remote_central_cb(manager->adapter, &on_remote_central_connected);
 
     manager->running = TRUE;
 
@@ -1098,6 +1102,50 @@ static gboolean delayed_discovery_start(gpointer user_data) {
         g_timeout_add(ADAPTER_INIT_RETRY_MS, delayed_discovery_start, manager);
     }
 
+    /* Also check for any cached LocalNet devices we already know about */
+    GList *devices = binc_adapter_get_devices(manager->adapter);
+    for (GList *iter = devices; iter != NULL; iter = iter->next) {
+        Device *device = (Device *)iter->data;
+        if (device) {
+            const char *name = binc_device_get_name(device);
+            const char *address = binc_device_get_address(device);
+
+            if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
+                uint32_t device_id = ble_extract_device_id(name);
+                if (device_id != 0 && device_id != manager->mesh_node->device_id) {
+                    log_info(BT_TAG, "Found cached LocalNet device: %s (%s)", name, address ? address : "unknown");
+
+                    /* Process it like a scan result */
+                    discovered_device_t *discovered = add_discovered_device(manager, device, device_id, -50);
+
+                    if (manager->discovered_callback) {
+                        manager->discovered_callback(device_id, -50);
+                    }
+
+                    /* Try to connect if not already connected */
+                    if (discovered && !discovered->is_connected && !discovered->connection_pending) {
+                        if (has_available_connections(manager->mesh_node)) {
+                            log_info(BT_TAG, "Attempting to connect to cached device 0x%08X", device_id);
+                            add_connection(manager->mesh_node->connection_table, device_id, -50);
+                            update_connection_state(manager->mesh_node->connection_table, device_id, DISCOVERING);
+                            int connect_result = ble_connect_to_node(manager, device_id);
+                            if (connect_result != 0) {
+                                log_error(BT_TAG, "Failed to initiate connection to cached device 0x%08X", device_id);
+                            }
+                        } else {
+                            log_debug(BT_TAG, "No available connections for cached device 0x%08X", device_id);
+                        }
+                    } else {
+                        log_debug(BT_TAG, "Cached device 0x%08X already connected or pending", device_id);
+                    }
+                }
+            }
+        }
+    }
+    if (devices) {
+        g_list_free(devices);
+    }
+
     return FALSE;  /* Don't repeat this one-shot timer */
 }
 
@@ -1130,6 +1178,47 @@ static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, c
         log_error(BT_TAG, "Discovery state changed to %s with error: %s", state_name, error->message);
     } else {
         log_info(BT_TAG, "Discovery state changed to %s", state_name);
+    }
+}
+
+/* Callback when a remote central connects to us (we're acting as peripheral) */
+static void on_remote_central_connected(Adapter *adapter, Device *device) {
+    (void)adapter;
+
+    if (!g_manager || !device) return;
+
+    const char *name = binc_device_get_name(device);
+    const char *address = binc_device_get_address(device);
+
+    log_info(BT_TAG, "Remote central connected: %s (%s)",
+             name ? name : "(unknown)", address ? address : "unknown");
+
+    /* If this is a LocalNet device, process it */
+    if (name && g_str_has_prefix(name, LOCAL_NET_DEVICE_PREFIX)) {
+        uint32_t device_id = ble_extract_device_id(name);
+        if (device_id != 0 && device_id != g_manager->mesh_node->device_id) {
+            /* Add to our incoming clients and mark as connected */
+            incoming_client_t *client = ble_find_or_add_incoming_client(g_manager, address);
+            if (client && !client->is_connected) {
+                client->is_connected = TRUE;
+                client->device_id = device_id;
+                log_info(BT_TAG, "LocalNet node connected as central: 0x%08X", device_id);
+
+                if (g_manager->mesh_node) {
+                    add_connection(g_manager->mesh_node->connection_table, device_id, 0);
+                    update_connection_state(g_manager->mesh_node->connection_table, device_id, STABLE);
+                    g_manager->mesh_node->available_connections--;
+                }
+
+                if (g_manager->connected_callback) {
+                    g_manager->connected_callback(device_id);
+                }
+            }
+        }
+    } else {
+        /* Unknown device connected - we still might get LocalNet data from it */
+        /* The MAC address will be used to derive the device ID when we get a write */
+        log_debug(BT_TAG, "Non-LocalNet device connected as central, tracking by address");
     }
 }
 
