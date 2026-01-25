@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdint.h>
+#include <time.h>
 #include <glib.h>
 #include "adapter.h"
 #include "device.h"
@@ -13,145 +15,86 @@
 #include "application.h"
 #include "advertisement.h"
 #include "characteristic.h"
-#include "routing.h"
-#include "protocol.h"
 
-#define BT_TAG "LocalNet-BT"
+/* Forward declarations */
+struct mesh_node;
+
 #define LOCAL_NET_SERVICE_UUID "00001234-0000-1000-8000-00805f9b34fb"
 #define LOCAL_NET_DATA_CHAR_UUID "00001235-0000-1000-8000-00805f9b34fb"
 #define LOCAL_NET_CTRL_CHAR_UUID "00001236-0000-1000-8000-00805f9b34fb"
 #define MAX_BLE_PAYLOAD_SIZE 512
-#define LOCAL_NET_DEVICE_PREFIX "LocalNet-"
-#define DISCOVERY_SCAN_INTERVAL_MS 30000
-#define RECONNECT_ATTEMPT_INTERVAL_MS 10000
-#define CONNECTION_RETRY_COOLDOWN_MS 15000   /* Wait 15 seconds before retrying a failed connection */
 #define MAX_DISCOVERED_DEVICES 32
-#define MAX_INCOMING_CLIENTS 16
-
-/* BLE Connection State */
-typedef enum {
-    BLE_STATE_IDLE = 0,
-    BLE_STATE_SCANNING,
-    BLE_STATE_CONNECTING,
-    BLE_STATE_CONNECTED,
-    BLE_STATE_DISCONNECTING
-} ble_state_t;
-
-/* Delay before allowing writes after connection (in seconds) */
-#define CONNECTION_WRITE_DELAY_SECONDS 2
-
-/* Discovered device entry */
-typedef struct {
-    Device *device;
-    uint32_t device_id;
-    char address[18];          /* MAC address string */
-    int8_t rssi;
-    uint32_t last_seen;
-    uint32_t last_connect_attempt;  /* Timestamp of last connection attempt */
-    uint32_t ready_time;           /* Timestamp when writes are allowed (after notification setup) */
-    gboolean is_connected;
-    gboolean connection_pending;
-} discovered_device_t;
-
-/* Incoming client entry - tracks devices that connected to our GATT server */
-typedef struct {
-    Device *device;            /* Device object for tracking disconnection */
-    char address[18];          /* MAC address string */
-    uint32_t device_id;        /* Derived device ID */
-    uint32_t last_seen;        /* Last activity timestamp */
-    gboolean is_connected;     /* Connection state */
-} incoming_client_t;
 
 /* Callback function types */
-typedef void (*on_data_received_cb)(uint32_t sender_id, const uint8_t *data, size_t len);
-typedef void (*on_node_connected_cb)(uint32_t node_id);
-typedef void (*on_node_disconnected_cb)(uint32_t node_id);
-typedef void (*on_node_discovered_cb)(uint32_t node_id, int8_t rssi);
+typedef void (*ble_discovered_callback)(uint32_t node_id, int16_t rssi);
+typedef void (*ble_connected_callback)(uint32_t node_id);
+typedef void (*ble_disconnected_callback)(uint32_t node_id);
+typedef void (*ble_data_callback)(uint32_t sender_id, const uint8_t *data, size_t len);
+
+/* Tracked device entry */
+typedef struct {
+    uint32_t device_id;
+    char mac_address[18];
+    Device *device;
+    gboolean is_connected;
+    gboolean we_initiated;  /* TRUE if we connected as central, FALSE if they connected to us */
+    int16_t rssi;
+    uint64_t last_heartbeat;
+    uint64_t last_seen;
+} tracked_device_t;
 
 /* BLE Node Manager - central structure for managing BLE mesh operations */
-typedef struct {
+typedef struct ble_node_manager {
     Adapter *adapter;
     Agent *agent;
     Application *app;
     Advertisement *advertisement;
-    GMainLoop *main_loop;
+    GMainLoop *loop;
     GDBusConnection *dbus_connection;
 
     struct mesh_node *mesh_node;
+    uint32_t device_id;
+    char local_name[32];
 
-    /* Discovered devices (outgoing connections) */
-    discovered_device_t discovered_devices[MAX_DISCOVERED_DEVICES];
-    size_t discovered_count;
-
-    /* Incoming clients (devices connected to our GATT server) */
-    incoming_client_t incoming_clients[MAX_INCOMING_CLIENTS];
-    size_t incoming_count;
+    /* Tracked devices */
+    tracked_device_t *discovered_devices;
+    guint discovered_count;
 
     /* State */
-    ble_state_t state;
-    gboolean advertising;
-    gboolean scanning;
     gboolean running;
 
     /* Callbacks */
-    on_data_received_cb data_callback;
-    on_node_connected_cb connected_callback;
-    on_node_disconnected_cb disconnected_callback;
-    on_node_discovered_cb discovered_callback;
+    ble_data_callback data_callback;
+    ble_connected_callback connected_callback;
+    ble_disconnected_callback disconnected_callback;
+    ble_discovered_callback discovered_callback;
 
-    /* Timers */
-    guint discovery_timer_id;
-    guint reconnect_timer_id;
-    guint heartbeat_timer_id;
+    /* Timer sources */
+    guint heartbeat_source;
 } ble_node_manager_t;
 
 /* Initialization and cleanup */
-ble_node_manager_t *ble_init(uint32_t device_id, enum NODE_TYPE node_type);
-void ble_cleanup(ble_node_manager_t *manager);
-int ble_start(ble_node_manager_t *manager);
+ble_node_manager_t *ble_init(struct mesh_node *mesh_node, uint32_t device_id,
+                              ble_discovered_callback discovered_cb,
+                              ble_connected_callback connected_cb,
+                              ble_disconnected_callback disconnected_cb,
+                              ble_data_callback data_cb);
+gboolean ble_start(ble_node_manager_t *manager);
 void ble_stop(ble_node_manager_t *manager);
+void ble_cleanup(ble_node_manager_t *manager);
 
-/* Node discovery */
-int ble_start_discovery(ble_node_manager_t *manager);
-void ble_stop_discovery(ble_node_manager_t *manager);
-int ble_is_discovering(const ble_node_manager_t *manager);
-
-/* Advertising (peripheral mode) */
-int ble_start_advertising(ble_node_manager_t *manager);
-void ble_stop_advertising(ble_node_manager_t *manager);
-int ble_is_advertising(const ble_node_manager_t *manager);
-
-/* Connection management */
-int ble_connect_to_node(ble_node_manager_t *manager, uint32_t device_id);
-int ble_disconnect_from_node(ble_node_manager_t *manager, uint32_t device_id);
-int ble_get_connected_count(ble_node_manager_t *manager);
+/* Main loop */
+void ble_run_loop(ble_node_manager_t *manager);
+void ble_quit_loop(ble_node_manager_t *manager);
 
 /* Data transmission */
-int ble_send_data(ble_node_manager_t *manager, uint32_t dest_id, const uint8_t *data, size_t len);
-int ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, size_t len);
+gboolean ble_send_data(ble_node_manager_t *manager, uint32_t dest_id, const uint8_t *data, size_t len);
+gboolean ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, size_t len);
 
-/* Callback registration */
-void ble_set_data_callback(ble_node_manager_t *manager, on_data_received_cb callback);
-void ble_set_connected_callback(ble_node_manager_t *manager, on_node_connected_cb callback);
-void ble_set_disconnected_callback(ble_node_manager_t *manager, on_node_disconnected_cb callback);
-void ble_set_discovered_callback(ble_node_manager_t *manager, on_node_discovered_cb callback);
-
-/* Utility functions */
-uint32_t ble_extract_device_id(const char *device_name);
-uint32_t ble_mac_to_device_id(const char *mac);
-char *ble_generate_device_name(uint32_t device_id);
-discovered_device_t *ble_find_discovered_device(ble_node_manager_t *manager, uint32_t device_id);
-discovered_device_t *ble_find_device_by_ptr(ble_node_manager_t *manager, Device *device);
-incoming_client_t *ble_find_or_add_incoming_client(ble_node_manager_t *manager, const char *address);
-int ble_get_adapter_address(char *address, size_t len);
-
-/* Connection info for display */
+/* Connection info */
+guint ble_get_connected_count(ble_node_manager_t *manager);
+void ble_get_connection_table(ble_node_manager_t *manager, uint32_t *devices, guint *count, guint max_count);
 void ble_print_connection_table(ble_node_manager_t *manager);
-
-/* Main loop integration */
-GMainLoop *ble_get_main_loop(const ble_node_manager_t *manager);
-void ble_run_main_loop(const ble_node_manager_t *manager);
-void ble_quit_main_loop(const ble_node_manager_t *manager);
 
 #endif //LOCALNET_BLUETOOTH_H
 

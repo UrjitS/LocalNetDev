@@ -5,15 +5,17 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
-#include "bluetooth.h"
-#include "protocol.h"
-#include "logger.h"
-#include "utils.h"
-#include "routing.h"
+#include "bluetooth/bluetooth.h"
+#include "protocol/protocol.h"
+#include "utils/utils.h"
+#include "routing/routing.h"
+
+#define TAG "LOCALNET"
 
 /* Global BLE manager for signal handler */
 static ble_node_manager_t *g_ble_manager = NULL;
 static volatile gboolean g_running = TRUE;
+static uint32_t g_device_id = 0;
 
 /* ============================================================================
  * MENU COMMAND SYSTEM
@@ -31,22 +33,14 @@ typedef struct {
 
 /* Forward declarations for command handlers */
 static void cmd_show_connections(void);
-static void cmd_show_discovered(void);
 static void cmd_show_node_info(void);
-static void cmd_show_routing_table(void);
-static void cmd_toggle_discovery(void);
-static void cmd_toggle_advertising(void);
 static void cmd_show_help(void);
 static void cmd_quit(void);
 
-/* Define menu commands - easily extendable by adding new entries */
+/* Define menu commands */
 static const menu_command_t g_menu_commands[] = {
     { "1", "Show connection table",     cmd_show_connections },
-    { "2", "Show discovered devices",   cmd_show_discovered },
-    { "3", "Show node info",            cmd_show_node_info },
-    { "4", "Show routing table",        cmd_show_routing_table },
-    { "d", "Toggle discovery",          cmd_toggle_discovery },
-    { "a", "Toggle advertising",        cmd_toggle_advertising },
+    { "2", "Show node info",            cmd_show_node_info },
     { "h", "Show help",                 cmd_show_help },
     { "q", "Quit",                      cmd_quit },
     { NULL, NULL, NULL }  /* Sentinel */
@@ -61,26 +55,6 @@ static void cmd_show_connections(void) {
     }
 }
 
-static void cmd_show_discovered(void) {
-    if (!g_ble_manager) {
-        printf("Error: BLE manager not initialized\n");
-        return;
-    }
-
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("║                    DISCOVERED DEVICES                            ║\n");
-    printf("╠────────────────┬────────────┬────────────┬────────────────────────╣\n");
-    printf("║ Device ID      │ Connected  │ RSSI       │ Last Seen              ║\n");
-    printf("╠────────────────┼────────────┼────────────┼────────────────────────╣\n");
-
-    /* Access discovered devices directly - we need to expose this or use accessor */
-    /* For now, just indicate how many we know about */
-    printf("║ Total discovered devices: (use verbose mode to see scan results) ║\n");
-    printf("╚══════════════════════════════════════════════════════════════════╝\n");
-    printf("\n");
-}
-
 static void cmd_show_node_info(void) {
     if (!g_ble_manager) {
         printf("Error: BLE manager not initialized\n");
@@ -91,57 +65,10 @@ static void cmd_show_node_info(void) {
     printf("╔══════════════════════════════════════════════════════════════════╗\n");
     printf("║                      NODE INFORMATION                            ║\n");
     printf("╠══════════════════════════════════════════════════════════════════╣\n");
-
-    char mac_address[18] = {0};
-    if (ble_get_adapter_address(mac_address, sizeof(mac_address)) == 0) {
-        printf("║ Adapter MAC:    %-50s ║\n", mac_address);
-    }
-
-    printf("║ Connected nodes: %-49d ║\n", ble_get_connected_count(g_ble_manager));
-    printf("║ Advertising:     %-49s ║\n", ble_is_advertising(g_ble_manager) ? "YES" : "NO");
-    printf("║ Discovering:     %-49s ║\n", ble_is_discovering(g_ble_manager) ? "YES" : "NO");
+    printf("║ Device ID:       0x%08X                                       ║\n", g_device_id);
+    printf("║ Connected nodes: %-49u ║\n", ble_get_connected_count(g_ble_manager));
     printf("╚══════════════════════════════════════════════════════════════════╝\n");
     printf("\n");
-}
-
-static void cmd_show_routing_table(void) {
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("║                     ROUTING TABLE                                ║\n");
-    printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ (Routing table display - to be implemented)                      ║\n");
-    printf("╚══════════════════════════════════════════════════════════════════╝\n");
-    printf("\n");
-}
-
-static void cmd_toggle_discovery(void) {
-    if (!g_ble_manager) {
-        printf("Error: BLE manager not initialized\n");
-        return;
-    }
-
-    if (ble_is_discovering(g_ble_manager)) {
-        ble_stop_discovery(g_ble_manager);
-        printf("Discovery STOPPED\n");
-    } else {
-        ble_start_discovery(g_ble_manager);
-        printf("Discovery STARTED\n");
-    }
-}
-
-static void cmd_toggle_advertising(void) {
-    if (!g_ble_manager) {
-        printf("Error: BLE manager not initialized\n");
-        return;
-    }
-
-    if (ble_is_advertising(g_ble_manager)) {
-        ble_stop_advertising(g_ble_manager);
-        printf("Advertising STOPPED\n");
-    } else {
-        ble_start_advertising(g_ble_manager);
-        printf("Advertising STARTED\n");
-    }
 }
 
 static void cmd_show_help(void) {
@@ -162,7 +89,7 @@ static void cmd_quit(void) {
     printf("Quitting...\n");
     g_running = FALSE;
     if (g_ble_manager) {
-        ble_quit_main_loop(g_ble_manager);
+        ble_quit_loop(g_ble_manager);
     }
 }
 
@@ -227,13 +154,13 @@ static void signal_handler(const int sig_no) {
     if (sig_no == SIGINT || sig_no == SIGTERM) {
         log_info(TAG, "Received signal %d, shutting down...", sig_no);
         if (g_ble_manager) {
-            ble_quit_main_loop(g_ble_manager);
+            ble_quit_loop(g_ble_manager);
         }
     }
 }
 
 /* Callback: Node discovered */
-static void on_node_discovered(const uint32_t node_id, const int8_t rssi) {
+static void on_node_discovered(const uint32_t node_id, const int16_t rssi) {
     log_info(TAG, "Discovered node: 0x%08X (RSSI: %d dBm)", node_id, rssi);
 }
 
@@ -261,30 +188,22 @@ static void on_node_disconnected(const uint32_t node_id) {
 static void on_data_received(const uint32_t sender_id, const uint8_t *data, const size_t len) {
     log_debug(TAG, "Received %zu bytes from node 0x%08X", len, sender_id);
 
-    /* Parse the header to determine message type */
-    if (len >= sizeof(struct header)) {
-        struct header hdr;
-        if (parse_header(data, len, &hdr) == 0) {
-            switch (hdr.message_type) {
-                case MSG_DISCOVERY:
-                    log_debug(TAG, "Received discovery message");
-                    break;
-                case MSG_HEARTBEAT:
-                    log_debug(TAG, "Received heartbeat from 0x%08X", sender_id);
-                    break;
-                case MSG_DATA:
-                    log_debug(TAG, "Received data message");
-                    break;
-                case MSG_ROUTE_REQUEST:
-                    log_debug(TAG, "Received route request");
-                    break;
-                case MSG_ROUTE_REPLY:
-                    log_debug(TAG, "Received route reply");
-                    break;
-                default:
-                    log_debug(TAG, "Received unknown message type: %d", hdr.message_type);
-                    break;
-            }
+    /* Parse the message header */
+    struct header hdr;
+    if (parse_header(data, len, &hdr) == 0) {
+        switch (hdr.message_type) {
+            case MSG_DISCOVERY:
+                log_debug(TAG, "Received discovery message");
+                break;
+            case MSG_HEARTBEAT:
+                log_debug(TAG, "Received heartbeat from 0x%08X", sender_id);
+                break;
+            case MSG_DATA:
+                log_debug(TAG, "Received data message");
+                break;
+            default:
+                log_debug(TAG, "Received unknown message type: %d", hdr.message_type);
+                break;
         }
     }
 }
@@ -296,6 +215,31 @@ const char *node_type_to_string(enum NODE_TYPE type) {
         case GATEWAY_NODE: return "GATEWAY";
         default: return "UNKNOWN";
     }
+}
+
+/* Get adapter MAC address using BlueZ/binc */
+static int get_adapter_address(char *address, size_t len) {
+    GDBusConnection *dbus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
+    if (!dbus) return -1;
+
+    Adapter *adapter = binc_adapter_get_default(dbus);
+    if (!adapter) {
+        g_object_unref(dbus);
+        return -1;
+    }
+
+    const char *addr = binc_adapter_get_address(adapter);
+    if (addr) {
+        strncpy(address, addr, len - 1);
+        address[len - 1] = '\0';
+    }
+
+    binc_adapter_free(adapter);
+    /* Note: Do NOT call g_dbus_connection_close_sync() - the system bus connection
+     * is shared and closing it would break subsequent DBus operations */
+    g_object_unref(dbus);
+
+    return addr ? 0 : -1;
 }
 
 /* Convert MAC address to 32-bit device ID (uses last 4 bytes) */
@@ -354,21 +298,21 @@ int main(const int argc, char *argv[]) {
 
     /* Get adapter MAC address */
     char mac_address[18] = {0};
-    if (ble_get_adapter_address(mac_address, sizeof(mac_address)) != 0) {
+    if (get_adapter_address(mac_address, sizeof(mac_address)) != 0) {
         log_error(TAG, "Failed to get Bluetooth adapter address");
         return EXIT_FAILURE;
     }
 
     /* Convert MAC to device ID */
-    uint32_t device_id = mac_to_device_id(mac_address);
-    if (device_id == 0) {
+    g_device_id = mac_to_device_id(mac_address);
+    if (g_device_id == 0) {
         log_error(TAG, "Failed to parse MAC address: %s", mac_address);
         return EXIT_FAILURE;
     }
 
     log_info(TAG, "Starting LocalNet node:");
     log_info(TAG, "  Adapter: %s", mac_address);
-    log_info(TAG, "  Device ID: 0x%08X", device_id);
+    log_info(TAG, "  Device ID: 0x%08X", g_device_id);
     log_info(TAG, "  Node Type: %s", node_type_to_string(node_type));
     log_info(TAG, "  Max Connections: %d", get_max_connections(node_type));
 
@@ -380,28 +324,26 @@ int main(const int argc, char *argv[]) {
         log_error(TAG, "Cannot set SIGTERM handler");
     }
 
-    /* Initialize BLE node manager */
-    g_ble_manager = ble_init(device_id, node_type);
+    /* Initialize BLE node manager with callbacks */
+    g_ble_manager = ble_init(NULL, g_device_id,
+                              on_node_discovered,
+                              on_node_connected,
+                              on_node_disconnected,
+                              on_data_received);
     if (!g_ble_manager) {
         log_error(TAG, "Failed to initialize BLE node manager");
         return EXIT_FAILURE;
     }
 
-    /* Set up callbacks */
-    ble_set_discovered_callback(g_ble_manager, on_node_discovered);
-    ble_set_connected_callback(g_ble_manager, on_node_connected);
-    ble_set_disconnected_callback(g_ble_manager, on_node_disconnected);
-    ble_set_data_callback(g_ble_manager, on_data_received);
-
     /* Start the BLE node */
-    if (ble_start(g_ble_manager) != 0) {
+    if (!ble_start(g_ble_manager)) {
         log_error(TAG, "Failed to start BLE node manager");
         ble_cleanup(g_ble_manager);
         return EXIT_FAILURE;
     }
 
     log_info(TAG, "Node is running. Press Ctrl+C to exit.");
-    log_info(TAG, "Advertising as: LocalNet-%08X", device_id);
+    log_info(TAG, "Advertising as: LocalNet-%08X", g_device_id);
     log_info(TAG, "Scanning for other LocalNet nodes...");
     log_info(TAG, "Press 'h' for help menu.");
 
@@ -412,7 +354,7 @@ int main(const int argc, char *argv[]) {
     guint stdin_watch_id = g_io_add_watch(stdin_channel, G_IO_IN, stdin_callback, NULL);
 
     /* Run the main loop (blocks until quit) */
-    ble_run_main_loop(g_ble_manager);
+    ble_run_loop(g_ble_manager);
 
     /* Cleanup stdin channel */
     g_source_remove(stdin_watch_id);
