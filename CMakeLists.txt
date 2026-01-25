@@ -63,6 +63,7 @@ target_include_directories(protocol_tests PRIVATE ${CMAKE_SOURCE_DIR}/protocol)
 # Test binary for routing unit tests
 add_executable(routing_tests
         routing/routing.c
+        utils/utils.c
         tests/test_routing.c
 )
 
