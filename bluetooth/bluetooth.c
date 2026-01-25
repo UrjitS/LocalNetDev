@@ -993,15 +993,38 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     /* Auto-connect if we have available connections and not already connected */
     if (discovered && !discovered->is_connected && !discovered->connection_pending) {
         if (has_available_connections(g_manager->mesh_node)) {
-            /* Add to connection table as discovering */
-            struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
-            if (!conn) {
-                add_connection(g_manager->mesh_node->connection_table, device_id, (int8_t)rssi);
-                update_connection_state(g_manager->mesh_node->connection_table, device_id, DISCOVERING);
-            }
+            /*
+             * Connection arbitration: To prevent both sides from connecting simultaneously
+             * (which causes BlueZ errors and disconnections), only the node with the LOWER
+             * device ID should initiate the outgoing connection. The higher ID node will
+             * wait to receive the incoming connection instead.
+             */
+            if (g_manager->mesh_node->device_id < device_id) {
+                /* We have the lower ID, so WE initiate the connection */
+                log_debug(BT_TAG, "Arbitration: we (0x%08X) initiate connection to 0x%08X",
+                          g_manager->mesh_node->device_id, device_id);
 
-            /* Attempt to connect */
-            ble_connect_to_node(g_manager, device_id);
+                /* Add to connection table as discovering */
+                struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
+                if (!conn) {
+                    add_connection(g_manager->mesh_node->connection_table, device_id, (int8_t)rssi);
+                    update_connection_state(g_manager->mesh_node->connection_table, device_id, DISCOVERING);
+                }
+
+                /* Attempt to connect */
+                ble_connect_to_node(g_manager, device_id);
+            } else {
+                /* We have the higher ID, wait for the other node to connect to us */
+                log_debug(BT_TAG, "Arbitration: waiting for 0x%08X to connect to us (0x%08X)",
+                          device_id, g_manager->mesh_node->device_id);
+
+                /* Still add to discovered list but don't actively connect */
+                struct connection_entry *conn = find_connection(g_manager->mesh_node->connection_table, device_id);
+                if (!conn) {
+                    add_connection(g_manager->mesh_node->connection_table, device_id, (int8_t)rssi);
+                    update_connection_state(g_manager->mesh_node->connection_table, device_id, DISCOVERING);
+                }
+            }
         }
     }
 }
@@ -1347,8 +1370,14 @@ static gboolean periodic_reconnect_callback(gpointer user_data) {
         /* Only reconnect if we have a disconnected entry (meaning we were previously connected) */
         if (conn && conn->state == DISCONNECTED) {
             if (has_available_connections(manager->mesh_node)) {
-                log_debug(BT_TAG, "Attempting reconnection to 0x%08X", disc->device_id);
-                ble_connect_to_node(manager, disc->device_id);
+                /*
+                 * Connection arbitration: Only reconnect if we have the lower device ID.
+                 * This prevents both sides from trying to reconnect simultaneously.
+                 */
+                if (manager->mesh_node->device_id < disc->device_id) {
+                    log_debug(BT_TAG, "Attempting reconnection to 0x%08X", disc->device_id);
+                    ble_connect_to_node(manager, disc->device_id);
+                }
             }
         }
     }
@@ -1558,18 +1587,26 @@ static gboolean delayed_discovery_start(gpointer user_data) {
                     /* Try to connect if not already connected */
                     if (discovered && !discovered->is_connected && !discovered->connection_pending) {
                         if (has_available_connections(manager->mesh_node)) {
-                            log_info(BT_TAG, "Attempting to connect to cached device 0x%08X", device_id);
+                            /*
+                             * Connection arbitration: Only connect if we have the lower device ID.
+                             * This prevents both sides from connecting simultaneously.
+                             */
+                            if (manager->mesh_node->device_id < device_id) {
+                                log_info(BT_TAG, "Attempting to connect to cached device 0x%08X", device_id);
 
-                            /* Check if connection entry already exists */
-                            struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, device_id);
-                            if (!conn) {
-                                add_connection(manager->mesh_node->connection_table, device_id, -50);
-                            }
-                            update_connection_state(manager->mesh_node->connection_table, device_id, DISCOVERING);
+                                /* Check if connection entry already exists */
+                                struct connection_entry *conn = find_connection(manager->mesh_node->connection_table, device_id);
+                                if (!conn) {
+                                    add_connection(manager->mesh_node->connection_table, device_id, -50);
+                                }
+                                update_connection_state(manager->mesh_node->connection_table, device_id, DISCOVERING);
 
-                            int connect_result = ble_connect_to_node(manager, device_id);
-                            if (connect_result != 0) {
-                                log_error(BT_TAG, "Failed to initiate connection to cached device 0x%08X", device_id);
+                                int connect_result = ble_connect_to_node(manager, device_id);
+                                if (connect_result != 0) {
+                                    log_error(BT_TAG, "Failed to initiate connection to cached device 0x%08X", device_id);
+                                }
+                            } else {
+                                log_debug(BT_TAG, "Arbitration: waiting for cached device 0x%08X to connect to us", device_id);
                             }
                         } else {
                             log_debug(BT_TAG, "No available connections for cached device 0x%08X", device_id);
