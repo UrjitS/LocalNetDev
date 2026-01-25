@@ -37,6 +37,9 @@ typedef enum {
     BLE_STATE_DISCONNECTING
 } ble_state_t;
 
+/* Delay before allowing writes after connection (in seconds) */
+#define CONNECTION_WRITE_DELAY_SECONDS 2
+
 /* Discovered device entry */
 typedef struct {
     Device *device;
@@ -45,6 +48,7 @@ typedef struct {
     int8_t rssi;
     uint32_t last_seen;
     uint32_t last_connect_attempt;  /* Timestamp of last connection attempt */
+    uint32_t ready_time;           /* Timestamp when writes are allowed (after notification setup) */
     gboolean is_connected;
     gboolean connection_pending;
 } discovered_device_t;

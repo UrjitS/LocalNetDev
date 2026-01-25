@@ -348,6 +348,7 @@ static discovered_device_t *add_discovered_device(ble_node_manager_t *manager, D
     entry->rssi = rssi;
     entry->last_seen = get_current_timestamp();
     entry->last_connect_attempt = 0;
+    entry->ready_time = 0;
     entry->is_connected = FALSE;
     entry->connection_pending = FALSE;
 
@@ -842,6 +843,14 @@ int ble_send_data(ble_node_manager_t *manager, const uint32_t dest_id, const uin
         return -1;
     }
 
+    /* Check if connection is ready for writes (notification subscription completed) */
+    uint32_t current_time = get_current_timestamp();
+    if (discovered->ready_time > 0 && current_time < discovered->ready_time) {
+        log_debug(BT_TAG, "Device 0x%08X not ready for writes yet (%u seconds remaining)",
+                  dest_id, discovered->ready_time - current_time);
+        return -1;
+    }
+
     Characteristic *data_char = binc_device_get_characteristic(discovered->device,
                                                                 LOCAL_NET_SERVICE_UUID,
                                                                 LOCAL_NET_DATA_CHAR_UUID);
@@ -1147,6 +1156,9 @@ static void on_services_resolved(Device *device) {
     discovered->is_connected = TRUE;
     discovered->connection_pending = FALSE;
 
+    /* Set ready_time to delay writes until notification subscription completes */
+    discovered->ready_time = get_current_timestamp() + CONNECTION_WRITE_DELAY_SECONDS;
+
     /* Update connection table */
     update_connection_state(g_manager->mesh_node->connection_table, discovered->device_id, STABLE);
     update_last_seen(g_manager->mesh_node->connection_table, discovered->device_id, get_current_timestamp());
@@ -1167,17 +1179,12 @@ static void on_services_resolved(Device *device) {
         g_manager->connected_callback(discovered->device_id);
     }
 
-    /* Send discovery message to newly connected node */
-    const struct discovery_message disc_msg = {
-        .available_connections = g_manager->mesh_node->available_connections,
-        .timestamp = get_current_timestamp()
-    };
-
-    uint8_t buffer[32];
-    const size_t len = serialize_discovery(&disc_msg, buffer, sizeof(buffer));
-    if (len > 0) {
-        ble_send_data(g_manager, discovered->device_id, buffer, len);
-    }
+    /*
+     * NOTE: We intentionally do NOT send data immediately here.
+     * The notification subscription (binc_characteristic_start_notify) is asynchronous,
+     * and trying to write while it's in progress causes "InProgress" errors that can
+     * destabilize the connection. The ready_time field delays writes for a few seconds.
+     */
 }
 
 static void on_read_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error) {
