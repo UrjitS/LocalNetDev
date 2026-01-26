@@ -122,10 +122,10 @@ static guint count_connected(void) {
 static void start_advertising(void) {
     if (!g_manager || !g_manager->adapter) return;
 
+    // If already advertising, don't restart - this can interfere with active connections
     if (g_manager->advertisement) {
-        binc_adapter_stop_advertising(g_manager->adapter, g_manager->advertisement);
-        binc_advertisement_free(g_manager->advertisement);
-        g_manager->advertisement = NULL;
+        log_debug(BT_TAG, "Already advertising, not restarting");
+        return;
     }
 
     g_manager->advertisement = binc_advertisement_create();
@@ -141,8 +141,12 @@ static void start_advertising(void) {
 }
 
 static void stop_advertising(void) {
-    if (!g_manager || !g_manager->adapter || !g_manager->advertisement) return;
+    if (!g_manager || !g_manager->adapter) return;
+    if (!g_manager->advertisement) return;
+
     binc_adapter_stop_advertising(g_manager->adapter, g_manager->advertisement);
+    binc_advertisement_free(g_manager->advertisement);
+    g_manager->advertisement = NULL;
 }
 
 // Discovery control 
@@ -483,18 +487,9 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
                 }
             }
 
-            // Always remove LocalNet devices from BlueZ cache to allow fresh discovery
-            // This prevents stale bonding issues
-            if (device) {  // Only if not already removed above
-                const char * dev_name = binc_device_get_name(device);
-                if (is_localnet_device(dev_name)) {
-                    log_debug(BT_TAG, "Removing device from cache: %s (bonded: %d)",
-                        dev_name, binc_device_get_bonding_state(device) == BINC_BONDED);
-                    binc_adapter_remove_device(g_manager->adapter, device);
-                } else if (binc_device_get_bonding_state(device) != BINC_BONDED) {
-                    binc_adapter_remove_device(g_manager->adapter, device);
-                }
-            }
+            // Only remove device from cache if it's bonded and we failed to connect
+            // Don't remove on normal disconnects - this causes rediscovery delays
+            // The device will be rediscovered naturally when it starts advertising again
 
             // Restart advertising and discovery after disconnection
             log_debug(BT_TAG, "Restarting advertising and discovery after disconnection");
@@ -707,18 +702,17 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
     }
 
     // Debounce check - if we just disconnected from this device, ignore spurious reconnection
+    // Use a short debounce (2 seconds) to filter ghost callbacks but allow real reconnections
     tracked_device_t * existing_tracked = find_device_by_id(device_id);
     if (existing_tracked) {
         const uint64_t now = get_current_timestamp();
 
-        // Strong debounce - ignore reconnections within 5 seconds of disconnect
+        // Short debounce - ignore reconnections within 2 seconds of disconnect
         if (existing_tracked->last_disconnect_time > 0 &&
-            (now - existing_tracked->last_disconnect_time < 5)) {
-            log_info(BT_TAG, "Ignoring reconnection from 0x%08X (disconnected %lu seconds ago)",
+            (now - existing_tracked->last_disconnect_time < 2)) {
+            log_debug(BT_TAG, "Ignoring spurious reconnection from 0x%08X (disconnected %lu seconds ago)",
                 device_id, (unsigned long)(now - existing_tracked->last_disconnect_time));
-            // Immediately disconnect this ghost connection
-            binc_device_disconnect(device);
-            return;
+            return;  // Just ignore, don't forcefully disconnect - it might be a ghost callback
         }
 
         // If we're currently trying to connect to this device, cancel our attempt
