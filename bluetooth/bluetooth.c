@@ -187,8 +187,9 @@ static void connect_to_device(tracked_device_t * tracked) {
     tracked->is_connecting = TRUE;
     tracked->last_connect_attempt = get_current_timestamp();
 
-    // Stop advertising before connecting (keep discovery running)
-    stop_advertising();
+    // DON'T stop advertising - we need to remain discoverable for other nodes
+    // Just stop discovery temporarily to avoid interference
+    stop_discovery();
 
     // Set up callbacks before connecting 
     binc_device_set_connection_state_change_cb(tracked->device, &on_connection_state_changed);
@@ -509,8 +510,12 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
 static gboolean restart_advertising_discovery_idle(gpointer user_data) {
     if (!g_manager || !g_manager->running) return FALSE;
 
-    log_debug(BT_TAG, "Restarting advertising and discovery");
+    log_info(BT_TAG, "Restarting advertising and discovery after connection");
+
+    // Always ensure we're advertising so other nodes can find us
     start_advertising();
+
+    // Restart discovery to find more nodes
     start_discovery();
 
     return FALSE;  // Don't repeat
@@ -736,6 +741,11 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
     if (g_manager->connected_callback) {
         g_manager->connected_callback(device_id);
     }
+
+    // IMPORTANT: When we're the peripheral (they connected to us), we need to ensure
+    // we're still advertising and discovering so other nodes can find us
+    // Schedule restart after a delay to let the connection stabilize
+    g_timeout_add(1000, restart_advertising_discovery_idle, NULL);
 }
 
 // Authorization callback
