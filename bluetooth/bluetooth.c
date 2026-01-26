@@ -626,6 +626,19 @@ gboolean ble_start(ble_node_manager_t * manager) {
 
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
+    // Clean up any cached LocalNet devices from previous sessions
+    log_debug(BT_TAG, "Cleaning up stale LocalNet devices from previous session");
+    GList * existing_devices = binc_adapter_get_devices(manager->adapter);
+    for (const GList * it = existing_devices; it != NULL; it = it->next) {
+        Device * device = it->data;
+        const char * name = binc_device_get_name(device);
+        if (is_localnet_device(name)) {
+            log_debug(BT_TAG, "Removing stale cached device: %s", name);
+            binc_adapter_remove_device(manager->adapter, device);
+        }
+    }
+    g_list_free(existing_devices);
+
     // Create agent for pairing
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
@@ -670,6 +683,26 @@ void ble_stop(ble_node_manager_t * manager) {
         if (tracked->is_connected && tracked->device && tracked->we_initiated) {
             binc_device_disconnect(tracked->device);
         }
+    }
+
+    // Remove all cached LocalNet devices from BlueZ to prevent ghost connections on restart
+    if (manager->adapter) {
+        log_debug(BT_TAG, "Removing cached LocalNet devices from BlueZ...");
+        GList * devices = binc_adapter_get_devices(manager->adapter);
+        for (const GList * it = devices; it != NULL; it = it->next) {
+            Device * device = it->data;
+            const char * name = binc_device_get_name(device);
+            if (is_localnet_device(name)) {
+                log_debug(BT_TAG, "Removing cached device: %s", name);
+                binc_adapter_remove_device(manager->adapter, device);
+            }
+        }
+        g_list_free(devices);
+    }
+
+    // Unregister GATT application before freeing
+    if (manager->app && manager->adapter) {
+        binc_adapter_unregister_application(manager->adapter, manager->app);
     }
 
     // Free advertisement
