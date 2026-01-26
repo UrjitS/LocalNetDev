@@ -143,11 +143,15 @@ static void stop_discovery(void) {
 // Connect to a device 
 static void connect_to_device(tracked_device_t * tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
-    if (tracked->is_connected) return;
+    if (tracked->is_connected || tracked->is_connecting) return;
 
     log_info(BT_TAG, "Connecting to device 0x%08X", tracked->device_id);
 
-    // Stop advertising and discovery before connecting to avoid conflicts 
+    // Mark as connecting to prevent duplicate attempts
+    tracked->is_connecting = TRUE;
+    tracked->last_connect_attempt = get_current_timestamp();
+
+    // Stop advertising and discovery before connecting to avoid conflicts
     log_debug(BT_TAG, "Stopping advertising before connection attempt");
     stop_advertising();
     log_debug(BT_TAG, "Stopping discovery before connection attempt");
@@ -307,13 +311,23 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     if (device_id == 0 || device_id == g_manager->device_id) return;
 
     const int16_t rssi = binc_device_get_rssi(device);
+    const uint64_t now = get_current_timestamp();
 
-    // Check if already connected, update rssi if we are
+    // Check if already connected or connecting
     tracked_device_t * tracked = find_device_by_id(device_id);
-    if (tracked && tracked->is_connected) {
+    if (tracked) {
         tracked->rssi = rssi;
-        tracked->last_seen = get_current_timestamp();
-        return;
+        tracked->last_seen = now;
+
+        // If already connected or currently connecting, skip
+        if (tracked->is_connected || tracked->is_connecting) {
+            return;
+        }
+
+        // Rate limit reconnection attempts
+        if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) {
+            return;
+        }
     }
 
     log_info(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
@@ -329,10 +343,16 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     }
 
     if (g_manager->device_id < device_id) {
-        log_debug(BT_TAG, "Connecting to 0x%08X", device_id);
+        // We should initiate the connection
+        // But first, check if this device isn't already connected to us (race condition protection)
+        if (tracked->is_connected) {
+            log_debug(BT_TAG, "Device 0x%08X already connected to us, skipping connection attempt", device_id);
+            return;
+        }
+        log_debug(BT_TAG, "Initiating connection to 0x%08X (we have lower ID)", device_id);
         connect_to_device(tracked);
     } else {
-        log_debug(BT_TAG, "Waiting for 0x%08X to connect to us", device_id);
+        log_debug(BT_TAG, "Waiting for 0x%08X to connect to us (they have lower ID)", device_id);
     }
 }
 
@@ -358,11 +378,16 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
 
     switch (state) {
         case BINC_CONNECTED:
+            // Clear connecting flag - will be marked as connected in on_services_resolved
+            if (tracked) {
+                tracked->is_connecting = FALSE;
+            }
             break;
         case BINC_DISCONNECTED:
             if (tracked) {
                 const gboolean was_connected = tracked->is_connected;
                 tracked->is_connected = FALSE;
+                tracked->is_connecting = FALSE;
                 tracked->device = NULL;
 
                 if (was_connected && g_manager->disconnected_callback) {
@@ -386,29 +411,50 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
     }
 }
 
+// Helper to restart advertising/discovery after a short delay
+static gboolean restart_advertising_discovery_idle(gpointer user_data) {
+    if (!g_manager || !g_manager->running) return FALSE;
+
+    log_debug(BT_TAG, "Restarting advertising and discovery");
+    start_advertising();
+    start_discovery();
+
+    return FALSE;  // Don't repeat
+}
+
 static void on_services_resolved(Device * device) {
     if (!g_manager || !device) return;
 
     tracked_device_t * tracked = find_device_by_ptr(device);
     if (!tracked) return;
 
+    // Skip if already connected (prevent duplicate processing)
+    if (tracked->is_connected) {
+        log_debug(BT_TAG, "Services resolved but device 0x%08X already marked connected, skipping", tracked->device_id);
+        return;
+    }
+
     log_debug(BT_TAG, "Services resolved for device 0x%08X", tracked->device_id);
 
     tracked->is_connected = TRUE;
+    tracked->is_connecting = FALSE;
     tracked->last_heartbeat = get_current_timestamp();
 
     Characteristic * characteristic = binc_device_get_characteristic(device, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID);
     if (characteristic) {
         binc_characteristic_start_notify(characteristic);
+        log_debug(BT_TAG, "Started notifications for device 0x%08X", tracked->device_id);
+    } else {
+        log_error(BT_TAG, "Failed to find data characteristic for device 0x%08X", tracked->device_id);
     }
 
-    log_debug(BT_TAG, "Restarting advertising and discovery after successful connection");
-    start_advertising();
-    start_discovery();
-
+    // Call connected callback before restarting advertising
     if (g_manager->connected_callback) {
         g_manager->connected_callback(tracked->device_id);
     }
+
+    // Schedule restart of advertising and discovery after a longer delay to let connection stabilize
+    g_timeout_add(1000, restart_advertising_discovery_idle, NULL);
 }
 
 // NOLINTNEXTLINE
@@ -469,7 +515,13 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
     if (is_localnet_device(name)) {
         device_id = extract_device_id_from_name(name);
     } else {
-        device_id = mac_to_device_id(mac);
+        // Try to find by MAC first in case we already discovered this device
+        tracked_device_t * existing = find_device_by_mac(mac);
+        if (existing && existing->device_id != 0) {
+            device_id = existing->device_id;
+        } else {
+            device_id = mac_to_device_id(mac);
+        }
     }
 
     if (device_id == 0) {
@@ -477,15 +529,40 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
         return;
     }
 
+    // Check for bidirectional connection scenario
+    // If we should have initiated the connection (our ID < their ID), but they connected to us,
+    // this might be a race condition. Accept the connection but note the unusual state.
+    if (g_manager->device_id < device_id) {
+        log_debug(BT_TAG, "Unexpected: device 0x%08X connected to us, but we should have initiated (our ID is lower)", device_id);
+    }
+
     log_info(BT_TAG, "Remote connected: %s (%s)", name ? name : "unknown", mac);
 
-    // Track device
-    tracked_device_t * tracked = add_device(device_id, mac, device);
-    if (!tracked) return;
+    // Check if we already have this device tracked (e.g., from scan or we're connecting to them)
+    tracked_device_t * tracked = find_device_by_id(device_id);
+    if (tracked) {
+        // If we're currently trying to connect to this device, don't override
+        if (tracked->is_connecting) {
+            log_debug(BT_TAG, "Device 0x%08X is connecting to us while we're connecting to them - accepting their connection", device_id);
+            // Cancel our connection attempt conceptually - their connection wins
+        }
 
-    tracked->is_connected = TRUE;
-    tracked->we_initiated = FALSE;
-    tracked->last_heartbeat = get_current_timestamp();
+        // Update existing tracking
+        tracked->device = device;
+        tracked->is_connected = TRUE;
+        tracked->is_connecting = FALSE;
+        tracked->we_initiated = FALSE;  // They connected to us
+        tracked->last_heartbeat = get_current_timestamp();
+        if (mac) strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
+    } else {
+        // Add new device
+        tracked = add_device(device_id, mac, device);
+        if (!tracked) return;
+
+        tracked->is_connected = TRUE;
+        tracked->we_initiated = FALSE;
+        tracked->last_heartbeat = get_current_timestamp();
+    }
 
     binc_device_set_connection_state_change_cb(device, &on_connection_state_changed);
 
@@ -500,7 +577,18 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 // NOLINTNEXTLINE
 static gboolean on_request_authorization(Device * device) {
     const char * name = binc_device_get_name(device);
-    log_info(BT_TAG, "Authorizing device: %s", name ? name : "unknown");
+    const char * mac = binc_device_get_address(device);
+    log_info(BT_TAG, "Authorizing device: %s (%s)", name ? name : "unknown", mac ? mac : "unknown");
+
+    // Check if this is a LocalNet device we know about
+    if (is_localnet_device(name)) {
+        const uint32_t device_id = extract_device_id_from_name(name);
+        tracked_device_t * tracked = find_device_by_id(device_id);
+        if (tracked) {
+            log_debug(BT_TAG, "Known LocalNet device 0x%08X requesting authorization", device_id);
+        }
+    }
+
     return TRUE;
 }
 
@@ -510,6 +598,32 @@ static const char* on_local_char_read(const Application * app, const char * addr
 
     if (g_str_equal(service_uuid, LOCAL_NET_SERVICE_UUID)) {
         if (g_str_equal(char_uuid, LOCAL_NET_DATA_CHAR_UUID)) {
+            // Track this connection if we don't already know about it
+            tracked_device_t * tracked = find_device_by_mac(address);
+            if (!tracked) {
+                uint32_t device_id = mac_to_device_id(address);
+                tracked = add_device(device_id, address, NULL);
+                if (tracked) {
+                    tracked->is_connected = TRUE;
+                    tracked->we_initiated = FALSE;
+                    tracked->last_heartbeat = get_current_timestamp();
+                    log_info(BT_TAG, "Detected incoming connection from %s (ID: 0x%08X) via characteristic read", address, device_id);
+
+                    if (g_manager->connected_callback) {
+                        g_manager->connected_callback(device_id);
+                    }
+                }
+            } else if (!tracked->is_connected) {
+                tracked->is_connected = TRUE;
+                tracked->we_initiated = FALSE;
+                tracked->last_heartbeat = get_current_timestamp();
+                log_info(BT_TAG, "Detected incoming connection from 0x%08X via characteristic read", tracked->device_id);
+
+                if (g_manager->connected_callback) {
+                    g_manager->connected_callback(tracked->device_id);
+                }
+            }
+
             GByteArray * empty = g_byte_array_new();
             binc_application_set_char_value(app, service_uuid, char_uuid, empty);
             g_byte_array_free(empty, TRUE);
@@ -536,18 +650,30 @@ static const char * on_local_char_write(const Application * app, const char * ad
     // Find/Create tracked device
     uint32_t device_id = mac_to_device_id(address);
     tracked_device_t * tracked = find_device_by_mac(address);
+    gboolean is_new_connection = FALSE;
 
     if (!tracked) {
         tracked = add_device(device_id, address, NULL);
+        is_new_connection = TRUE;
+    } else if (!tracked->is_connected) {
+        is_new_connection = TRUE;
     }
 
     if (tracked) {
         tracked->last_heartbeat = get_current_timestamp();
-        tracked->is_connected = TRUE;
+        if (!tracked->is_connected) {
+            tracked->is_connected = TRUE;
+            tracked->we_initiated = FALSE;
+        }
         device_id = tracked->device_id;
     }
 
-    log_info(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes", address, device_id, byteArray->len);
+    if (is_new_connection && g_manager->connected_callback) {
+        log_info(BT_TAG, "Detected incoming connection from %s (ID: 0x%08X) via characteristic write", address, device_id);
+        g_manager->connected_callback(device_id);
+    }
+
+    log_debug(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes", address, device_id, byteArray->len);
 
     struct header header;
     struct network network;
@@ -646,8 +772,11 @@ gboolean ble_start(ble_node_manager_t * manager) {
     // Setup GATT application
     manager->app = binc_create_application(manager->adapter);
     binc_application_add_service(manager->app, LOCAL_NET_SERVICE_UUID);
-    binc_application_add_characteristic(manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID, GATT_CHR_PROP_READ | GATT_CHR_PROP_WRITE | GATT_CHR_PROP_NOTIFY);
-    binc_application_add_characteristic(manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_CTRL_CHAR_UUID, GATT_CHR_PROP_READ | GATT_CHR_PROP_WRITE);
+    // Add WRITE_WITHOUT_RESP to avoid authorization delays
+    binc_application_add_characteristic(manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID,
+        GATT_CHR_PROP_READ | GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP | GATT_CHR_PROP_NOTIFY);
+    binc_application_add_characteristic(manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_CTRL_CHAR_UUID,
+        GATT_CHR_PROP_READ | GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP);
     binc_application_set_char_read_cb(manager->app, &on_local_char_read);
     binc_application_set_char_write_cb(manager->app, &on_local_char_write);
     binc_adapter_register_application(manager->adapter, manager->app);

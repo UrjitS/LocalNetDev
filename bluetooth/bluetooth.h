@@ -15,6 +15,7 @@ struct mesh_node;
 #define BT_TAG "LOCALNET-BT"
 #define LOCALNET_PREFIX "LOCALNET-"
 #define HEARTBEAT_TIMEOUT_SECONDS 30
+#define RECONNECT_DELAY_SECONDS 5
 #define RECONNECT_DELAY_MS 5000
 #define PROTOCOL_VERSION 1
 #define MAX_BLE_PAYLOAD_SIZE 512
@@ -32,10 +33,12 @@ typedef struct {
     char mac_address[18];
     Device *device;
     gboolean is_connected;
+    gboolean is_connecting;
     gboolean we_initiated;
     int16_t rssi;
     uint64_t last_heartbeat;
     uint64_t last_seen;
+    uint64_t last_connect_attempt;
 } tracked_device_t;
 
 // BLE Node Manager
