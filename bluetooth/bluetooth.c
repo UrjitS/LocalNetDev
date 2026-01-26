@@ -26,6 +26,9 @@ static const char* on_local_char_read(const Application * app, const char * addr
 static const char* on_local_char_write(const Application * app, const char * address, const char * service_uuid, const char * char_uuid, GByteArray * byteArray, guint16 offset, guint16 mtu);
 static gboolean check_pending_connections_idle(gpointer user_data);
 
+// Flag to prevent processing during cleanup/restart operations
+static gboolean g_in_cleanup = FALSE;
+
 // Utility functions
 static uint32_t extract_device_id_from_name(const char * name) {
     if (!name) return 0;
@@ -38,6 +41,23 @@ static uint32_t extract_device_id_from_name(const char * name) {
 
 static gboolean is_localnet_device(const char * name) {
     return name && g_str_has_prefix(name, LOCALNET_PREFIX);
+}
+
+// Validate that a Device pointer is still in the adapter's device list
+// Returns TRUE if the device is still valid, FALSE if it's been removed
+static gboolean is_device_valid(Device * device) {
+    if (!device || !g_manager || !g_manager->adapter) return FALSE;
+
+    GList * devices = binc_adapter_get_devices(g_manager->adapter);
+    gboolean found = FALSE;
+    for (const GList * it = devices; it != NULL; it = it->next) {
+        if (it->data == device) {
+            found = TRUE;
+            break;
+        }
+    }
+    g_list_free(devices);
+    return found;
 }
 
 
@@ -170,8 +190,12 @@ static void stop_discovery(void) {
 
 // Force restart discovery - stops and starts to trigger fresh scan
 static gboolean restart_discovery_delayed(gpointer user_data) {
-    if (!g_manager || !g_manager->adapter || !g_manager->running) return FALSE;
+    if (!g_manager || !g_manager->adapter || !g_manager->running) {
+        g_in_cleanup = FALSE;
+        return FALSE;
+    }
     log_debug(BT_TAG, "Delayed discovery restart - starting discovery");
+    g_in_cleanup = FALSE;  // Clear flag before starting discovery
     binc_adapter_set_discovery_filter(g_manager->adapter, -100, NULL, NULL);
     binc_adapter_start_discovery(g_manager->adapter);
     return FALSE;  // Don't repeat
@@ -179,7 +203,12 @@ static gboolean restart_discovery_delayed(gpointer user_data) {
 
 static void restart_discovery(void) {
     if (!g_manager || !g_manager->adapter) return;
+    if (g_in_cleanup) {
+        log_debug(BT_TAG, "Already in cleanup, skipping restart_discovery");
+        return;
+    }
     log_debug(BT_TAG, "Force restarting discovery");
+    g_in_cleanup = TRUE;  // Set flag to prevent race conditions during cleanup
     // Stop discovery first
     binc_adapter_stop_discovery(g_manager->adapter);
     g_discovery_running = FALSE;
@@ -199,19 +228,28 @@ static void connect_to_device(tracked_device_t * tracked) {
         return;
     }
 
+    // Validate device is still in adapter's list
+    if (!is_device_valid(tracked->device)) {
+        log_debug(BT_TAG, "Cannot connect to 0x%08X - device no longer valid", tracked->device_id);
+        tracked->device = NULL;
+        return;
+    }
+
     // Check if the device is in a bonded state - this causes connection issues
     BondingState bond_state = binc_device_get_bonding_state(tracked->device);
 
     if (bond_state == BINC_BONDED) {
         log_info(BT_TAG, "Device 0x%08X is bonded, removing to prevent connection issues", tracked->device_id);
 
-        // Remove the device entirely - this should clear bonding
-        binc_adapter_remove_device(g_manager->adapter, tracked->device);
-
-        // Clear our tracking and set a longer reconnect delay
+        // IMPORTANT: NULL out pointer BEFORE calling remove to prevent race conditions
+        Device * device_to_remove = tracked->device;
         tracked->device = NULL;
         tracked->is_connecting = FALSE;
         tracked->is_connected = FALSE;
+
+        // Remove the device entirely - this should clear bonding
+        binc_adapter_remove_device(g_manager->adapter, device_to_remove);
+
         // Set last_connect_attempt further in the past to allow immediate retry after rediscovery
         // Set last_seen to now so we can track when to force discovery restart
         tracked->last_connect_attempt = get_current_timestamp() - RECONNECT_DELAY_SECONDS + 1;
@@ -329,8 +367,15 @@ static gboolean heartbeat_callback(gpointer user_data) {
 
     // Send heartbeats to all connected devices we initiated connection to
     for (guint i = 0; i < g_manager->discovered_count; i++) {
-        const tracked_device_t * tracked = &g_manager->discovered_devices[i];
+        tracked_device_t * tracked = &g_manager->discovered_devices[i];
         if (!tracked->is_connected || !tracked->we_initiated || !tracked->device) continue;
+
+        // Validate device is still valid before using it
+        if (!is_device_valid(tracked->device)) {
+            log_debug(BT_TAG, "Skipping heartbeat to 0x%08X - device no longer valid", tracked->device_id);
+            tracked->device = NULL;  // Clear stale pointer
+            continue;
+        }
 
         GByteArray * data = g_byte_array_sized_new(len);
         g_byte_array_append(data, buffer, len);
@@ -401,6 +446,9 @@ static void on_discovery_state_changed(Adapter * adapter, DiscoveryState state, 
 // NOLINTNEXTLINE
 static void on_scan_result(Adapter * adapter, Device * device) {
     if (!g_manager || !device) return;
+
+    // Skip processing during cleanup to prevent race conditions
+    if (g_in_cleanup) return;
 
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
@@ -488,6 +536,12 @@ static void on_scan_result(Adapter * adapter, Device * device) {
 // NOLINTNEXTLINE
 static void on_connection_state_changed(Device * device, ConnectionState state, const GError * error) {
     if (!g_manager || !device) return;
+
+    // Validate device is still in adapter's list before using it
+    if (!is_device_valid(device)) {
+        log_debug(BT_TAG, "Connection state callback for removed device, ignoring");
+        return;
+    }
 
     tracked_device_t * tracked = find_device_by_ptr(device);
     if (!tracked) {
@@ -593,8 +647,11 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
                 // Just remove the device from BlueZ cache - don't try to disconnect
                 // a device that's stuck in connecting state as it may crash
                 if (tracked->device) {
-                    binc_adapter_remove_device(g_manager->adapter, tracked->device);
+                    // IMPORTANT: NULL out pointer BEFORE calling remove to prevent
+                    // race conditions with callbacks that might access this device
+                    Device * device_to_remove = tracked->device;
                     tracked->device = NULL;
+                    binc_adapter_remove_device(g_manager->adapter, device_to_remove);
                 }
 
                 // Mark last_seen as now so we can track when to force discovery restart
@@ -655,6 +712,12 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
         gboolean they_are_slow = (tracked->last_seen > 0 && (now - tracked->last_seen > 20));
 
         if (we_have_priority || they_are_slow) {
+            // Double-check device is still valid right before connecting
+            if (!is_device_valid(tracked->device)) {
+                log_debug(BT_TAG, "Device 0x%08X no longer valid before connection, clearing", tracked->device_id);
+                tracked->device = NULL;
+                continue;
+            }
             log_info(BT_TAG, "Initiating pending connection to 0x%08X (priority: %s, slow: %s)",
                 tracked->device_id, we_have_priority ? "yes" : "no", they_are_slow ? "yes" : "no");
             connect_to_device(tracked);
@@ -667,6 +730,12 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
 
 static void on_services_resolved(Device * device) {
     if (!g_manager || !device) return;
+
+    // Validate device is still valid
+    if (!is_device_valid(device)) {
+        log_debug(BT_TAG, "Services resolved callback for removed device, ignoring");
+        return;
+    }
 
     tracked_device_t * tracked = find_device_by_ptr(device);
     if (!tracked) return;
@@ -702,7 +771,10 @@ static void on_services_resolved(Device * device) {
 
 // NOLINTNEXTLINE
 static void on_notify(Device * device, Characteristic * characteristic, const GByteArray * byteArray) {
-    if (!g_manager || !byteArray || byteArray->len == 0) return;
+    if (!g_manager || !device || !byteArray || byteArray->len == 0) return;
+
+    // Validate device is still valid
+    if (!is_device_valid(device)) return;
 
     tracked_device_t * tracked = find_device_by_ptr(device);
     if (tracked) {
@@ -740,7 +812,7 @@ static void on_notify(Device * device, Characteristic * characteristic, const GB
 
 // NOLINTNEXTLINE
 static void on_write_characteristic(Device * device, Characteristic * characteristic, const GByteArray * byteArray, const GError * error) {
-    if (error) {
+    if (error && device && is_device_valid(device)) {
         const tracked_device_t * tracked = find_device_by_ptr(device);
         log_error(BT_TAG, "Write characteristic error for 0x%08X: %s", tracked ? tracked->device_id : 0, error->message);
     }
@@ -749,6 +821,12 @@ static void on_write_characteristic(Device * device, Characteristic * characteri
 // NOLINTNEXTLINE
 static void on_remote_central_connected(Adapter * adapter, Device * device) {
     if (!g_manager || !device) return;
+
+    // Validate device and skip during cleanup
+    if (g_in_cleanup || !is_device_valid(device)) {
+        log_debug(BT_TAG, "Remote central connected callback during cleanup or for invalid device, ignoring");
+        return;
+    }
 
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
@@ -801,8 +879,11 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 
             // If we have an outgoing connection attempt, cancel it
             if (existing_tracked->device && existing_tracked->device != device) {
-                binc_device_disconnect(existing_tracked->device);
-                binc_adapter_remove_device(g_manager->adapter, existing_tracked->device);
+                // IMPORTANT: NULL out pointer BEFORE calling disconnect/remove
+                Device * old_device = existing_tracked->device;
+                existing_tracked->device = NULL;
+                binc_device_disconnect(old_device);
+                binc_adapter_remove_device(g_manager->adapter, old_device);
             }
         }
 
@@ -852,6 +933,10 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 // Authorization callback
 // NOLINTNEXTLINE
 static gboolean on_request_authorization(Device * device) {
+    if (!device || !is_device_valid(device)) {
+        return FALSE;  // Reject invalid device
+    }
+
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
     log_info(BT_TAG, "Authorizing device: %s (%s)", name ? name : "unknown", mac ? mac : "unknown");
