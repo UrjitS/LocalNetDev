@@ -167,22 +167,22 @@ static void on_node_disconnected(const uint32_t node_id) {
 }
 
 static void on_data_received(const uint32_t sender_id, const uint8_t *data, const size_t len) {
-    log_debug(TAG, "Received %zu bytes from Node 0x%08X", len, sender_id);
+    log_info(TAG, "Received %zu bytes from Node 0x%08X", len, sender_id);
 
     struct header hdr;
     if (parse_header(data, len, &hdr) == 0) {
         switch (hdr.message_type) {
             case MSG_DISCOVERY:
-                log_debug(TAG, "Received discovery message");
+                log_info(TAG, "Received discovery message");
                 break;
             case MSG_HEARTBEAT:
-                log_debug(TAG, "Received heartbeat from 0x%08X", sender_id);
+                log_info(TAG, "Received heartbeat from 0x%08X", sender_id);
                 break;
             case MSG_DATA:
-                log_debug(TAG, "Received data message");
+                log_info(TAG, "Received data message");
                 break;
             default:
-                log_debug(TAG, "Received unknown message type: %d", hdr.message_type);
+                log_info(TAG, "Received unknown message type: %d", hdr.message_type);
                 break;
         }
     }

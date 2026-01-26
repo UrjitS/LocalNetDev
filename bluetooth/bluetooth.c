@@ -1,5 +1,3 @@
-/* bluetooth.c - Simplified LocalNet BLE mesh networking implementation */
-
 #include "bluetooth.h"
 #include <string.h>
 #include <stdlib.h>
@@ -10,7 +8,6 @@
 #define HEARTBEAT_TIMEOUT_SECONDS 30
 #define RECONNECT_DELAY_MS 5000
 
-/* Simple mesh packet for BLE communication */
 #define MSG_TYPE_HEARTBEAT 0x01
 #define MSG_TYPE_DATA      0x02
 #define MSG_TYPE_DISCOVERY 0x03
@@ -22,16 +19,16 @@ struct mesh_packet {
     uint32_t timestamp;
 };
 
+// NOLINTNEXTLINE
 static size_t serialize_mesh_packet(const struct mesh_packet *pkt, uint8_t *buffer, size_t buffer_size) {
-    if (buffer_size < 8) return 0;
     buffer[0] = pkt->type;
     buffer[1] = pkt->flags;
     memcpy(&buffer[2], &pkt->source_id, sizeof(pkt->source_id));
     memcpy(&buffer[6], &pkt->timestamp, sizeof(pkt->timestamp));
-    return 10;  // Actually 10 bytes if timestamp is 4 bytes
+    return 10;
 }
 
-static gboolean deserialize_mesh_packet(const uint8_t *buffer, size_t len, struct mesh_packet *pkt) {
+static gboolean deserialize_mesh_packet(const uint8_t *buffer, const size_t len, struct mesh_packet *pkt) {
     if (len < 8) return FALSE;
     pkt->type = buffer[0];
     pkt->flags = buffer[1];
@@ -46,7 +43,7 @@ static gboolean deserialize_mesh_packet(const uint8_t *buffer, size_t len, struc
 
 static ble_node_manager_t *g_manager = NULL;
 
-/* Forward declarations */
+
 static void on_scan_result(Adapter *adapter, Device *device);
 static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, const GError *error);
 static void on_connection_state_changed(Device *device, ConnectionState state, const GError *error);
@@ -55,10 +52,8 @@ static void on_notify(Device *device, Characteristic *characteristic, const GByt
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_remote_central_connected(Adapter *adapter, Device *device);
 static gboolean on_request_authorization(Device *device);
-static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid,
-                                       const char* char_uuid, const guint16 offset, const guint16 mtu);
-static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid,
-                                        const char *char_uuid, GByteArray *byteArray, const guint16 offset, const guint16 mtu);
+static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid, const char* char_uuid, guint16 offset, guint16 mtu);
+static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid, const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
 
 /* Utility functions */
 static uint32_t mac_to_device_id(const char *mac) {

@@ -2,21 +2,12 @@
 #define LOCALNET_BLUETOOTH_H
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <signal.h>
 #include <stdint.h>
-#include <time.h>
 #include <glib.h>
-#include "adapter.h"
 #include "device.h"
-#include "logger.h"
 #include "agent.h"
-#include "application.h"
-#include "advertisement.h"
-#include "characteristic.h"
 
-/* Forward declarations */
+
 struct mesh_node;
 
 #define LOCAL_NET_SERVICE_UUID "00001234-0000-1000-8000-00805f9b34fb"
@@ -24,8 +15,9 @@ struct mesh_node;
 #define LOCAL_NET_CTRL_CHAR_UUID "00001236-0000-1000-8000-00805f9b34fb"
 #define MAX_BLE_PAYLOAD_SIZE 512
 #define MAX_DISCOVERED_DEVICES 32
+#define MAX_NAME_SIZE 32
 
-/* Callback function types */
+// Callback function types
 typedef void (*ble_discovered_callback)(uint32_t node_id, int16_t rssi);
 typedef void (*ble_connected_callback)(uint32_t node_id);
 typedef void (*ble_disconnected_callback)(uint32_t node_id);
@@ -37,7 +29,7 @@ typedef struct {
     char mac_address[18];
     Device *device;
     gboolean is_connected;
-    gboolean we_initiated;  /* TRUE if we connected as central, FALSE if they connected to us */
+    gboolean we_initiated;
     int16_t rssi;
     uint64_t last_heartbeat;
     uint64_t last_seen;
@@ -54,7 +46,7 @@ typedef struct ble_node_manager {
 
     struct mesh_node *mesh_node;
     uint32_t device_id;
-    char local_name[32];
+    char local_name[MAX_NAME_SIZE];
 
     /* Tracked devices */
     tracked_device_t *discovered_devices;
@@ -74,11 +66,7 @@ typedef struct ble_node_manager {
 } ble_node_manager_t;
 
 /* Initialization and cleanup */
-ble_node_manager_t *ble_init(struct mesh_node *mesh_node, uint32_t device_id,
-                              ble_discovered_callback discovered_cb,
-                              ble_connected_callback connected_cb,
-                              ble_disconnected_callback disconnected_cb,
-                              ble_data_callback data_cb);
+ble_node_manager_t *ble_init(struct mesh_node *mesh_node, uint32_t device_id, ble_discovered_callback discovered_cb, ble_connected_callback connected_cb, ble_disconnected_callback disconnected_cb, ble_data_callback data_cb);
 gboolean ble_start(ble_node_manager_t *manager);
 void ble_stop(ble_node_manager_t *manager);
 void ble_cleanup(ble_node_manager_t *manager);
