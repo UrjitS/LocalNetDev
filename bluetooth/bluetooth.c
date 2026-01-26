@@ -26,7 +26,7 @@ static void on_services_resolved(Device *device);
 static void on_notify(Device *device, Characteristic *characteristic, const GByteArray *byteArray);
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_remote_central_connected(Adapter *adapter, Device *device);
-static gboolean on_request_authorization(const Device *device);
+static gboolean on_request_authorization(Device *device);
 static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid, const char* char_uuid, guint16 offset, guint16 mtu);
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid, const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
 
@@ -301,7 +301,7 @@ static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, c
 }
 
 /* Scan result callback */
-static void on_scan_result(Adapter * adapter, Device *device) {
+static void on_scan_result(Adapter *adapter, Device *device) {
     if (!g_manager || !device) return;
 
     const char *name = binc_device_get_name(device);
@@ -517,7 +517,7 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
 }
 
 /* Authorization callback */
-static gboolean on_request_authorization(const Device * device) {
+static gboolean on_request_authorization(Device * device) {
     const char *name = binc_device_get_name(device);
     log_info(BT_TAG, "Authorizing device: %s", name ? name : "unknown");
     return TRUE;
