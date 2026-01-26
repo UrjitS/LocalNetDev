@@ -392,12 +392,14 @@ static void on_scan_result(Adapter * adapter, Device * device) {
         }
     }
 
-    // Rate limit connection attempts
+    // Rate limit connection attempts for this specific device
     if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) {
         return;
     }
 
     // Check if we're already in the process of connecting to another device
+    // If so, still track this device but don't initiate a connection yet
+    // The periodic check_pending_connections_idle will handle it later
     gboolean already_connecting = FALSE;
     for (guint i = 0; i < g_manager->discovered_count; i++) {
         if (g_manager->discovered_devices[i].is_connecting) {
@@ -406,29 +408,27 @@ static void on_scan_result(Adapter * adapter, Device * device) {
         }
     }
 
+    // Decide if we should initiate connection
+    gboolean we_have_priority = (g_manager->device_id < device_id);
+    gboolean they_are_slow = (now - tracked->last_seen > 10);
+
     if (already_connecting) {
-        // Queue this device for later connection
-        log_debug(BT_TAG, "Already connecting to another device, 0x%08X queued", device_id);
+        // Don't initiate new connection, but device is tracked for later
+        log_debug(BT_TAG, "Already connecting to another device, 0x%08X tracked for later", device_id);
         return;
     }
 
-    // NEW STRATEGY: Both sides can initiate connections
-    // The device with lower ID has priority, but if we discover a device with lower ID,
-    // we still track it and wait for them to connect to us (or try ourselves after a delay)
-
-    if (g_manager->device_id < device_id) {
+    // Initiate connection based on priority
+    if (we_have_priority) {
         // We have priority - connect immediately
         log_debug(BT_TAG, "Connecting to 0x%08X (we have lower ID, priority)", device_id);
         connect_to_device(tracked);
+    } else if (they_are_slow) {
+        // They have priority but haven't connected to us yet
+        log_debug(BT_TAG, "Attempting connection to 0x%08X (they have priority but haven't connected)", device_id);
+        connect_to_device(tracked);
     } else {
-        // They have priority, but we can still try if they haven't connected to us yet
-        // Use a longer delay to give them a chance to connect first
-        if (now - tracked->last_seen > 10) {  // They've been around for >10 seconds
-            log_debug(BT_TAG, "Attempting connection to 0x%08X (they have priority but haven't connected)", device_id);
-            connect_to_device(tracked);
-        } else {
-            log_debug(BT_TAG, "Waiting for 0x%08X to connect (they have lower ID)", device_id);
-        }
+        log_debug(BT_TAG, "Waiting for 0x%08X to connect (they have lower ID)", device_id);
     }
 }
 
@@ -524,21 +524,41 @@ static gboolean restart_advertising_discovery_idle(gpointer user_data) {
 }
 
 // Helper to check if there are pending connections we should initiate
+// Also checks for stuck connections and cleans them up
 // Returns TRUE to keep running as a periodic timer
 static gboolean check_pending_connections_idle(gpointer user_data) {
     if (!g_manager || !g_manager->running) return FALSE;
 
+    const uint64_t now = get_current_timestamp();
+
     // Check if we're already connecting to something
+    gboolean already_connecting = FALSE;
     for (guint i = 0; i < g_manager->discovered_count; i++) {
-        if (g_manager->discovered_devices[i].is_connecting) {
-            return TRUE;  // Already connecting, check again later
+        tracked_device_t * tracked = &g_manager->discovered_devices[i];
+        if (tracked->is_connecting) {
+            // Check for stuck connections (connecting for more than 15 seconds)
+            if (now - tracked->last_connect_attempt > 15) {
+                log_warn(BT_TAG, "Connection to 0x%08X stuck for 15+ seconds, canceling", tracked->device_id);
+                tracked->is_connecting = FALSE;
+                if (tracked->device) {
+                    binc_device_disconnect(tracked->device);
+                    binc_adapter_remove_device(g_manager->adapter, tracked->device);
+                    tracked->device = NULL;
+                }
+                // Allow retry after reconnect delay
+                tracked->last_connect_attempt = now;
+            } else {
+                already_connecting = TRUE;
+            }
         }
     }
 
-    const uint64_t now = get_current_timestamp();
+    // If still connecting to something, wait for it to complete
+    if (already_connecting) {
+        return TRUE;
+    }
 
     // Find devices we should connect to but haven't yet
-    // Sort by priority: lower ID devices (where we have priority) first
     for (guint i = 0; i < g_manager->discovered_count; i++) {
         tracked_device_t * tracked = &g_manager->discovered_devices[i];
 
@@ -558,7 +578,7 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
         // Priority logic: connect to devices where we have lower ID first
         // Also connect to higher priority devices if they haven't connected to us after 10+ seconds
         gboolean we_have_priority = (g_manager->device_id < tracked->device_id);
-        gboolean they_are_slow = (now - tracked->last_seen > 10);
+        gboolean they_are_slow = (tracked->last_seen > 0 && (now - tracked->last_seen > 10));
 
         if (we_have_priority || they_are_slow) {
             log_info(BT_TAG, "Initiating pending connection to 0x%08X (priority: %s, slow: %s)",
@@ -705,6 +725,12 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
         if (existing_tracked->is_connecting) {
             log_info(BT_TAG, "Device 0x%08X connected to us while we were connecting - accepting theirs", device_id);
             existing_tracked->is_connecting = FALSE;
+
+            // If we have an outgoing connection attempt, cancel it
+            if (existing_tracked->device && existing_tracked->device != device) {
+                binc_device_disconnect(existing_tracked->device);
+                binc_adapter_remove_device(g_manager->adapter, existing_tracked->device);
+            }
         }
 
         // If already connected, this might be a duplicate - disconnect and ignore
