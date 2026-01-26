@@ -168,7 +168,26 @@ static void stop_discovery(void) {
     g_discovery_running = FALSE;
 }
 
-// Connect to a device 
+// Force restart discovery - stops and starts to trigger fresh scan
+static gboolean restart_discovery_delayed(gpointer user_data) {
+    if (!g_manager || !g_manager->adapter || !g_manager->running) return FALSE;
+    log_debug(BT_TAG, "Delayed discovery restart - starting discovery");
+    binc_adapter_set_discovery_filter(g_manager->adapter, -100, NULL, NULL);
+    binc_adapter_start_discovery(g_manager->adapter);
+    return FALSE;  // Don't repeat
+}
+
+static void restart_discovery(void) {
+    if (!g_manager || !g_manager->adapter) return;
+    log_debug(BT_TAG, "Force restarting discovery");
+    // Stop discovery first
+    binc_adapter_stop_discovery(g_manager->adapter);
+    g_discovery_running = FALSE;
+    // Schedule restart after a short delay to allow BlueZ to clean up
+    g_timeout_add(500, restart_discovery_delayed, NULL);
+}
+
+// Connect to a device
 static void connect_to_device(tracked_device_t * tracked) {
     if (!g_manager || !tracked) return;
     if (!tracked->device) {
@@ -194,11 +213,13 @@ static void connect_to_device(tracked_device_t * tracked) {
         tracked->is_connecting = FALSE;
         tracked->is_connected = FALSE;
         // Set last_connect_attempt further in the past to allow immediate retry after rediscovery
-        // But also set last_seen to 0 so the device needs to be freshly discovered
+        // Set last_seen to now so we can track when to force discovery restart
         tracked->last_connect_attempt = get_current_timestamp() - RECONNECT_DELAY_SECONDS + 1;
-        tracked->last_seen = 0;
+        tracked->last_seen = get_current_timestamp();
 
         // Device will be rediscovered (hopefully without bond) and we can try connecting again
+        // Force restart discovery to speed up rediscovery
+        restart_discovery();
         return;
     }
 
@@ -576,10 +597,14 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
                     tracked->device = NULL;
                 }
 
-                // Set last_seen to 0 to force fresh discovery
-                tracked->last_seen = 0;
+                // Mark last_seen as now so we can track when to force discovery restart
+                // (Setting to 0 would break the timeout logic in the pending connection check)
+                tracked->last_seen = now;
                 // Add longer cooldown (10 seconds) after canceling stuck connection
                 tracked->last_connect_attempt = now + 5;  // Will need to wait extra 5 + RECONNECT_DELAY seconds
+
+                // Force restart discovery to find the device again after removal
+                restart_discovery();
             } else {
                 already_connecting = TRUE;
             }
@@ -610,12 +635,11 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
             // If we've been waiting too long for discovery, try to force restart discovery
             // This can happen if the remote device is advertising but we're not scanning
             // Only do this if last_seen is set (meaning we saw this device before)
-            if (tracked->last_seen > 0 && (now - tracked->last_seen > 30)) {
-                log_warn(BT_TAG, "Device 0x%08X not rediscovered for 30+ seconds, restarting discovery",
+            if (tracked->last_seen > 0 && (now - tracked->last_seen > 15)) {
+                log_warn(BT_TAG, "Device 0x%08X not rediscovered for 15+ seconds, restarting discovery",
                     tracked->device_id);
-                // Force restart discovery
-                g_discovery_running = FALSE;  // Force restart
-                start_discovery();
+                // Force restart discovery (stop + start)
+                restart_discovery();
                 // Reset last_seen to current time to avoid spamming this
                 tracked->last_seen = now;
             } else {
