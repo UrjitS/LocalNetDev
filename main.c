@@ -80,7 +80,7 @@ static void cmd_show_help(void) {
 }
 
 static void cmd_quit(void) {
-    printf("Quitting...\n");
+    printf("Quitting\n");
     g_running = FALSE;
     if (g_ble_manager) {
         ble_quit_loop(g_ble_manager);
@@ -138,7 +138,7 @@ void usage(const char *program_name) {
 
 static void signal_handler(const int sig_no) {
     if (sig_no == SIGINT || sig_no == SIGTERM) {
-        log_info(TAG, "Received signal %d, shutting down...", sig_no);
+        log_info(TAG, "Received signal %d, shutting down", sig_no);
         if (g_ble_manager) {
             ble_quit_loop(g_ble_manager);
         }
@@ -296,7 +296,7 @@ int main(const int argc, char *argv[]) {
     log_enabled(TRUE);
     log_set_level(verbose ? LOG_DEBUG : LOG_INFO);
 
-    log_debug(TAG, "LocalNet starting...");
+    log_debug(TAG, "LocalNet starting");
 
     // Get adapter MAC address
     char mac_address[18] = {0};
