@@ -150,8 +150,14 @@ static void stop_advertising(void) {
 }
 
 // Discovery control 
+static gboolean g_discovery_running = FALSE;
+
 static void start_discovery(void) {
     if (!g_manager || !g_manager->adapter) return;
+    if (g_discovery_running) {
+        log_debug(BT_TAG, "Discovery already running, not restarting");
+        return;
+    }
     binc_adapter_set_discovery_filter(g_manager->adapter, -100, NULL, NULL);
     binc_adapter_start_discovery(g_manager->adapter);
 }
@@ -159,6 +165,7 @@ static void start_discovery(void) {
 static void stop_discovery(void) {
     if (!g_manager || !g_manager->adapter) return;
     binc_adapter_stop_discovery(g_manager->adapter);
+    g_discovery_running = FALSE;
 }
 
 // Connect to a device 
@@ -345,8 +352,14 @@ static void on_discovery_state_changed(Adapter * adapter, DiscoveryState state, 
     const char * state_name = "UNKNOWN";
     switch (state) {
         case BINC_DISCOVERY_STARTING: state_name = "STARTING"; break;
-        case BINC_DISCOVERY_STARTED: state_name = "STARTED"; break;
-        case BINC_DISCOVERY_STOPPED: state_name = "STOPPED"; break;
+        case BINC_DISCOVERY_STARTED:
+            state_name = "STARTED";
+            g_discovery_running = TRUE;
+            break;
+        case BINC_DISCOVERY_STOPPED:
+            state_name = "STOPPED";
+            g_discovery_running = FALSE;
+            break;
         case BINC_DISCOVERY_STOPPING: state_name = "STOPPING"; break;
     }
     if (error) {
@@ -376,7 +389,8 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     tracked_device_t * tracked = find_device_by_id(device_id);
     if (tracked) {
         tracked->rssi = rssi;
-        tracked->last_seen = now;
+        // Only update device pointer, don't reset last_seen for existing devices
+        // last_seen tracks when we FIRST saw this device (for "they_are_slow" logic)
         tracked->device = device;
 
         // If already connected or currently connecting, just update and return
@@ -389,6 +403,7 @@ static void on_scan_result(Adapter * adapter, Device * device) {
         tracked = add_device(device_id, mac, device);
         if (!tracked) return;
         tracked->rssi = rssi;
+        tracked->last_seen = now;  // Only set last_seen for NEW devices
 
         // Call discovery callback for new devices
         if (g_manager->discovered_callback) {
@@ -526,6 +541,12 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
 
     const uint64_t now = get_current_timestamp();
 
+    // Ensure discovery is running - if not, restart it
+    if (!g_discovery_running) {
+        log_warn(BT_TAG, "Discovery not running, restarting");
+        start_discovery();
+    }
+
     // Check if we're already connecting to something
     gboolean already_connecting = FALSE;
     for (guint i = 0; i < g_manager->discovered_count; i++) {
@@ -566,14 +587,28 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
 
         // We need a valid device pointer to connect
         if (!tracked->device) {
-            log_debug(BT_TAG, "Pending connection to 0x%08X but no device pointer, waiting for discovery", tracked->device_id);
+            // If we've been waiting too long for discovery, try to force restart discovery
+            // This can happen if the remote device is advertising but we're not scanning
+            // Only do this if last_seen is set (meaning we saw this device before)
+            if (tracked->last_seen > 0 && (now - tracked->last_seen > 30)) {
+                log_warn(BT_TAG, "Device 0x%08X not rediscovered for 30+ seconds, restarting discovery",
+                    tracked->device_id);
+                // Force restart discovery
+                g_discovery_running = FALSE;  // Force restart
+                start_discovery();
+                // Reset last_seen to current time to avoid spamming this
+                tracked->last_seen = now;
+            } else {
+                log_debug(BT_TAG, "Pending connection to 0x%08X but no device pointer, waiting for discovery",
+                    tracked->device_id);
+            }
             continue;
         }
 
         // Priority logic: connect to devices where we have lower ID first
-        // Also connect to higher priority devices if they haven't connected to us after 10+ seconds
+        // Also connect to higher priority devices if they haven't connected to us after 15+ seconds
         gboolean we_have_priority = (g_manager->device_id < tracked->device_id);
-        gboolean they_are_slow = (tracked->last_seen > 0 && (now - tracked->last_seen > 10));
+        gboolean they_are_slow = (tracked->last_seen > 0 && (now - tracked->last_seen > 15));
 
         if (we_have_priority || they_are_slow) {
             log_info(BT_TAG, "Initiating pending connection to 0x%08X (priority: %s, slow: %s)",
