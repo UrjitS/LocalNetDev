@@ -171,13 +171,16 @@ static void connect_to_device(tracked_device_t * tracked) {
         // Remove the device entirely - this should clear bonding
         binc_adapter_remove_device(g_manager->adapter, tracked->device);
 
-        // Clear our tracking
+        // Clear our tracking and set a longer reconnect delay
         tracked->device = NULL;
         tracked->is_connecting = FALSE;
         tracked->is_connected = FALSE;
-        tracked->last_connect_attempt = get_current_timestamp();
+        // Set last_connect_attempt further in the past to allow immediate retry after rediscovery
+        // But also set last_seen to 0 so the device needs to be freshly discovered
+        tracked->last_connect_attempt = get_current_timestamp() - RECONNECT_DELAY_SECONDS + 1;
+        tracked->last_seen = 0;
 
-        // Device will be rediscovered and we can try connecting again
+        // Device will be rediscovered (hopefully without bond) and we can try connecting again
         return;
     }
 
@@ -187,9 +190,8 @@ static void connect_to_device(tracked_device_t * tracked) {
     tracked->is_connecting = TRUE;
     tracked->last_connect_attempt = get_current_timestamp();
 
-    // DON'T stop advertising - we need to remain discoverable for other nodes
-    // Just stop discovery temporarily to avoid interference
-    stop_discovery();
+    // DON'T stop advertising or discovery - modern BLE can handle simultaneous operations
+    // This keeps us discoverable and able to discover other nodes during connection
 
     // Set up callbacks before connecting 
     binc_device_set_connection_state_change_cb(tracked->device, &on_connection_state_changed);
