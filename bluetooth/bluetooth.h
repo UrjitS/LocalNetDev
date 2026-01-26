@@ -67,6 +67,7 @@ typedef struct ble_node_manager {
     ble_discovered_callback discovered_callback;
 
     guint heartbeat_source;
+    guint connection_check_source;
 } ble_node_manager_t;
 
 // Initialization and cleanup
