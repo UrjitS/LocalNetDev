@@ -145,6 +145,20 @@ static void connect_to_device(tracked_device_t * tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
     if (tracked->is_connected || tracked->is_connecting) return;
 
+    // Check if the device is in a stale bonded state - if so, we need to remove it and wait for rediscovery
+    BondingState bond_state = binc_device_get_bonding_state(tracked->device);
+    log_debug(BT_TAG, "Device 0x%08X bonding state: %d (BONDED=%d, NONE=%d)",
+        tracked->device_id, bond_state, BINC_BONDED, BINC_BOND_NONE);
+
+    if (bond_state == BINC_BONDED) {
+        log_info(BT_TAG, "Device 0x%08X is in bonded state, removing to get fresh connection", tracked->device_id);
+        binc_adapter_remove_device(g_manager->adapter, tracked->device);
+        tracked->device = NULL;
+        tracked->last_connect_attempt = get_current_timestamp();
+        // Device will be rediscovered and we'll try again
+        return;
+    }
+
     log_info(BT_TAG, "Connecting to device 0x%08X", tracked->device_id);
 
     // Mark as connecting to prevent duplicate attempts
@@ -404,18 +418,38 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
         case BINC_DISCONNECTED:
             if (tracked) {
                 const gboolean was_connected = tracked->is_connected;
+                const gboolean was_connecting = tracked->is_connecting;
                 tracked->is_connected = FALSE;
                 tracked->is_connecting = FALSE;
                 tracked->device = NULL;
+                tracked->last_disconnect_time = get_current_timestamp();
 
                 if (was_connected && g_manager->disconnected_callback) {
                     g_manager->disconnected_callback(device_id);
                 }
+
+                // If we disconnected during connection attempt (before services resolved),
+                // this likely means bonding keys are mismatched. Force remove the device.
+                if (was_connecting && !was_connected) {
+                    log_error(BT_TAG, "Connection to 0x%08X failed during connection/service discovery - likely bonding mismatch", device_id);
+                    // Force remove to clear any stale bonding info
+                    log_debug(BT_TAG, "Force removing device to clear bonding info");
+                    binc_adapter_remove_device(g_manager->adapter, device);
+                    device = NULL;  // Device is now invalid
+                }
             }
 
-            // Remove device from BlueZ cache to allow fresh discovery 
-            if (binc_device_get_bonding_state(device) != BINC_BONDED) {
-                binc_adapter_remove_device(g_manager->adapter, device);
+            // Always remove LocalNet devices from BlueZ cache to allow fresh discovery
+            // This prevents stale bonding issues
+            if (device) {  // Only if not already removed above
+                const char * dev_name = binc_device_get_name(device);
+                if (is_localnet_device(dev_name)) {
+                    log_debug(BT_TAG, "Removing device from cache: %s (bonded: %d)",
+                        dev_name, binc_device_get_bonding_state(device) == BINC_BONDED);
+                    binc_adapter_remove_device(g_manager->adapter, device);
+                } else if (binc_device_get_bonding_state(device) != BINC_BONDED) {
+                    binc_adapter_remove_device(g_manager->adapter, device);
+                }
             }
 
             // Restart advertising and discovery after disconnection
@@ -595,6 +629,18 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
         return;
     }
 
+    // Early debounce check - if we just disconnected from this device, ignore
+    tracked_device_t * existing_tracked = find_device_by_id(device_id);
+    if (existing_tracked) {
+        const uint64_t now = get_current_timestamp();
+        if (existing_tracked->last_disconnect_time > 0 &&
+            (now - existing_tracked->last_disconnect_time < 3)) {
+            log_debug(BT_TAG, "Ignoring spurious reconnection from 0x%08X (disconnected %lu seconds ago)",
+                device_id, (unsigned long)(now - existing_tracked->last_disconnect_time));
+            return;
+        }
+    }
+
     // Check for bidirectional connection scenario
     // If we should have initiated the connection (our ID < their ID), but they connected to us,
     // this might be a race condition. Accept the connection but note the unusual state.
@@ -619,6 +665,7 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
         tracked->is_connecting = FALSE;
         tracked->we_initiated = FALSE;  // They connected to us
         tracked->last_heartbeat = get_current_timestamp();
+        tracked->last_disconnect_time = 0;  // Clear disconnect time since we're now connected
         if (mac) strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
     } else {
         // Add new device
@@ -819,13 +866,19 @@ gboolean ble_start(ble_node_manager_t * manager) {
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
     // Clean up any cached LocalNet devices from previous sessions
+    // This includes removing bonding information to ensure fresh connections
     log_debug(BT_TAG, "Cleaning up stale LocalNet devices from previous session");
     GList * existing_devices = binc_adapter_get_devices(manager->adapter);
     for (const GList * it = existing_devices; it != NULL; it = it->next) {
         Device * device = it->data;
         const char * name = binc_device_get_name(device);
         if (is_localnet_device(name)) {
-            log_debug(BT_TAG, "Removing stale cached device: %s", name);
+            log_debug(BT_TAG, "Removing stale cached device: %s (bonded: %d)", name,
+                binc_device_get_bonding_state(device) == BINC_BONDED);
+            // Disconnect if connected
+            if (binc_device_get_connection_state(device) == BINC_CONNECTED) {
+                binc_device_disconnect(device);
+            }
             binc_adapter_remove_device(manager->adapter, device);
         }
     }

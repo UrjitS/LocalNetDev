@@ -39,6 +39,7 @@ typedef struct {
     uint64_t last_heartbeat;
     uint64_t last_seen;
     uint64_t last_connect_attempt;
+    uint64_t last_disconnect_time;
 } tracked_device_t;
 
 // BLE Node Manager
