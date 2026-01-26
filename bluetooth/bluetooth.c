@@ -6,45 +6,15 @@
 #include "characteristic.h"
 #include "adapter.h"
 #include "logger.h"
+#include "protocol.h"
+#include "routing.h"
+#include "utils.h"
 
 #define BT_TAG "LocalNet-BT"
 #define LOCALNET_PREFIX "LocalNet-"
-#define HEARTBEAT_INTERVAL_SECONDS 10
 #define HEARTBEAT_TIMEOUT_SECONDS 30
 #define RECONNECT_DELAY_MS 5000
-
-#define MSG_TYPE_HEARTBEAT 0x01
-#define MSG_TYPE_DATA      0x02
-#define MSG_TYPE_DISCOVERY 0x03
-
-struct mesh_packet {
-    uint8_t type;
-    uint8_t flags;
-    uint32_t source_id;
-    uint32_t timestamp;
-};
-
-// NOLINTNEXTLINE
-static size_t serialize_mesh_packet(const struct mesh_packet *pkt, uint8_t *buffer, size_t buffer_size) {
-    buffer[0] = pkt->type;
-    buffer[1] = pkt->flags;
-    memcpy(&buffer[2], &pkt->source_id, sizeof(pkt->source_id));
-    memcpy(&buffer[6], &pkt->timestamp, sizeof(pkt->timestamp));
-    return 10;
-}
-
-static gboolean deserialize_mesh_packet(const uint8_t *buffer, const size_t len, struct mesh_packet *pkt) {
-    if (len < 8) return FALSE;
-    pkt->type = buffer[0];
-    pkt->flags = buffer[1];
-    memcpy(&pkt->source_id, &buffer[2], sizeof(pkt->source_id));
-    if (len >= 10) {
-        memcpy(&pkt->timestamp, &buffer[6], sizeof(pkt->timestamp));
-    } else {
-        pkt->timestamp = 0;
-    }
-    return TRUE;
-}
+#define PROTOCOL_VERSION 1
 
 static ble_node_manager_t *g_manager = NULL;
 
@@ -61,15 +31,6 @@ static const char* on_local_char_read(const Application *app, const char *addres
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid, const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
 
 /* Utility functions */
-static uint32_t mac_to_device_id(const char *mac) {
-    if (!mac) return 0;
-    unsigned int b1, b2, b3, b4, b5, b6;
-    if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &b1, &b2, &b3, &b4, &b5, &b6) == 6) {
-        return (b4 << 16) | (b5 << 8) | b6;
-    }
-    return 0;
-}
-
 static uint32_t extract_device_id_from_name(const char *name) {
     if (!name) return 0;
     if (g_str_has_prefix(name, LOCALNET_PREFIX)) {
@@ -83,9 +44,6 @@ static gboolean is_localnet_device(const char *name) {
     return name && g_str_has_prefix(name, LOCALNET_PREFIX);
 }
 
-static uint64_t get_current_timestamp(void) {
-    return (uint64_t)time(NULL);
-}
 
 static tracked_device_t* find_device_by_id(uint32_t device_id) {
     if (!g_manager) return NULL;
@@ -214,7 +172,7 @@ static void connect_to_device(tracked_device_t *tracked) {
 static gboolean heartbeat_callback(gpointer user_data) {
     if (!g_manager || !g_manager->running) return FALSE;
 
-    uint64_t now = get_current_timestamp();
+    uint32_t now = get_current_timestamp();
     guint connected = 0;
     guint timed_out = 0;
 
@@ -242,16 +200,52 @@ static gboolean heartbeat_callback(gpointer user_data) {
         }
     }
 
-    /* Create heartbeat message */
-    struct mesh_packet packet = {
-        .type = MSG_TYPE_HEARTBEAT,
-        .flags = 0,
-        .source_id = g_manager->device_id,
-        .timestamp = (uint32_t)now
+    /* Create proper heartbeat message using protocol structures */
+    struct heartbeat hb = {
+        .device_status = 0x01,  /* Normal status */
+        .active_connection_number = (uint8_t)count_connected(),
+        .timestamp = now
     };
 
-    uint8_t buffer[32];
-    size_t len = serialize_mesh_packet(&packet, buffer, sizeof(buffer));
+    struct header hdr = {
+        .protocol_version = PROTOCOL_VERSION,
+        .message_type = MSG_HEARTBEAT,
+        .fragmentation_flag = 0,
+        .fragmentation_number = 0,
+        .total_fragments = 1,
+        .time_to_live = 1,  /* Heartbeat is single-hop */
+        .payload_length = sizeof(struct heartbeat),
+        .sequence_number = 0
+    };
+
+    struct network net = {
+        .source_id = g_manager->device_id,
+        .destination_id = 0  /* Broadcast */
+    };
+
+    /* Serialize the heartbeat payload */
+    uint8_t payload_buffer[16];
+    size_t payload_len = serialize_heartbeat(&hb, payload_buffer, sizeof(payload_buffer));
+    if (payload_len == 0) {
+        log_error(BT_TAG, "Failed to serialize heartbeat");
+        return TRUE;
+    }
+
+    /* Create the full packet */
+    struct packet pkt = {
+        .header = &hdr,
+        .network = &net,
+        .payload = payload_buffer,
+        .security = NULL
+    };
+
+    /* Serialize the complete packet */
+    uint8_t buffer[64];
+    size_t len = serialize_packet(&pkt, buffer, sizeof(buffer));
+    if (len == 0) {
+        log_error(BT_TAG, "Failed to serialize heartbeat packet");
+        return TRUE;
+    }
 
     /* Send heartbeats to all connected devices we initiated connection to (as client) */
     for (guint i = 0; i < g_manager->discovered_count; i++) {
@@ -441,14 +435,34 @@ static void on_notify(Device *device, Characteristic *characteristic, const GByt
         tracked->last_heartbeat = get_current_timestamp();
     }
 
-    /* Parse and handle the message */
-    struct mesh_packet packet;
-    if (deserialize_mesh_packet(byteArray->data, byteArray->len, &packet)) {
-        if (packet.type == MSG_TYPE_HEARTBEAT) {
-            log_debug(BT_TAG, "Received heartbeat from 0x%08X", packet.source_id);
-        } else if (g_manager->data_callback) {
-            g_manager->data_callback(packet.source_id, byteArray->data, byteArray->len);
+    /* Parse the packet using protocol functions */
+    struct header hdr;
+    struct network net;
+    if (parse_header(byteArray->data, byteArray->len, &hdr) != 0) {
+        log_error(BT_TAG, "Failed to parse packet header");
+        return;
+    }
+
+    if (byteArray->len < 16 || parse_network(byteArray->data + 8, byteArray->len - 8, &net) != 0) {
+        log_error(BT_TAG, "Failed to parse network header");
+        return;
+    }
+
+    /* Handle message based on type */
+    if (hdr.message_type == MSG_HEARTBEAT) {
+        struct heartbeat hb;
+        if (parse_heartbeat(byteArray->data + 16, byteArray->len - 16, &hb) == 0) {
+            log_debug(BT_TAG, "Received heartbeat from 0x%08X (status: %u, connections: %u)",
+                     net.source_id, hb.device_status, hb.active_connection_number);
+
+            /* Update mesh node connection info if available */
+            if (g_manager->mesh_node && g_manager->mesh_node->connection_table) {
+                reset_missed_heartbeats(g_manager->mesh_node->connection_table, net.source_id);
+                update_last_seen(g_manager->mesh_node->connection_table, net.source_id, hb.timestamp);
+            }
         }
+    } else if (g_manager->data_callback) {
+        g_manager->data_callback(net.source_id, byteArray->data, byteArray->len);
     }
 }
 
@@ -558,18 +572,37 @@ static const char* on_local_char_write(const Application *app, const char *addre
     log_debug(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes",
               address, device_id, byteArray->len);
 
-    /* Parse message */
-    struct mesh_packet packet;
-    if (deserialize_mesh_packet(byteArray->data, byteArray->len, &packet)) {
-        if (packet.type == MSG_TYPE_HEARTBEAT) {
-            log_debug(BT_TAG, "Received heartbeat from 0x%08X", packet.source_id);
+    /* Parse message using protocol functions */
+    struct header hdr;
+    struct network net;
+    if (parse_header(byteArray->data, byteArray->len, &hdr) != 0) {
+        log_error(BT_TAG, "Failed to parse packet header from write");
+        return NULL;
+    }
+
+    if (byteArray->len < 16 || parse_network(byteArray->data + 8, byteArray->len - 8, &net) != 0) {
+        log_error(BT_TAG, "Failed to parse network header from write");
+        return NULL;
+    }
+
+    /* Handle message based on type */
+    if (hdr.message_type == MSG_HEARTBEAT) {
+        struct heartbeat hb;
+        if (parse_heartbeat(byteArray->data + 16, byteArray->len - 16, &hb) == 0) {
+            log_debug(BT_TAG, "Received heartbeat from 0x%08X", net.source_id);
             /* Update device ID if we got it from the packet */
-            if (tracked && tracked->device_id == 0 && packet.source_id != 0) {
-                tracked->device_id = packet.source_id;
+            if (tracked && tracked->device_id == 0 && net.source_id != 0) {
+                tracked->device_id = net.source_id;
             }
-        } else if (g_manager->data_callback) {
-            g_manager->data_callback(packet.source_id, byteArray->data, byteArray->len);
+
+            /* Update mesh node connection info if available */
+            if (g_manager->mesh_node && g_manager->mesh_node->connection_table) {
+                reset_missed_heartbeats(g_manager->mesh_node->connection_table, net.source_id);
+                update_last_seen(g_manager->mesh_node->connection_table, net.source_id, hb.timestamp);
+            }
         }
+    } else if (g_manager->data_callback) {
+        g_manager->data_callback(net.source_id, byteArray->data, byteArray->len);
     }
 
     return NULL;
