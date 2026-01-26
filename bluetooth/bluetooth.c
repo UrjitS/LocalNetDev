@@ -569,18 +569,60 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
             if (tracked) {
                 const gboolean was_connected = tracked->is_connected;
                 const gboolean was_connecting = tracked->is_connecting;
+                const uint64_t now = get_current_timestamp();
+
                 tracked->is_connected = FALSE;
                 tracked->is_connecting = FALSE;
                 tracked->device = NULL;
-                tracked->last_disconnect_time = get_current_timestamp();
+                tracked->last_disconnect_time = now;
 
                 if (was_connected && g_manager->disconnected_callback) {
                     g_manager->disconnected_callback(device_id);
                 }
 
+                // Detect ghost connection pattern: rapid connect/disconnect cycles
+                // This happens when the remote device has a cached connection but isn't actually running
+                if (was_connected) {
+                    // Calculate connection duration
+                    const uint64_t connection_duration = now - tracked->connection_start_time;
+
+                    // If connection lasted less than 2 seconds, this is likely a ghost connection
+                    if (connection_duration < 2) {
+                        // Check if this is part of a rapid pattern
+                        if (tracked->first_rapid_disconnect_time == 0 ||
+                            (now - tracked->first_rapid_disconnect_time > 30)) {
+                            // Start new tracking window
+                            tracked->first_rapid_disconnect_time = now;
+                            tracked->rapid_disconnect_count = 1;
+                        } else {
+                            tracked->rapid_disconnect_count++;
+                        }
+
+                        log_debug(BT_TAG, "Detected rapid disconnect from 0x%08X (duration: %lus, count: %u)",
+                                  device_id, (unsigned long)connection_duration, tracked->rapid_disconnect_count);
+
+                        // If we've seen 2+ rapid disconnects in 30 seconds, this is a ghost device
+                        // Reduced from 3 to 2 since ghost connections are clearly problematic
+                        if (tracked->rapid_disconnect_count >= 2) {
+                            log_warn(BT_TAG, "Ghost connection pattern detected for 0x%08X - removing from BlueZ cache",
+                                     device_id);
+                            // Remove the device to prevent further ghost connections
+                            binc_adapter_remove_device(g_manager->adapter, device);
+                            device = NULL;
+                            // Reset the counter
+                            tracked->rapid_disconnect_count = 0;
+                            tracked->first_rapid_disconnect_time = 0;
+                        }
+                    } else {
+                        // Normal disconnect after successful connection - reset ghost tracking
+                        tracked->rapid_disconnect_count = 0;
+                        tracked->first_rapid_disconnect_time = 0;
+                    }
+                }
+
                 // If we disconnected during connection attempt (before services resolved),
                 // this likely means bonding keys are mismatched. Force remove the device.
-                if (was_connecting && !was_connected) {
+                if (was_connecting && !was_connected && device != NULL) {
                     log_error(BT_TAG, "Connection to 0x%08X failed during connection/service discovery - likely bonding mismatch", device_id);
                     // Force remove to clear any stale bonding info
                     log_debug(BT_TAG, "Force removing device to clear bonding info");
@@ -589,9 +631,6 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
                 }
             }
 
-            // Only remove device from cache if it's bonded and we failed to connect
-            // Don't remove on normal disconnects - this causes rediscovery delays
-            // The device will be rediscovered naturally when it starts advertising again
 
             // Restart advertising and discovery after disconnection
             log_debug(BT_TAG, "Restarting advertising and discovery after disconnection");
@@ -750,6 +789,7 @@ static void on_services_resolved(Device * device) {
 
     tracked->is_connected = TRUE;
     tracked->is_connecting = FALSE;
+    tracked->connection_start_time = get_current_timestamp();
     tracked->last_heartbeat = get_current_timestamp();
 
     Characteristic * characteristic = binc_device_get_characteristic(device, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID);
@@ -899,12 +939,13 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 
     // Track the connection
     tracked_device_t * tracked = find_device_by_id(device_id);
+    const uint64_t now = get_current_timestamp();
     if (tracked) {
         tracked->device = device;
         tracked->is_connected = TRUE;
         tracked->is_connecting = FALSE;
         tracked->we_initiated = FALSE;
-        tracked->last_heartbeat = get_current_timestamp();
+        tracked->connection_start_time = now;
         tracked->last_disconnect_time = 0;
         if (mac) strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
     } else {
@@ -913,7 +954,7 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 
         tracked->is_connected = TRUE;
         tracked->we_initiated = FALSE;
-        tracked->last_heartbeat = get_current_timestamp();
+        tracked->connection_start_time = now;
     }
 
     binc_device_set_connection_state_change_cb(device, &on_connection_state_changed);
@@ -1123,19 +1164,34 @@ gboolean ble_start(ble_node_manager_t * manager) {
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
     // CRITICAL: Aggressively clean up any cached LocalNet devices BEFORE registering callbacks
+    // This prevents ghost connections from cached devices that aren't actually running
     log_info(BT_TAG, "Performing aggressive cleanup of cached LocalNet devices...");
 
-    // Pass 1: Force disconnect all LocalNet devices
     GList * existing_devices = binc_adapter_get_devices(manager->adapter);
     guint disconnect_count = 0;
+
+    // Pass 1: Force disconnect all LocalNet-related devices
     for (const GList * it = existing_devices; it != NULL; it = it->next) {
         Device * device = it->data;
         const char * name = binc_device_get_name(device);
-        if (is_localnet_device(name)) {
-            ConnectionState conn_state = binc_device_get_connection_state(device);
-            log_debug(BT_TAG, "Found cached LocalNet device: %s (state: %d)", name, conn_state);
 
-            // Always try to disconnect, regardless of reported state
+        gboolean should_cleanup = FALSE;
+
+        // Check if name indicates LocalNet device
+        if (is_localnet_device(name)) {
+            should_cleanup = TRUE;
+        }
+
+        // Also check if device has our service characteristic (catches renamed/cached devices)
+        Characteristic * our_char = binc_device_get_characteristic(device, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID);
+        if (our_char != NULL) {
+            should_cleanup = TRUE;
+        }
+
+        if (should_cleanup) {
+            ConnectionState conn_state = binc_device_get_connection_state(device);
+            log_debug(BT_TAG, "Found cached LocalNet device: %s (state: %d)",
+                      name ? name : "(null)", conn_state);
             binc_device_disconnect(device);
             disconnect_count++;
         }
@@ -1147,7 +1203,7 @@ gboolean ble_start(ble_node_manager_t * manager) {
         g_usleep(500000);  // 500ms - longer delay for disconnections
     }
 
-    // Pass 2: Remove all LocalNet devices from BlueZ cache
+    // Pass 2: Remove all LocalNet-related devices from BlueZ cache
     existing_devices = binc_adapter_get_devices(manager->adapter);
     guint remove_count = 0;
     for (const GList * it = existing_devices; it != NULL; it = it->next) {
@@ -1155,8 +1211,20 @@ gboolean ble_start(ble_node_manager_t * manager) {
         const char * name = binc_device_get_name(device);
         const char * mac = binc_device_get_address(device);
 
+        gboolean should_remove = FALSE;
+
         if (is_localnet_device(name)) {
-            log_debug(BT_TAG, "Removing cached device: %s (%s)", name, mac);
+            should_remove = TRUE;
+        }
+
+        // Also check for our service characteristic
+        Characteristic * our_char = binc_device_get_characteristic(device, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID);
+        if (our_char != NULL) {
+            should_remove = TRUE;
+        }
+
+        if (should_remove) {
+            log_debug(BT_TAG, "Removing cached device: %s (%s)", name ? name : "(null)", mac);
             binc_adapter_remove_device(manager->adapter, device);
             remove_count++;
         }

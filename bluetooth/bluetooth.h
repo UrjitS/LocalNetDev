@@ -40,6 +40,9 @@ typedef struct {
     uint64_t last_seen;
     uint64_t last_connect_attempt;
     uint64_t last_disconnect_time;
+    uint64_t connection_start_time;  // When the current connection was established
+    guint rapid_disconnect_count;  // Track rapid connect/disconnect cycles (ghost connections)
+    uint64_t first_rapid_disconnect_time;  // When the rapid disconnect pattern started
 } tracked_device_t;
 
 // BLE Node Manager
