@@ -162,16 +162,22 @@ static void connect_to_device(tracked_device_t * tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
     if (tracked->is_connected || tracked->is_connecting) return;
 
-    // Check if the device is in a stale bonded state - if so, we need to remove it and wait for rediscovery
+    // Check if the device is in a bonded state - this causes connection issues
     BondingState bond_state = binc_device_get_bonding_state(tracked->device);
-    log_debug(BT_TAG, "Device 0x%08X bonding state: %d (BONDED=%d, NONE=%d)",
-        tracked->device_id, bond_state, BINC_BONDED, BINC_BOND_NONE);
 
     if (bond_state == BINC_BONDED) {
-        log_info(BT_TAG, "Device 0x%08X is in bonded state, removing to get fresh connection", tracked->device_id);
+        log_info(BT_TAG, "Device 0x%08X is bonded, removing to prevent connection issues", tracked->device_id);
+
+        // Remove the device entirely - this should clear bonding
         binc_adapter_remove_device(g_manager->adapter, tracked->device);
+
+        // Clear our tracking
         tracked->device = NULL;
+        tracked->is_connecting = FALSE;
+        tracked->is_connected = FALSE;
         tracked->last_connect_attempt = get_current_timestamp();
+
+        // Device will be rediscovered and we can try connecting again
         return;
     }
 
@@ -181,8 +187,7 @@ static void connect_to_device(tracked_device_t * tracked) {
     tracked->is_connecting = TRUE;
     tracked->last_connect_attempt = get_current_timestamp();
 
-    // Only stop advertising before connecting (keep discovery running to find other devices)
-    log_debug(BT_TAG, "Stopping advertising before connection attempt");
+    // Stop advertising before connecting (keep discovery running)
     stop_advertising();
 
     // Set up callbacks before connecting 
@@ -644,15 +649,12 @@ static void on_write_characteristic(Device * device, Characteristic * characteri
 static void on_remote_central_connected(Adapter * adapter, Device * device) {
     if (!g_manager || !device) return;
 
-    // Verify this is actually a connected device, not just a cached entry
-    ConnectionState conn_state = binc_device_get_connection_state(device);
-    if (conn_state != BINC_CONNECTED) {
-        log_debug(BT_TAG, "Ignoring non-connected device callback (state: %d)", conn_state);
-        return;
-    }
-
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
+
+    // Log all connection attempts for debugging
+    log_debug(BT_TAG, "on_remote_central_connected called for %s (%s)",
+        name ? name : "unknown", mac ? mac : "unknown");
 
     // Identify the device - only trust LOCALNET names or previously discovered devices
     uint32_t device_id = 0;
@@ -665,18 +667,15 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
             device_id = existing->device_id;
             log_debug(BT_TAG, "Found existing device 0x%08X by MAC %s", device_id, mac);
         } else {
-            // Don't create a new entry with MAC-derived ID - wait for proper identification
-            // The device will be properly identified when it writes to our characteristic
-            log_debug(BT_TAG, "Unknown device connected: %s (%s) - waiting for identification via characteristic write",
-                name ? name : "unknown", mac);
-            // Still set up the connection state callback so we know when it disconnects
+            // Don't create a new entry - wait for proper identification via characteristic write
+            log_debug(BT_TAG, "Unknown device connected - waiting for identification");
             binc_device_set_connection_state_change_cb(device, &on_connection_state_changed);
             return;
         }
     }
 
     if (device_id == 0) {
-        log_info(BT_TAG, "Non-LocalNet device connected: %s", mac);
+        log_debug(BT_TAG, "Non-LocalNet device connected: %s", mac);
         return;
     }
 
@@ -684,22 +683,27 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
     tracked_device_t * existing_tracked = find_device_by_id(device_id);
     if (existing_tracked) {
         const uint64_t now = get_current_timestamp();
+
+        // Strong debounce - ignore reconnections within 5 seconds of disconnect
         if (existing_tracked->last_disconnect_time > 0 &&
-            (now - existing_tracked->last_disconnect_time < 3)) {
-            log_debug(BT_TAG, "Ignoring spurious reconnection from 0x%08X", device_id);
+            (now - existing_tracked->last_disconnect_time < 5)) {
+            log_info(BT_TAG, "Ignoring reconnection from 0x%08X (disconnected %lu seconds ago)",
+                device_id, (unsigned long)(now - existing_tracked->last_disconnect_time));
+            // Immediately disconnect this ghost connection
+            binc_device_disconnect(device);
             return;
         }
 
         // If we're currently trying to connect to this device, cancel our attempt
-        // Their connection wins - they connected to us first
         if (existing_tracked->is_connecting) {
-            log_info(BT_TAG, "Device 0x%08X connected to us while we were connecting to them - accepting their connection", device_id);
+            log_info(BT_TAG, "Device 0x%08X connected to us while we were connecting - accepting theirs", device_id);
             existing_tracked->is_connecting = FALSE;
         }
 
-        // If already connected, ignore (might be a duplicate callback)
+        // If already connected, this might be a duplicate - disconnect and ignore
         if (existing_tracked->is_connected) {
-            log_debug(BT_TAG, "Device 0x%08X already connected, ignoring duplicate callback", device_id);
+            log_warn(BT_TAG, "Device 0x%08X already connected, rejecting duplicate connection", device_id);
+            binc_device_disconnect(device);
             return;
         }
     }
@@ -903,7 +907,7 @@ ble_node_manager_t* ble_init(struct mesh_node * mesh_node, uint32_t device_id, b
 gboolean ble_start(ble_node_manager_t * manager) {
     if (!manager) return FALSE;
 
-    log_debug(BT_TAG, "Starting BLE node manager");
+    log_info(BT_TAG, "Starting BLE node manager");
 
     // Get DBus connection
     GDBusConnection * dbus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
@@ -922,53 +926,61 @@ gboolean ble_start(ble_node_manager_t * manager) {
 
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
-    // IMPORTANT: Clean up any cached LocalNet devices BEFORE registering any callbacks
-    // This prevents ghost connection events from cached devices
-    log_info(BT_TAG, "Cleaning up cached LocalNet devices from previous sessions...");
+    // CRITICAL: Aggressively clean up any cached LocalNet devices BEFORE registering callbacks
+    log_info(BT_TAG, "Performing aggressive cleanup of cached LocalNet devices...");
 
-    // First pass: disconnect any connected devices
+    // Pass 1: Force disconnect all LocalNet devices
     GList * existing_devices = binc_adapter_get_devices(manager->adapter);
+    guint disconnect_count = 0;
     for (const GList * it = existing_devices; it != NULL; it = it->next) {
         Device * device = it->data;
         const char * name = binc_device_get_name(device);
         if (is_localnet_device(name)) {
             ConnectionState conn_state = binc_device_get_connection_state(device);
-            if (conn_state == BINC_CONNECTED || conn_state == BINC_CONNECTING) {
-                log_debug(BT_TAG, "Disconnecting cached device: %s", name);
-                binc_device_disconnect(device);
-            }
+            log_debug(BT_TAG, "Found cached LocalNet device: %s (state: %d)", name, conn_state);
+
+            // Always try to disconnect, regardless of reported state
+            binc_device_disconnect(device);
+            disconnect_count++;
         }
     }
     g_list_free(existing_devices);
 
-    // Small delay to let disconnections complete
-    g_usleep(100000);  // 100ms
+    if (disconnect_count > 0) {
+        log_debug(BT_TAG, "Waiting for %u disconnections to complete...", disconnect_count);
+        g_usleep(500000);  // 500ms - longer delay for disconnections
+    }
 
-    // Second pass: remove all LocalNet devices from cache
+    // Pass 2: Remove all LocalNet devices from BlueZ cache
     existing_devices = binc_adapter_get_devices(manager->adapter);
+    guint remove_count = 0;
     for (const GList * it = existing_devices; it != NULL; it = it->next) {
         Device * device = it->data;
         const char * name = binc_device_get_name(device);
+        const char * mac = binc_device_get_address(device);
+
         if (is_localnet_device(name)) {
-            log_debug(BT_TAG, "Removing cached device: %s", name);
+            log_debug(BT_TAG, "Removing cached device: %s (%s)", name, mac);
             binc_adapter_remove_device(manager->adapter, device);
+            remove_count++;
         }
     }
     g_list_free(existing_devices);
 
-    // Another small delay to let removals complete
-    g_usleep(100000);  // 100ms
+    if (remove_count > 0) {
+        log_debug(BT_TAG, "Waiting for %u device removals to complete...", remove_count);
+        g_usleep(500000);  // 500ms - longer delay for removals
+    }
 
-    log_debug(BT_TAG, "Cached device cleanup complete");
+    log_info(BT_TAG, "Cleanup complete - disconnected %u, removed %u devices", disconnect_count, remove_count);
 
-    // Create agent for pairing
+    // Create agent for pairing (JustWorks - no bonding)
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
 
     // Setup GATT application
     manager->app = binc_create_application(manager->adapter);
     binc_application_add_service(manager->app, LOCAL_NET_SERVICE_UUID);
-    // Add WRITE_WITHOUT_RESP to avoid authorization delays
     binc_application_add_characteristic(manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID,
         GATT_CHR_PROP_READ | GATT_CHR_PROP_WRITE | GATT_CHR_PROP_WRITE_WITHOUT_RESP | GATT_CHR_PROP_NOTIFY);
     binc_application_add_characteristic(manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_CTRL_CHAR_UUID,
@@ -988,7 +1000,7 @@ gboolean ble_start(ble_node_manager_t * manager) {
     start_advertising();
     start_discovery();
 
-    log_debug(BT_TAG, "BLE node manager started successfully");
+    log_info(BT_TAG, "BLE node manager started successfully");
     return TRUE;
 }
 
