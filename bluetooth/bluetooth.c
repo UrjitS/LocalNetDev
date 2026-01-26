@@ -16,7 +16,7 @@
 #define RECONNECT_DELAY_MS 5000
 #define PROTOCOL_VERSION 1
 
-static ble_node_manager_t *g_manager = NULL;
+static ble_node_manager_t * g_manager = NULL;
 
 
 static void on_scan_result(Adapter *adapter, Device *device);
@@ -26,7 +26,7 @@ static void on_services_resolved(Device *device);
 static void on_notify(Device *device, Characteristic *characteristic, const GByteArray *byteArray);
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error);
 static void on_remote_central_connected(Adapter *adapter, Device *device);
-static gboolean on_request_authorization(Device *device);
+static gboolean on_request_authorization(const Device *device);
 static const char* on_local_char_read(const Application *app, const char *address, const char* service_uuid, const char* char_uuid, guint16 offset, guint16 mtu);
 static const char* on_local_char_write(const Application *app, const char *address, const char *service_uuid, const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
 
@@ -150,7 +150,7 @@ static void connect_to_device(tracked_device_t *tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
     if (tracked->is_connected) return;
 
-    log_debug(BT_TAG, "Connecting to device 0x%08X", tracked->device_id);
+    log_info(BT_TAG, "Connecting to device 0x%08X", tracked->device_id);
 
     /* Stop advertising and discovery before connecting to avoid conflicts */
     log_debug(BT_TAG, "Stopping advertising before connection attempt");
@@ -284,7 +284,7 @@ static gboolean heartbeat_callback(gpointer user_data) {
         g_byte_array_free(data, TRUE);
     }
 
-    log_debug(BT_TAG, "Heartbeat sent to %u connected nodes", connected - timed_out);
+    log_info(BT_TAG, "Heartbeat sent to %u connected nodes", connected - timed_out);
     return TRUE;
 }
 
@@ -301,7 +301,7 @@ static void on_discovery_state_changed(Adapter *adapter, DiscoveryState state, c
 }
 
 /* Scan result callback */
-static void on_scan_result(Adapter *adapter, Device *device) {
+static void on_scan_result(Adapter * adapter, Device *device) {
     if (!g_manager || !device) return;
 
     const char *name = binc_device_get_name(device);
@@ -309,10 +309,10 @@ static void on_scan_result(Adapter *adapter, Device *device) {
 
     if (!is_localnet_device(name)) return;
 
-    uint32_t device_id = extract_device_id_from_name(name);
+    const uint32_t device_id = extract_device_id_from_name(name);
     if (device_id == 0 || device_id == g_manager->device_id) return;
 
-    int16_t rssi = binc_device_get_rssi(device);
+    const int16_t rssi = binc_device_get_rssi(device);
 
     /* Check if already connected */
     tracked_device_t *tracked = find_device_by_id(device_id);
@@ -322,7 +322,7 @@ static void on_scan_result(Adapter *adapter, Device *device) {
         return;  /* Already connected, just update RSSI */
     }
 
-    log_debug(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
+    log_info(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
 
     /* Add or update device */
     tracked = add_device(device_id, mac, device);
@@ -452,7 +452,7 @@ static void on_notify(Device *device, Characteristic *characteristic, const GByt
     if (hdr.message_type == MSG_HEARTBEAT) {
         struct heartbeat hb;
         if (parse_heartbeat(byteArray->data + 16, byteArray->len - 16, &hb) == 0) {
-            log_debug(BT_TAG, "Received heartbeat from 0x%08X (status: %u, connections: %u)",
+            log_info(BT_TAG, "Received heartbeat from 0x%08X (status: %u, connections: %u)",
                      net.source_id, hb.device_status, hb.active_connection_number);
 
             /* Update mesh node connection info if available */
@@ -469,7 +469,7 @@ static void on_notify(Device *device, Characteristic *characteristic, const GByt
 /* Write callback */
 static void on_write_characteristic(Device *device, Characteristic *characteristic, const GByteArray *byteArray, const GError *error) {
     if (error) {
-        tracked_device_t *tracked = find_device_by_ptr(device);
+        const tracked_device_t *tracked = find_device_by_ptr(device);
         log_error(BT_TAG, "Write characteristic error for 0x%08X: %s",
                   tracked ? tracked->device_id : 0, error->message);
     }
@@ -492,7 +492,7 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
     }
 
     if (device_id == 0) {
-        log_debug(BT_TAG, "Non-LocalNet device connected as central: %s", mac);
+        log_info(BT_TAG, "Non-LocalNet device connected as central: %s", mac);
         return;
     }
 
@@ -517,10 +517,10 @@ static void on_remote_central_connected(Adapter *adapter, Device *device) {
 }
 
 /* Authorization callback */
-static gboolean on_request_authorization(Device *device) {
+static gboolean on_request_authorization(const Device * device) {
     const char *name = binc_device_get_name(device);
-    log_debug(BT_TAG, "Authorizing device: %s", name ? name : "unknown");
-    return TRUE;  /* Auto-accept (JustWorks) */
+    log_info(BT_TAG, "Authorizing device: %s", name ? name : "unknown");
+    return TRUE;
 }
 
 /* Local characteristic read callback */
@@ -569,8 +569,7 @@ static const char* on_local_char_write(const Application *app, const char *addre
         device_id = tracked->device_id;
     }
 
-    log_debug(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes",
-              address, device_id, byteArray->len);
+    log_info(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes", address, device_id, byteArray->len);
 
     /* Parse message using protocol functions */
     struct header hdr;
@@ -589,7 +588,7 @@ static const char* on_local_char_write(const Application *app, const char *addre
     if (hdr.message_type == MSG_HEARTBEAT) {
         struct heartbeat hb;
         if (parse_heartbeat(byteArray->data + 16, byteArray->len - 16, &hb) == 0) {
-            log_debug(BT_TAG, "Received heartbeat from 0x%08X", net.source_id);
+            log_info(BT_TAG, "Received heartbeat from 0x%08X", net.source_id);
             /* Update device ID if we got it from the packet */
             if (tracked && tracked->device_id == 0 && net.source_id != 0) {
                 tracked->device_id = net.source_id;
