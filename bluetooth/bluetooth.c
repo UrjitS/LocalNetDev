@@ -644,6 +644,13 @@ static void on_write_characteristic(Device * device, Characteristic * characteri
 static void on_remote_central_connected(Adapter * adapter, Device * device) {
     if (!g_manager || !device) return;
 
+    // Verify this is actually a connected device, not just a cached entry
+    ConnectionState conn_state = binc_device_get_connection_state(device);
+    if (conn_state != BINC_CONNECTED) {
+        log_debug(BT_TAG, "Ignoring non-connected device callback (state: %d)", conn_state);
+        return;
+    }
+
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
 
@@ -915,24 +922,44 @@ gboolean ble_start(ble_node_manager_t * manager) {
 
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
-    // Clean up any cached LocalNet devices from previous sessions
-    // This includes removing bonding information to ensure fresh connections
-    log_debug(BT_TAG, "Cleaning up stale LocalNet devices from previous session");
+    // IMPORTANT: Clean up any cached LocalNet devices BEFORE registering any callbacks
+    // This prevents ghost connection events from cached devices
+    log_info(BT_TAG, "Cleaning up cached LocalNet devices from previous sessions...");
+
+    // First pass: disconnect any connected devices
     GList * existing_devices = binc_adapter_get_devices(manager->adapter);
     for (const GList * it = existing_devices; it != NULL; it = it->next) {
         Device * device = it->data;
         const char * name = binc_device_get_name(device);
         if (is_localnet_device(name)) {
-            log_debug(BT_TAG, "Removing stale cached device: %s (bonded: %d)", name,
-                binc_device_get_bonding_state(device) == BINC_BONDED);
-            // Disconnect if connected
-            if (binc_device_get_connection_state(device) == BINC_CONNECTED) {
+            ConnectionState conn_state = binc_device_get_connection_state(device);
+            if (conn_state == BINC_CONNECTED || conn_state == BINC_CONNECTING) {
+                log_debug(BT_TAG, "Disconnecting cached device: %s", name);
                 binc_device_disconnect(device);
             }
+        }
+    }
+    g_list_free(existing_devices);
+
+    // Small delay to let disconnections complete
+    g_usleep(100000);  // 100ms
+
+    // Second pass: remove all LocalNet devices from cache
+    existing_devices = binc_adapter_get_devices(manager->adapter);
+    for (const GList * it = existing_devices; it != NULL; it = it->next) {
+        Device * device = it->data;
+        const char * name = binc_device_get_name(device);
+        if (is_localnet_device(name)) {
+            log_debug(BT_TAG, "Removing cached device: %s", name);
             binc_adapter_remove_device(manager->adapter, device);
         }
     }
     g_list_free(existing_devices);
+
+    // Another small delay to let removals complete
+    g_usleep(100000);  // 100ms
+
+    log_debug(BT_TAG, "Cached device cleanup complete");
 
     // Create agent for pairing
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
@@ -950,7 +977,7 @@ gboolean ble_start(ble_node_manager_t * manager) {
     binc_application_set_char_write_cb(manager->app, &on_local_char_write);
     binc_adapter_register_application(manager->adapter, manager->app);
 
-    // Setup discovery callbacks
+    // Setup discovery callbacks AFTER cleanup
     binc_adapter_set_discovery_cb(manager->adapter, &on_scan_result);
     binc_adapter_set_discovery_state_cb(manager->adapter, &on_discovery_state_changed);
     binc_adapter_set_remote_central_cb(manager->adapter, &on_remote_central_connected);
@@ -971,35 +998,49 @@ void ble_stop(ble_node_manager_t * manager) {
     log_debug(BT_TAG, "Stopping BLE node manager");
     manager->running = FALSE;
 
-    // Stop discovery and advertising
+    // Stop discovery and advertising first
     stop_discovery();
     stop_advertising();
 
-    // Disconnect all connections
+    // Disconnect all connections we initiated
     for (guint i = 0; i < manager->discovered_count; i++) {
-        const tracked_device_t * tracked = &manager->discovered_devices[i];
+        tracked_device_t * tracked = &manager->discovered_devices[i];
         if (tracked->is_connected && tracked->device && tracked->we_initiated) {
+            log_debug(BT_TAG, "Disconnecting from 0x%08X", tracked->device_id);
             binc_device_disconnect(tracked->device);
+            tracked->is_connected = FALSE;
+            tracked->device = NULL;
         }
     }
 
+    // Small delay to let disconnections complete
+    g_usleep(100000);  // 100ms
+
     // Remove all cached LocalNet devices from BlueZ to prevent ghost connections on restart
     if (manager->adapter) {
-        log_debug(BT_TAG, "Removing cached LocalNet devices from BlueZ...");
+        log_debug(BT_TAG, "Removing all cached LocalNet devices from BlueZ...");
         GList * devices = binc_adapter_get_devices(manager->adapter);
         for (const GList * it = devices; it != NULL; it = it->next) {
             Device * device = it->data;
             const char * name = binc_device_get_name(device);
             if (is_localnet_device(name)) {
                 log_debug(BT_TAG, "Removing cached device: %s", name);
+                // Disconnect if still connected
+                if (binc_device_get_connection_state(device) == BINC_CONNECTED) {
+                    binc_device_disconnect(device);
+                }
                 binc_adapter_remove_device(manager->adapter, device);
             }
         }
         g_list_free(devices);
     }
 
+    // Small delay to let removals complete
+    g_usleep(100000);  // 100ms
+
     // Unregister GATT application before freeing
     if (manager->app && manager->adapter) {
+        log_debug(BT_TAG, "Unregistering GATT application");
         binc_adapter_unregister_application(manager->adapter, manager->app);
     }
 
@@ -1033,6 +1074,8 @@ void ble_stop(ble_node_manager_t * manager) {
         g_object_unref(manager->dbus_connection);
         manager->dbus_connection = NULL;
     }
+
+    log_debug(BT_TAG, "BLE node manager stopped");
 }
 
 void ble_cleanup(ble_node_manager_t * manager) {
