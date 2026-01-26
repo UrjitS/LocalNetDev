@@ -74,13 +74,29 @@ static tracked_device_t * find_device_by_ptr(Device * device) {
 static tracked_device_t * add_device(const uint32_t device_id, const char * mac, Device * device) {
     if (!g_manager || g_manager->discovered_count >= MAX_DISCOVERED_DEVICES) return NULL;
 
-    // Check if already exists 
+    // Check if already exists by device ID
     tracked_device_t * existing = find_device_by_id(device_id);
     if (existing) {
         if (device) existing->device = device;
-        if (mac) strncpy(existing->mac_address, mac, sizeof(existing->mac_address) - 1);
+        if (mac && mac[0] != '\0') strncpy(existing->mac_address, mac, sizeof(existing->mac_address) - 1);
         existing->last_seen = get_current_timestamp();
         return existing;
+    }
+
+    // Also check by MAC address to prevent duplicates when ID changes
+    if (mac && mac[0] != '\0') {
+        existing = find_device_by_mac(mac);
+        if (existing) {
+            // Update the device ID if we have a better one (non-zero)
+            if (device_id != 0 && existing->device_id != device_id) {
+                log_debug(BT_TAG, "Updating device ID for %s from 0x%08X to 0x%08X",
+                    mac, existing->device_id, device_id);
+                existing->device_id = device_id;
+            }
+            if (device) existing->device = device;
+            existing->last_seen = get_current_timestamp();
+            return existing;
+        }
     }
 
     tracked_device_t * tracked = &g_manager->discovered_devices[g_manager->discovered_count++];
@@ -199,12 +215,17 @@ static gboolean heartbeat_callback(gpointer user_data) {
         if (now - tracked->last_heartbeat > HEARTBEAT_TIMEOUT_SECONDS) {
             log_info(BT_TAG, "Heartbeat timeout: disconnecting 0x%08X", tracked->device_id);
             tracked->is_connected = FALSE;
+            tracked->is_connecting = FALSE;
             timed_out++;
 
             // Disconnect the device 
             if (tracked->device && tracked->we_initiated) {
                 binc_device_disconnect(tracked->device);
             }
+
+            // Clear the device pointer - it will be set again when rediscovered
+            tracked->device = NULL;
+            tracked->last_disconnect_time = now;
 
             if (g_manager->disconnected_callback) {
                 g_manager->disconnected_callback(tracked->device_id);
@@ -626,17 +647,24 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
 
-    // Identify the device
+    // Identify the device - only trust LOCALNET names or previously discovered devices
     uint32_t device_id = 0;
     if (is_localnet_device(name)) {
         device_id = extract_device_id_from_name(name);
     } else {
-        // Try to find by MAC first in case we already discovered this device
+        // Try to find by MAC - we might have discovered this device via scanning
         tracked_device_t * existing = find_device_by_mac(mac);
         if (existing && existing->device_id != 0) {
             device_id = existing->device_id;
+            log_debug(BT_TAG, "Found existing device 0x%08X by MAC %s", device_id, mac);
         } else {
-            device_id = mac_to_device_id(mac);
+            // Don't create a new entry with MAC-derived ID - wait for proper identification
+            // The device will be properly identified when it writes to our characteristic
+            log_debug(BT_TAG, "Unknown device connected: %s (%s) - waiting for identification via characteristic write",
+                name ? name : "unknown", mac);
+            // Still set up the connection state callback so we know when it disconnects
+            binc_device_set_connection_state_change_cb(device, &on_connection_state_changed);
+            return;
         }
     }
 
@@ -724,22 +752,10 @@ static const char* on_local_char_read(const Application * app, const char * addr
 
     if (g_str_equal(service_uuid, LOCAL_NET_SERVICE_UUID)) {
         if (g_str_equal(char_uuid, LOCAL_NET_DATA_CHAR_UUID)) {
-            // Track this connection if we don't already know about it
+            // Only update tracking if we already know about this device (from scanning or prior writes)
+            // Don't create new entries here since we don't know the real device ID from a read
             tracked_device_t * tracked = find_device_by_mac(address);
-            if (!tracked) {
-                uint32_t device_id = mac_to_device_id(address);
-                tracked = add_device(device_id, address, NULL);
-                if (tracked) {
-                    tracked->is_connected = TRUE;
-                    tracked->we_initiated = FALSE;
-                    tracked->last_heartbeat = get_current_timestamp();
-                    log_info(BT_TAG, "Detected incoming connection from %s (ID: 0x%08X) via characteristic read", address, device_id);
-
-                    if (g_manager->connected_callback) {
-                        g_manager->connected_callback(device_id);
-                    }
-                }
-            } else if (!tracked->is_connected) {
+            if (tracked && !tracked->is_connected) {
                 tracked->is_connected = TRUE;
                 tracked->we_initiated = FALSE;
                 tracked->last_heartbeat = get_current_timestamp();
@@ -748,6 +764,9 @@ static const char* on_local_char_read(const Application * app, const char * addr
                 if (g_manager->connected_callback) {
                     g_manager->connected_callback(tracked->device_id);
                 }
+            } else if (!tracked) {
+                // Unknown device reading our characteristic - they'll identify themselves when they write
+                log_debug(BT_TAG, "Unknown device %s reading characteristic - waiting for write to identify", address);
             }
 
             GByteArray * empty = g_byte_array_new();
@@ -773,34 +792,7 @@ static const char * on_local_char_write(const Application * app, const char * ad
 
     if (!byteArray || byteArray->len == 0) return NULL;
 
-    // Find/Create tracked device
-    uint32_t device_id = mac_to_device_id(address);
-    tracked_device_t * tracked = find_device_by_mac(address);
-    gboolean is_new_connection = FALSE;
-
-    if (!tracked) {
-        tracked = add_device(device_id, address, NULL);
-        is_new_connection = TRUE;
-    } else if (!tracked->is_connected) {
-        is_new_connection = TRUE;
-    }
-
-    if (tracked) {
-        tracked->last_heartbeat = get_current_timestamp();
-        if (!tracked->is_connected) {
-            tracked->is_connected = TRUE;
-            tracked->we_initiated = FALSE;
-        }
-        device_id = tracked->device_id;
-    }
-
-    if (is_new_connection && g_manager->connected_callback) {
-        log_info(BT_TAG, "Detected incoming connection from %s (ID: 0x%08X) via characteristic write", address, device_id);
-        g_manager->connected_callback(device_id);
-    }
-
-    log_debug(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes", address, device_id, byteArray->len);
-
+    // Parse the packet first to get the real device ID from the source
     struct header header;
     struct network network;
     if (parse_header(byteArray->data, byteArray->len, &header) != 0) {
@@ -813,14 +805,59 @@ static const char * on_local_char_write(const Application * app, const char * ad
         return NULL;
     }
 
+    // Use the source_id from the packet as the authoritative device ID
+    uint32_t device_id = network.source_id;
+    if (device_id == 0) {
+        // Fallback to MAC-derived ID if source_id is not set
+        device_id = mac_to_device_id(address);
+    }
+
+    // Find tracked device - first by ID, then by MAC
+    tracked_device_t * tracked = find_device_by_id(device_id);
+    if (!tracked) {
+        tracked = find_device_by_mac(address);
+    }
+
+    gboolean is_new_connection = FALSE;
+
+    if (!tracked) {
+        tracked = add_device(device_id, address, NULL);
+        is_new_connection = TRUE;
+    } else {
+        // Update device ID if we had a placeholder/wrong ID from MAC
+        if (tracked->device_id != device_id && device_id != 0) {
+            log_debug(BT_TAG, "Updating device ID from 0x%08X to 0x%08X", tracked->device_id, device_id);
+            tracked->device_id = device_id;
+        }
+        if (!tracked->is_connected) {
+            is_new_connection = TRUE;
+        }
+    }
+
+    if (tracked) {
+        tracked->last_heartbeat = get_current_timestamp();
+        if (!tracked->is_connected) {
+            tracked->is_connected = TRUE;
+            tracked->we_initiated = FALSE;
+        }
+        // Update MAC if we didn't have it
+        if (address && tracked->mac_address[0] == '\0') {
+            strncpy(tracked->mac_address, address, sizeof(tracked->mac_address) - 1);
+        }
+    }
+
+    if (is_new_connection && g_manager->connected_callback) {
+        log_info(BT_TAG, "Detected incoming connection from %s (ID: 0x%08X) via characteristic write", address, device_id);
+        g_manager->connected_callback(device_id);
+    }
+
+    log_debug(BT_TAG, "Received write from %s (ID: 0x%08X): %u bytes", address, device_id, byteArray->len);
+
     if (header.message_type == MSG_HEARTBEAT) {
         struct heartbeat heartbeat;
         if (parse_heartbeat(byteArray->data + 16, byteArray->len - 16, &heartbeat) == 0) {
             log_info(BT_TAG, "Received heartbeat from 0x%08X", network.source_id);
 
-            if (tracked && tracked->device_id == 0 && network.source_id != 0) {
-                tracked->device_id = network.source_id;
-            }
 
             if (g_manager->mesh_node && g_manager->mesh_node->connection_table) {
                 reset_missed_heartbeats(g_manager->mesh_node->connection_table, network.source_id);

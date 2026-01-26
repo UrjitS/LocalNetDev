@@ -43,7 +43,9 @@ uint32_t mac_to_device_id(const char *mac) {
         }
     }
 
-    return ((uint32_t)bytes[3] << 16) |
+    // Use last 4 bytes of MAC for 32-bit device ID
+    return ((uint32_t)bytes[2] << 24) |
+           ((uint32_t)bytes[3] << 16) |
            ((uint32_t)bytes[4] << 8)  |
            ((uint32_t)bytes[5]);
 }
