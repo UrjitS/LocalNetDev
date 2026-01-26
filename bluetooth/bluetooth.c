@@ -170,8 +170,15 @@ static void stop_discovery(void) {
 
 // Connect to a device 
 static void connect_to_device(tracked_device_t * tracked) {
-    if (!g_manager || !tracked || !tracked->device) return;
-    if (tracked->is_connected || tracked->is_connecting) return;
+    if (!g_manager || !tracked) return;
+    if (!tracked->device) {
+        log_debug(BT_TAG, "Cannot connect to 0x%08X - no device pointer", tracked->device_id);
+        return;
+    }
+    if (tracked->is_connected || tracked->is_connecting) {
+        log_debug(BT_TAG, "Cannot connect to 0x%08X - already connected/connecting", tracked->device_id);
+        return;
+    }
 
     // Check if the device is in a bonded state - this causes connection issues
     BondingState bond_state = binc_device_get_bonding_state(tracked->device);
@@ -412,7 +419,10 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     }
 
     // Rate limit connection attempts for this specific device
-    if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) {
+    // Handle case where last_connect_attempt might be in the future (after stuck connection cleanup)
+    if (tracked->last_connect_attempt > now ||
+        (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS)) {
+        log_debug(BT_TAG, "Rate limiting connection to 0x%08X", device_id);
         return;
     }
 
@@ -429,7 +439,9 @@ static void on_scan_result(Adapter * adapter, Device * device) {
 
     // Decide if we should initiate connection
     gboolean we_have_priority = (g_manager->device_id < device_id);
-    gboolean they_are_slow = (now - tracked->last_seen > 10);
+    // Wait longer (20 seconds) before initiating connection if we don't have priority
+    // This gives the higher priority device time to connect first
+    gboolean they_are_slow = (now - tracked->last_seen > 20);
 
     if (already_connecting) {
         // Don't initiate new connection, but device is tracked for later
@@ -556,13 +568,18 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
             if (now - tracked->last_connect_attempt > 15) {
                 log_warn(BT_TAG, "Connection to 0x%08X stuck for 15+ seconds, canceling", tracked->device_id);
                 tracked->is_connecting = FALSE;
+
+                // Just remove the device from BlueZ cache - don't try to disconnect
+                // a device that's stuck in connecting state as it may crash
                 if (tracked->device) {
-                    binc_device_disconnect(tracked->device);
                     binc_adapter_remove_device(g_manager->adapter, tracked->device);
                     tracked->device = NULL;
                 }
-                // Allow retry after reconnect delay
-                tracked->last_connect_attempt = now;
+
+                // Set last_seen to 0 to force fresh discovery
+                tracked->last_seen = 0;
+                // Add longer cooldown (10 seconds) after canceling stuck connection
+                tracked->last_connect_attempt = now + 5;  // Will need to wait extra 5 + RECONNECT_DELAY seconds
             } else {
                 already_connecting = TRUE;
             }
@@ -582,8 +599,11 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
         if (tracked->device_id == 0) continue;
         if (tracked->is_connected) continue;
 
-        // Check rate limiting
-        if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) continue;
+        // Check rate limiting - handle case where last_connect_attempt might be in the future
+        if (tracked->last_connect_attempt > now ||
+            (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS)) {
+            continue;
+        }
 
         // We need a valid device pointer to connect
         if (!tracked->device) {
@@ -606,9 +626,9 @@ static gboolean check_pending_connections_idle(gpointer user_data) {
         }
 
         // Priority logic: connect to devices where we have lower ID first
-        // Also connect to higher priority devices if they haven't connected to us after 15+ seconds
+        // Also connect to higher priority devices if they haven't connected to us after 20+ seconds
         gboolean we_have_priority = (g_manager->device_id < tracked->device_id);
-        gboolean they_are_slow = (tracked->last_seen > 0 && (now - tracked->last_seen > 15));
+        gboolean they_are_slow = (tracked->last_seen > 0 && (now - tracked->last_seen > 20));
 
         if (we_have_priority || they_are_slow) {
             log_info(BT_TAG, "Initiating pending connection to 0x%08X (priority: %s, slow: %s)",
