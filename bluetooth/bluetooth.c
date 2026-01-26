@@ -24,6 +24,7 @@ static void on_remote_central_connected(Adapter * adapter, Device * device);
 static gboolean on_request_authorization(Device * device);
 static const char* on_local_char_read(const Application * app, const char * address, const char * service_uuid, const char * char_uuid, guint16 offset, guint16 mtu);
 static const char* on_local_char_write(const Application * app, const char * address, const char * service_uuid, const char * char_uuid, GByteArray * byteArray, guint16 offset, guint16 mtu);
+static gboolean check_pending_connections_idle(gpointer user_data);
 
 // Utility functions
 static uint32_t extract_device_id_from_name(const char * name) {
@@ -155,7 +156,6 @@ static void connect_to_device(tracked_device_t * tracked) {
         binc_adapter_remove_device(g_manager->adapter, tracked->device);
         tracked->device = NULL;
         tracked->last_connect_attempt = get_current_timestamp();
-        // Device will be rediscovered and we'll try again
         return;
     }
 
@@ -165,11 +165,9 @@ static void connect_to_device(tracked_device_t * tracked) {
     tracked->is_connecting = TRUE;
     tracked->last_connect_attempt = get_current_timestamp();
 
-    // Stop advertising and discovery before connecting to avoid conflicts
+    // Only stop advertising before connecting (keep discovery running to find other devices)
     log_debug(BT_TAG, "Stopping advertising before connection attempt");
     stop_advertising();
-    log_debug(BT_TAG, "Stopping discovery before connection attempt");
-    stop_discovery();
 
     // Set up callbacks before connecting 
     binc_device_set_connection_state_change_cb(tracked->device, &on_connection_state_changed);
@@ -295,6 +293,19 @@ static gboolean heartbeat_callback(gpointer user_data) {
     }
 
     log_info(BT_TAG, "Heartbeat sent to %u connected nodes", connected - timed_out);
+
+    // Periodically restart discovery to ensure we're actively scanning
+    // This helps work around BLE stack issues where discovery might stall
+    static guint heartbeat_count = 0;
+    heartbeat_count++;
+    if (heartbeat_count % 3 == 0) {  // Every 30 seconds (3 heartbeats)
+        log_debug(BT_TAG, "Periodic discovery restart");
+        start_discovery();
+    }
+
+    // Also check for pending connections we should initiate
+    g_timeout_add(100, check_pending_connections_idle, NULL);
+
     return TRUE;
 }
 
@@ -308,7 +319,11 @@ static void on_discovery_state_changed(Adapter * adapter, DiscoveryState state, 
         case BINC_DISCOVERY_STOPPED: state_name = "STOPPED"; break;
         case BINC_DISCOVERY_STOPPING: state_name = "STOPPING"; break;
     }
-    log_info(BT_TAG, "Discovery state changed to %s", state_name);
+    if (error) {
+        log_error(BT_TAG, "Discovery state changed to %s (error: %s)", state_name, error->message);
+    } else {
+        log_info(BT_TAG, "Discovery state changed to %s", state_name);
+    }
 }
 
 // Scan result callback
@@ -327,42 +342,42 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     const int16_t rssi = binc_device_get_rssi(device);
     const uint64_t now = get_current_timestamp();
 
-    // Check if already connected or connecting
+    // Check if we already know this device
     tracked_device_t * tracked = find_device_by_id(device_id);
     if (tracked) {
         tracked->rssi = rssi;
         tracked->last_seen = now;
         // Update device pointer in case it changed
-        if (device) tracked->device = device;
+        tracked->device = device;
 
-        // If already connected or currently connecting, skip
+        // If already connected or currently connecting, just update and return
         if (tracked->is_connected || tracked->is_connecting) {
             return;
         }
+    } else {
+        // New device - log discovery and add to tracking
+        log_info(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
+        tracked = add_device(device_id, mac, device);
+        if (!tracked) return;
+        tracked->rssi = rssi;
 
-        // Rate limit reconnection attempts
-        if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) {
-            return;
+        // Call discovery callback for new devices
+        if (g_manager->discovered_callback) {
+            g_manager->discovered_callback(device_id, rssi);
         }
     }
 
-    log_info(BT_TAG, "Discovered LocalNet node: 0x%08X (RSSI: %d)", device_id, rssi);
-
-    // Add or update device
-    tracked = add_device(device_id, mac, device);
-    if (!tracked) return;
-    tracked->rssi = rssi;
-
-    // Call discovery callback
-    if (g_manager->discovered_callback) {
-        g_manager->discovered_callback(device_id, rssi);
-    }
-
+    // Decide if we should initiate connection based on device ID comparison
     if (g_manager->device_id < device_id) {
         // We should initiate the connection (we have lower ID)
-        // But first, check if this device isn't already connected to us (race condition protection)
+
+        // Check if already connected
         if (tracked->is_connected) {
-            log_debug(BT_TAG, "Device 0x%08X already connected to us, skipping connection attempt", device_id);
+            return;
+        }
+
+        // Rate limit connection attempts
+        if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) {
             return;
         }
 
@@ -376,8 +391,8 @@ static void on_scan_result(Adapter * adapter, Device * device) {
         }
 
         if (already_connecting) {
-            // Queue this device for later - don't try to connect while another connection is in progress
-            log_debug(BT_TAG, "Already connecting to another device, will connect to 0x%08X later", device_id);
+            // Don't connect now, but the device is tracked and check_pending_connections_idle will handle it
+            log_debug(BT_TAG, "Already connecting to another device, 0x%08X queued for later", device_id);
             return;
         }
 
@@ -463,15 +478,16 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
     }
 }
 
-// Forward declaration
-static gboolean check_pending_connections_idle(gpointer user_data);
 
 // Helper to restart advertising/discovery after a short delay
 static gboolean restart_advertising_discovery_idle(gpointer user_data) {
     if (!g_manager || !g_manager->running) return FALSE;
 
+    // Always restart advertising so other devices can discover us
     log_debug(BT_TAG, "Restarting advertising and discovery");
     start_advertising();
+
+    // Always restart discovery to find more devices
     start_discovery();
 
     // Also schedule a check for pending connections in case we have already-discovered devices
