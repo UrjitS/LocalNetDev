@@ -318,6 +318,8 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     if (tracked) {
         tracked->rssi = rssi;
         tracked->last_seen = now;
+        // Update device pointer in case it changed
+        if (device) tracked->device = device;
 
         // If already connected or currently connecting, skip
         if (tracked->is_connected || tracked->is_connecting) {
@@ -343,12 +345,28 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     }
 
     if (g_manager->device_id < device_id) {
-        // We should initiate the connection
+        // We should initiate the connection (we have lower ID)
         // But first, check if this device isn't already connected to us (race condition protection)
         if (tracked->is_connected) {
             log_debug(BT_TAG, "Device 0x%08X already connected to us, skipping connection attempt", device_id);
             return;
         }
+
+        // Check if we're already in the process of connecting to another device
+        gboolean already_connecting = FALSE;
+        for (guint i = 0; i < g_manager->discovered_count; i++) {
+            if (g_manager->discovered_devices[i].is_connecting) {
+                already_connecting = TRUE;
+                break;
+            }
+        }
+
+        if (already_connecting) {
+            // Queue this device for later - don't try to connect while another connection is in progress
+            log_debug(BT_TAG, "Already connecting to another device, will connect to 0x%08X later", device_id);
+            return;
+        }
+
         log_debug(BT_TAG, "Initiating connection to 0x%08X (we have lower ID)", device_id);
         connect_to_device(tracked);
     } else {
@@ -411,6 +429,9 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
     }
 }
 
+// Forward declaration
+static gboolean check_pending_connections_idle(gpointer user_data);
+
 // Helper to restart advertising/discovery after a short delay
 static gboolean restart_advertising_discovery_idle(gpointer user_data) {
     if (!g_manager || !g_manager->running) return FALSE;
@@ -418,6 +439,48 @@ static gboolean restart_advertising_discovery_idle(gpointer user_data) {
     log_debug(BT_TAG, "Restarting advertising and discovery");
     start_advertising();
     start_discovery();
+
+    // Also schedule a check for pending connections in case we have already-discovered devices
+    g_timeout_add(1000, check_pending_connections_idle, NULL);
+
+    return FALSE;  // Don't repeat
+}
+
+// Helper to check if there are pending connections we should initiate
+static gboolean check_pending_connections_idle(gpointer user_data) {
+    if (!g_manager || !g_manager->running) return FALSE;
+
+    // Check if we're already connecting to something
+    for (guint i = 0; i < g_manager->discovered_count; i++) {
+        if (g_manager->discovered_devices[i].is_connecting) {
+            return FALSE;  // Already connecting, will check again later
+        }
+    }
+
+    const uint64_t now = get_current_timestamp();
+
+    // Find devices we should connect to but haven't yet
+    for (guint i = 0; i < g_manager->discovered_count; i++) {
+        tracked_device_t * tracked = &g_manager->discovered_devices[i];
+
+        // Skip if no device ID, already connected, or we shouldn't initiate
+        if (tracked->device_id == 0) continue;
+        if (tracked->is_connected) continue;
+        if (g_manager->device_id >= tracked->device_id) continue;  // They should connect to us
+
+        // Check rate limiting
+        if (now - tracked->last_connect_attempt < RECONNECT_DELAY_SECONDS) continue;
+
+        // We need a valid device pointer to connect
+        if (!tracked->device) {
+            log_debug(BT_TAG, "Pending connection to 0x%08X but no device pointer, waiting for discovery", tracked->device_id);
+            continue;
+        }
+
+        log_info(BT_TAG, "Initiating pending connection to 0x%08X", tracked->device_id);
+        connect_to_device(tracked);
+        return FALSE;  // Only start one connection at a time
+    }
 
     return FALSE;  // Don't repeat
 }
@@ -453,8 +516,11 @@ static void on_services_resolved(Device * device) {
         g_manager->connected_callback(tracked->device_id);
     }
 
-    // Schedule restart of advertising and discovery after a longer delay to let connection stabilize
+    // Schedule restart of advertising and discovery after a delay to let connection stabilize
     g_timeout_add(1000, restart_advertising_discovery_idle, NULL);
+
+    // Schedule a check for other pending connections after discovery restarts
+    g_timeout_add(2000, check_pending_connections_idle, NULL);
 }
 
 // NOLINTNEXTLINE
