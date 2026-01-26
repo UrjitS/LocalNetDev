@@ -60,17 +60,21 @@ typedef struct ble_node_manager {
     guint heartbeat_source;
 } ble_node_manager_t;
 
+// Initialization and cleanup
 ble_node_manager_t *ble_init(struct mesh_node *mesh_node, uint32_t device_id, ble_discovered_callback discovered_cb, ble_connected_callback connected_cb, ble_disconnected_callback disconnected_cb, ble_data_callback data_cb);
 gboolean ble_start(ble_node_manager_t *manager);
 void ble_stop(ble_node_manager_t *manager);
 void ble_cleanup(ble_node_manager_t *manager);
 
+// Main loop
 void ble_run_loop(ble_node_manager_t *manager);
 void ble_quit_loop(ble_node_manager_t *manager);
 
+// Data transmission
 gboolean ble_send_data(ble_node_manager_t *manager, uint32_t dest_id, const uint8_t *data, size_t len);
 gboolean ble_broadcast_data(ble_node_manager_t *manager, const uint8_t *data, size_t len);
 
+// Connection info
 guint ble_get_connected_count(ble_node_manager_t *manager);
 void ble_get_connection_table(ble_node_manager_t *manager, uint32_t *devices, guint *count, guint max_count);
 void ble_print_connection_table(ble_node_manager_t *manager);

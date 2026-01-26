@@ -1,6 +1,11 @@
 #include "bluetooth.h"
 #include <string.h>
 #include <stdlib.h>
+#include "application.h"
+#include "advertisement.h"
+#include "characteristic.h"
+#include "adapter.h"
+#include "logger.h"
 
 #define BT_TAG "LocalNet-BT"
 #define LOCALNET_PREFIX "LocalNet-"

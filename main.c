@@ -8,6 +8,7 @@
 #include "bluetooth/bluetooth.h"
 #include "protocol/protocol.h"
 #include "routing/routing.h"
+#include "logger.h"
 
 #define TAG "LOCALNET"
 
