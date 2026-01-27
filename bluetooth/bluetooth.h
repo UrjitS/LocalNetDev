@@ -20,8 +20,6 @@ struct mesh_node;
 #define MAX_BLE_PAYLOAD_SIZE 512
 #define MAX_DISCOVERED_DEVICES 32
 #define MAX_NAME_SIZE 32
-#define CONNECTION_MAINTENANCE_INTERVAL_SECONDS 5
-#define CONNECTION_WAIT_TIMEOUT_SECONDS 15
 
 typedef void (*ble_discovered_callback)(uint32_t node_id, int16_t rssi);
 typedef void (*ble_connected_callback)(uint32_t node_id);
@@ -34,13 +32,10 @@ typedef struct {
     char mac_address[18];
     Device *device;
     gboolean is_connected;
-    gboolean is_connecting;
     gboolean we_initiated;
     int16_t rssi;
-    uint32_t connection_attempts;
     uint64_t last_heartbeat;
     uint64_t last_seen;
-    uint64_t last_connect_attempt;
 } tracked_device_t;
 
 // BLE Node Manager
@@ -68,7 +63,6 @@ typedef struct ble_node_manager {
     ble_discovered_callback discovered_callback;
 
     guint heartbeat_source;
-    guint connection_maintenance_source;
 } ble_node_manager_t;
 
 // Initialization and cleanup
