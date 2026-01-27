@@ -50,6 +50,14 @@ static gboolean on_request_authorization(Device *device);
 static const char *on_local_char_read(const Application *app, const char *address, const char *service_uuid, const char *char_uuid, guint16 offset, guint16 mtu);
 static const char *on_local_char_write(const Application *app, const char *address, const char *service_uuid, const char *char_uuid, GByteArray *byteArray, guint16 offset, guint16 mtu);
 
+/* Timer callbacks */
+static gboolean heartbeat_callback(gpointer user_data);
+static gboolean connection_maintenance_callback(gpointer user_data);
+
+/* Connection management */
+static void connect_to_device(tracked_device_t *tracked);
+static gboolean is_any_connecting(void);
+
 /* ============================================================================
  * Utility Functions
  * ========================================================================== */
@@ -158,6 +166,19 @@ static guint count_connected(void) {
     return count;
 }
 
+static guint count_connecting(void) {
+    if (!g_manager) return 0;
+    guint count = 0;
+    for (guint i = 0; i < g_manager->discovered_count; i++) {
+        if (g_manager->discovered_devices[i].is_connecting) count++;
+    }
+    return count;
+}
+
+static gboolean is_any_connecting(void) {
+    return count_connecting() > 0;
+}
+
 /* ============================================================================
  * Advertising Control
  * ========================================================================== */
@@ -219,9 +240,10 @@ static void connect_to_device(tracked_device_t *tracked) {
     /* Implement connection backoff - don't retry too quickly */
     uint64_t now = get_current_timestamp();
     uint64_t backoff_seconds = (tracked->connection_attempts < 5) ?
-                               (tracked->connection_attempts * 2 + 1) : 10;
+                               ((uint64_t)tracked->connection_attempts * 2 + 1) : 10;
 
     if (tracked->last_connect_attempt != 0 &&
+        now > tracked->last_connect_attempt &&
         (now - tracked->last_connect_attempt) < backoff_seconds) {
         return;
     }
@@ -301,14 +323,15 @@ static gboolean heartbeat_callback(gpointer user_data) {
 
     if (!g_manager || !g_manager->running) return FALSE;
 
-    uint32_t now = get_current_timestamp();
+    uint64_t now = get_current_timestamp();
 
     /* Check for heartbeat timeouts */
     for (guint i = 0; i < g_manager->discovered_count; i++) {
         tracked_device_t *tracked = &g_manager->discovered_devices[i];
         if (!tracked->is_connected) continue;
 
-        if (now - tracked->last_heartbeat > HEARTBEAT_TIMEOUT_SECONDS) {
+        if (now > tracked->last_heartbeat &&
+            (now - tracked->last_heartbeat) > HEARTBEAT_TIMEOUT_SECONDS) {
             log_info(BT_TAG, "Heartbeat timeout for 0x%08X, disconnecting", tracked->device_id);
             tracked->is_connected = FALSE;
 
@@ -326,7 +349,7 @@ static gboolean heartbeat_callback(gpointer user_data) {
     struct heartbeat hb = {
         .device_status = 0x01,
         .active_connection_number = (uint8_t)count_connected(),
-        .timestamp = now
+        .timestamp = (uint32_t)now
     };
 
     struct header header = {
@@ -409,6 +432,97 @@ static gboolean heartbeat_callback(gpointer user_data) {
 }
 
 /* ============================================================================
+ * Connection Maintenance
+ * ========================================================================== */
+
+/**
+ * Periodic connection maintenance callback.
+ *
+ * This function handles the case where devices don't connect to each other
+ * due to timing issues or the simple "lower ID initiates" rule failing.
+ *
+ * Strategy:
+ * 1. Only attempt one connection at a time (BLE limitation)
+ * 2. Prioritize connecting to devices with lower IDs that should have
+ *    connected to us but haven't
+ * 3. Also connect to devices with higher IDs if we haven't connected yet
+ * 4. Use backoff to avoid hammering failed connections
+ */
+static gboolean connection_maintenance_callback(gpointer user_data) {
+    (void)user_data;
+
+    if (!g_manager || !g_manager->running) return FALSE;
+
+    /* Don't start new connections if one is already in progress */
+    if (is_any_connecting()) {
+        return TRUE;
+    }
+
+    uint64_t now = get_current_timestamp();
+    tracked_device_t *best_candidate = NULL;
+    uint32_t best_priority = 0;
+
+    for (guint i = 0; i < g_manager->discovered_count; i++) {
+        tracked_device_t *tracked = &g_manager->discovered_devices[i];
+
+        /* Skip if already connected, connecting, or no device pointer */
+        if (tracked->is_connected || tracked->is_connecting || !tracked->device) {
+            continue;
+        }
+
+        /* Skip if device ID is invalid or is ourselves */
+        if (tracked->device_id == 0 || tracked->device_id == g_manager->device_id) {
+            continue;
+        }
+
+        /* Check backoff timing */
+        uint64_t backoff_seconds = (tracked->connection_attempts < 5) ?
+                                   ((uint64_t)tracked->connection_attempts * 2 + 1) : 10;
+        if (tracked->last_connect_attempt != 0 &&
+            now > tracked->last_connect_attempt &&
+            (now - tracked->last_connect_attempt) < backoff_seconds) {
+            continue;
+        }
+
+        /*
+         * Calculate priority:
+         * - Devices that should have connected to us (their ID < our ID)
+         *   but haven't get higher priority after timeout
+         * - Devices we should connect to (their ID > our ID) also need attention
+         */
+        uint32_t priority = 0;
+        uint64_t time_since_seen = (now > tracked->last_seen) ? (now - tracked->last_seen) : 0;
+        uint32_t attempts_penalty = (tracked->connection_attempts < 10) ?
+                                    (tracked->connection_attempts * 10) : 100;
+
+        if (tracked->device_id > g_manager->device_id) {
+            /* We should initiate - high priority */
+            priority = 1000 + (100 - attempts_penalty);
+        } else {
+            /* They should have connected to us - if timeout passed, we try */
+            if (time_since_seen >= CONNECTION_WAIT_TIMEOUT_SECONDS) {
+                priority = 500 + (100 - attempts_penalty);
+                log_debug(BT_TAG, "Device 0x%08X should have connected to us, will try ourselves",
+                         tracked->device_id);
+            }
+        }
+
+        if (priority > best_priority) {
+            best_priority = priority;
+            best_candidate = tracked;
+        }
+    }
+
+    if (best_candidate) {
+        log_debug(BT_TAG, "Connection maintenance: connecting to 0x%08X (priority %u)",
+                 best_candidate->device_id, best_priority);
+        connect_to_device(best_candidate);
+    }
+
+    return TRUE;
+}
+
+/* ============================================================================
  * Adapter Callbacks
  * ========================================================================== */
 
@@ -466,12 +580,19 @@ static void on_scan_result(Adapter *adapter, Device *device) {
     }
 
     /*
-     * Connection decision: lower device ID initiates connection.
-     * This prevents both devices trying to connect simultaneously.
+     * Connection decision:
+     * - Lower device ID initiates connection to higher ID
+     * - Only initiate immediately if no other connection is in progress
+     * - Otherwise, let the connection_maintenance_callback handle it
      */
-    if (g_manager->device_id < device_id) {
+    if (g_manager->device_id < device_id && !is_any_connecting()) {
         connect_to_device(tracked);
     }
+    /*
+     * If our ID > their ID, we wait for them to connect.
+     * If they don't connect within CONNECTION_WAIT_TIMEOUT_SECONDS,
+     * connection_maintenance_callback will initiate the connection.
+     */
 }
 
 static void on_remote_central_connected(Adapter *adapter, Device *device) {
@@ -866,12 +987,21 @@ void ble_run_loop(ble_node_manager_t *manager) {
     /* Schedule heartbeat timer */
     manager->heartbeat_source = g_timeout_add_seconds(HEARTBEAT_INTERVAL_SECONDS, heartbeat_callback, NULL);
 
+    /* Schedule connection maintenance timer */
+    manager->connection_maintenance_source = g_timeout_add_seconds(
+        CONNECTION_MAINTENANCE_INTERVAL_SECONDS, connection_maintenance_callback, NULL);
+
     g_main_loop_run(manager->loop);
 
-    /* Cleanup timer */
+    /* Cleanup timers */
     if (manager->heartbeat_source) {
         g_source_remove(manager->heartbeat_source);
         manager->heartbeat_source = 0;
+    }
+
+    if (manager->connection_maintenance_source) {
+        g_source_remove(manager->connection_maintenance_source);
+        manager->connection_maintenance_source = 0;
     }
 
     g_main_loop_unref(manager->loop);
