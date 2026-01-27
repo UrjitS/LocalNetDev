@@ -149,7 +149,7 @@ static void connect_to_device(tracked_device_t * tracked) {
 
     // Stop advertising and discovery before connecting to avoid conflicts 
     log_debug(BT_TAG, "Stopping advertising before connection attempt");
-    stop_advertising();
+    // stop_advertising();
     log_debug(BT_TAG, "Stopping discovery before connection attempt");
     stop_discovery();
 
@@ -328,7 +328,7 @@ static void on_scan_result(Adapter * adapter, Device * device) {
         g_manager->discovered_callback(device_id, rssi);
     }
 
-    if (g_manager->device_id < device_id) {
+    if (g_manager->device_id > device_id) {
         log_debug(BT_TAG, "Connecting to 0x%08X", device_id);
         connect_to_device(tracked);
     } else {
