@@ -105,18 +105,24 @@ static tracked_device_t *add_or_update_device(uint32_t device_id, const char *ma
     if (!g_manager) return NULL;
 
     /* Check if device already exists */
-    tracked_device_t *tracked = find_device_by_id(device_id);
+    tracked_device_t *tracked = NULL;
+    if (device_id != 0) {
+        tracked = find_device_by_id(device_id);
+    }
     if (!tracked && mac) {
         tracked = find_device_by_mac(mac);
     }
 
     if (tracked) {
-        /* Update existing entry */
-        if (device) tracked->device = device;
-        if (mac && tracked->mac_address[0] == '\0') {
-            strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
+        /* Update existing entry - always update device pointer if provided */
+        if (device) {
+            tracked->device = device;
         }
-        if (device_id != 0 && tracked->device_id == 0) {
+        if (mac && mac[0] != '\0') {
+            strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
+            tracked->mac_address[sizeof(tracked->mac_address) - 1] = '\0';
+        }
+        if (device_id != 0) {
             tracked->device_id = device_id;
         }
         tracked->last_seen = get_current_timestamp();
@@ -133,7 +139,10 @@ static tracked_device_t *add_or_update_device(uint32_t device_id, const char *ma
     memset(tracked, 0, sizeof(*tracked));
     tracked->device_id = device_id;
     tracked->device = device;
-    if (mac) strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
+    if (mac) {
+        strncpy(tracked->mac_address, mac, sizeof(tracked->mac_address) - 1);
+        tracked->mac_address[sizeof(tracked->mac_address) - 1] = '\0';
+    }
     tracked->last_seen = get_current_timestamp();
     tracked->last_heartbeat = get_current_timestamp();
 
@@ -205,9 +214,20 @@ static void stop_discovery(void) {
 
 static void connect_to_device(tracked_device_t *tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
-    if (tracked->is_connected) return;
+    if (tracked->is_connected || tracked->is_connecting) return;
 
-    log_info(BT_TAG, "Initiating connection to 0x%08X", tracked->device_id);
+    /* Implement connection backoff - don't retry too quickly */
+    uint64_t now = get_current_timestamp();
+    uint64_t backoff_seconds = (tracked->connection_attempts < 5) ?
+                               (tracked->connection_attempts * 2 + 1) : 10;
+
+    if (tracked->last_connect_attempt != 0 &&
+        (now - tracked->last_connect_attempt) < backoff_seconds) {
+        return;
+    }
+
+    log_info(BT_TAG, "Initiating connection to 0x%08X (attempt %u)",
+             tracked->device_id, tracked->connection_attempts + 1);
 
     /* Set up device callbacks */
     binc_device_set_connection_state_change_cb(tracked->device, &on_connection_state_changed);
@@ -216,6 +236,10 @@ static void connect_to_device(tracked_device_t *tracked) {
     binc_device_set_write_char_cb(tracked->device, &on_write_characteristic);
 
     tracked->we_initiated = TRUE;
+    tracked->is_connecting = TRUE;
+    tracked->last_connect_attempt = now;
+    tracked->connection_attempts++;
+
     binc_device_connect(tracked->device);
 }
 
@@ -353,8 +377,8 @@ static gboolean heartbeat_callback(gpointer user_data) {
 
         Characteristic *chr = binc_device_get_characteristic(tracked->device, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID);
         if (chr) {
-            GByteArray *data = g_byte_array_sized_new(len);
-            g_byte_array_append(data, buffer, len);
+            GByteArray *data = g_byte_array_sized_new((guint)len);
+            g_byte_array_append(data, buffer, (guint)len);
             binc_characteristic_write(chr, data, WITH_RESPONSE);
             g_byte_array_free(data, TRUE);
             sent_count++;
@@ -372,8 +396,8 @@ static gboolean heartbeat_callback(gpointer user_data) {
     }
 
     if (has_incoming && g_manager->app) {
-        GByteArray *data = g_byte_array_sized_new(len);
-        g_byte_array_append(data, buffer, len);
+        GByteArray *data = g_byte_array_sized_new((guint)len);
+        g_byte_array_append(data, buffer, (guint)len);
         binc_application_set_char_value(g_manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID, data);
         binc_application_notify(g_manager->app, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID, data);
         g_byte_array_free(data, TRUE);
@@ -416,24 +440,29 @@ static void on_scan_result(Adapter *adapter, Device *device) {
 
     int16_t rssi = binc_device_get_rssi(device);
 
-    /* Check if already connected */
+    /* Check if already connected or connecting */
     tracked_device_t *tracked = find_device_by_id(device_id);
-    if (tracked && tracked->is_connected) {
+    if (tracked) {
+        /* Always update the device pointer and RSSI */
+        tracked->device = device;
         tracked->rssi = rssi;
         tracked->last_seen = get_current_timestamp();
-        return;
-    }
 
-    log_info(BT_TAG, "Discovered 0x%08X (RSSI: %d dBm)", device_id, rssi);
+        if (tracked->is_connected || tracked->is_connecting) {
+            return;
+        }
+    } else {
+        log_info(BT_TAG, "Discovered 0x%08X (RSSI: %d dBm)", device_id, rssi);
 
-    /* Add or update device */
-    tracked = add_or_update_device(device_id, mac, device);
-    if (!tracked) return;
-    tracked->rssi = rssi;
+        /* Add new device */
+        tracked = add_or_update_device(device_id, mac, device);
+        if (!tracked) return;
+        tracked->rssi = rssi;
 
-    /* Notify discovery callback */
-    if (g_manager->discovered_callback) {
-        g_manager->discovered_callback(device_id, rssi);
+        /* Notify discovery callback */
+        if (g_manager->discovered_callback) {
+            g_manager->discovered_callback(device_id, rssi);
+        }
     }
 
     /*
@@ -492,40 +521,73 @@ static void on_connection_state_changed(Device *device, ConnectionState state, c
     }
 
     uint32_t device_id = tracked ? tracked->device_id : 0;
+    const char *state_name = binc_device_get_connection_state_name(device);
 
     if (error) {
         log_error(BT_TAG, "Connection error for 0x%08X: %s", device_id, error->message);
     }
 
+    log_debug(BT_TAG, "Connection state 0x%08X: %s", device_id, state_name);
+
     switch (state) {
         case BINC_CONNECTED:
-            log_debug(BT_TAG, "Device 0x%08X connected", device_id);
+            log_debug(BT_TAG, "Device 0x%08X connected, waiting for services", device_id);
+            /* Note: is_connected will be set in on_services_resolved for outgoing connections */
+            break;
+
+        case BINC_CONNECTING:
+            if (tracked) {
+                tracked->is_connecting = TRUE;
+            }
+            break;
+
+        case BINC_DISCONNECTING:
             break;
 
         case BINC_DISCONNECTED: {
             log_info(BT_TAG, "Device 0x%08X disconnected", device_id);
             gboolean was_connected = FALSE;
+            gboolean was_connecting = FALSE;
 
             if (tracked) {
                 was_connected = tracked->is_connected;
+                was_connecting = tracked->is_connecting;
                 tracked->is_connected = FALSE;
-                tracked->device = NULL;
+                tracked->is_connecting = FALSE;
 
                 if (was_connected && g_manager->disconnected_callback) {
                     g_manager->disconnected_callback(device_id);
                 }
             }
 
-            /* Remove unbonded device from BlueZ cache */
-            if (binc_device_get_bonding_state(device) != BINC_BONDED) {
+            /*
+             * Handle removal of device from BlueZ cache.
+             * If we were connecting (not yet fully connected) and have failed
+             * multiple times, consider removing the bonded device to clear
+             * potentially stale bonding info.
+             */
+            BondingState bonding = binc_device_get_bonding_state(device);
+            gboolean should_remove = FALSE;
+
+            if (bonding != BINC_BONDED) {
+                should_remove = TRUE;
+            } else if (was_connecting && !was_connected && tracked &&
+                       tracked->connection_attempts >= 3) {
+                /* Bonded but failed to connect 3+ times - might be stale bond */
+                log_info(BT_TAG, "Removing stale bond for 0x%08X after %u failed attempts",
+                        device_id, tracked->connection_attempts);
+                should_remove = TRUE;
+            }
+
+            if (should_remove) {
+                log_debug(BT_TAG, "Removing device 0x%08X from cache", device_id);
                 binc_adapter_remove_device(g_manager->adapter, device);
+                if (tracked) {
+                    tracked->device = NULL;
+                }
             }
             break;
         }
-
-        case BINC_CONNECTING:
-        case BINC_DISCONNECTING:
-            break;
     }
 }
 
@@ -533,17 +595,28 @@ static void on_services_resolved(Device *device) {
     if (!g_manager || !device) return;
 
     tracked_device_t *tracked = find_device_by_ptr(device);
-    if (!tracked) return;
+    if (!tracked) {
+        tracked = find_device_by_mac(binc_device_get_address(device));
+    }
+    if (!tracked) {
+        log_error(BT_TAG, "Services resolved for unknown device");
+        return;
+    }
 
     log_debug(BT_TAG, "Services resolved for 0x%08X", tracked->device_id);
 
     tracked->is_connected = TRUE;
+    tracked->is_connecting = FALSE;
+    tracked->connection_attempts = 0;  /* Reset on successful connection */
     tracked->last_heartbeat = get_current_timestamp();
 
-    /* Subscribe to notifications */
+    /* Subscribe to notifications on the data characteristic */
     Characteristic *chr = binc_device_get_characteristic(device, LOCAL_NET_SERVICE_UUID, LOCAL_NET_DATA_CHAR_UUID);
     if (chr) {
+        log_debug(BT_TAG, "Subscribing to notifications for 0x%08X", tracked->device_id);
         binc_characteristic_start_notify(chr);
+    } else {
+        log_error(BT_TAG, "Data characteristic not found for 0x%08X", tracked->device_id);
     }
 
     log_info(BT_TAG, "Connected to 0x%08X", tracked->device_id);
@@ -591,6 +664,7 @@ static gboolean on_request_authorization(Device *device) {
 static const char *on_local_char_read(const Application *app, const char *address,
                                        const char *service_uuid, const char *char_uuid,
                                        guint16 offset, guint16 mtu) {
+    (void)address;
     (void)offset;
     (void)mtu;
 
@@ -819,8 +893,8 @@ gboolean ble_send_data(ble_node_manager_t *manager, uint32_t target_id, const ui
         return FALSE;
     }
 
-    GByteArray *byte_array = g_byte_array_sized_new(len);
-    g_byte_array_append(byte_array, data, len);
+    GByteArray *byte_array = g_byte_array_sized_new((guint)len);
+    g_byte_array_append(byte_array, data, (guint)len);
 
     gboolean success = FALSE;
 
@@ -885,15 +959,23 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
     printf("\t %-12s %-12s %-10s %-10s %-18s\n", "Device ID", "Status", "RSSI", "Type", "MAC");
     printf("--------------------------------------------------------------------\n");
 
-    guint known = 0, connected = 0;
+    guint known = 0, connected = 0, connecting = 0;
     for (guint i = 0; i < manager->discovered_count; i++) {
         tracked_device_t *tracked = &manager->discovered_devices[i];
         if (tracked->device_id == 0 && tracked->mac_address[0] == '\0') continue;
 
         known++;
         if (tracked->is_connected) connected++;
+        if (tracked->is_connecting) connecting++;
 
-        const char *status = tracked->is_connected ? "CONNECTED" : "KNOWN";
+        const char *status;
+        if (tracked->is_connected) {
+            status = "CONNECTED";
+        } else if (tracked->is_connecting) {
+            status = "CONNECTING";
+        } else {
+            status = "KNOWN";
+        }
         const char *type = tracked->we_initiated ? "OUTGOING" : "INCOMING";
 
         printf("\t 0x%08X   %-12s %4d dBm   %-10s %-18s\n",
@@ -905,6 +987,6 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
     }
 
     printf("--------------------------------------------------------------------\n");
-    printf("\t Total: %u known, %u connected\n", known, connected);
+    printf("\t Total: %u known, %u connected, %u connecting\n", known, connected, connecting);
     printf("--------------------------------------------------------------------\n");
 }

@@ -32,10 +32,13 @@ typedef struct {
     char mac_address[18];
     Device *device;
     gboolean is_connected;
+    gboolean is_connecting;
     gboolean we_initiated;
     int16_t rssi;
+    uint32_t connection_attempts;
     uint64_t last_heartbeat;
     uint64_t last_seen;
+    uint64_t last_connect_attempt;
 } tracked_device_t;
 
 // BLE Node Manager
