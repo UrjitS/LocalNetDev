@@ -149,7 +149,7 @@ static void connect_to_device(tracked_device_t * tracked) {
 
     // Stop advertising and discovery before connecting to avoid conflicts 
     log_debug(BT_TAG, "Stopping advertising before connection attempt");
-    // stop_advertising();
+    stop_advertising();
     log_debug(BT_TAG, "Stopping discovery before connection attempt");
     stop_discovery();
 
