@@ -358,6 +358,8 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
 
     switch (state) {
         case BINC_CONNECTED:
+            start_advertising();
+            start_discovery();
             break;
         case BINC_DISCONNECTED:
             if (tracked) {
@@ -377,7 +379,7 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
 
             // Restart advertising and discovery after disconnection
             log_debug(BT_TAG, "Restarting advertising and discovery after disconnection");
-            // start_advertising();
+            start_advertising();
             start_discovery();
             break;
         case BINC_CONNECTING:
