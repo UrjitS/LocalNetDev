@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Forward declarations for protocol structures */
+struct route_request;
+struct route_reply;
+
 /* Node Types */
 enum NODE_TYPE {
     EDGE_NODE = 0,
@@ -63,9 +67,26 @@ struct routing_entry {
 struct route_request_entry {
     uint32_t request_id;
     uint32_t originator_id;
+    uint32_t destination_id;
     uint32_t timestamp;
     uint8_t is_active;
+    uint8_t awaiting_reply;        /* 1 if this node initiated the request */
+    uint32_t *reverse_path;        /* Path from originator to destination */
+    uint8_t reverse_path_len;
 };
+
+/* Pending Route Request (for tracking outgoing requests) */
+struct pending_route_request {
+    uint32_t request_id;
+    uint32_t destination_id;
+    uint32_t timestamp;
+    uint8_t retries;
+    uint8_t is_active;
+};
+
+#define MAX_PENDING_REQUESTS 16
+#define ROUTE_REQUEST_TIMEOUT_SECONDS 10
+#define MAX_ROUTE_REQUEST_RETRIES 3
 
 /* Connection Table */
 struct connection_table {
@@ -94,6 +115,8 @@ struct mesh_node {
     struct connection_table *connection_table;
     struct routing_table *routing_table;
     struct route_request_cache *request_cache;
+    struct pending_route_request pending_requests[MAX_PENDING_REQUESTS];
+    size_t pending_count;
     uint32_t last_discovery_time;
     uint8_t discovery_active;
 };
@@ -154,6 +177,82 @@ int process_route_request(struct mesh_node *node, uint32_t request_id, uint32_t 
                           uint32_t sender_id);
 int process_route_reply(struct mesh_node *node, uint32_t request_id, uint8_t route_cost,
                         const uint32_t *forward_path, uint8_t forward_path_len);
+
+/* Route Request Result Structure */
+struct route_request_result {
+    int action;                    /* 0=forward, 1=destination reached, 2=cached route, -1=drop */
+    uint32_t request_id;
+    uint32_t destination_id;
+    uint8_t hop_count;
+    uint32_t *updated_reverse_path;
+    uint8_t updated_path_len;
+    uint32_t exclude_neighbor;     /* Neighbor to exclude when forwarding (sender) */
+};
+
+/* Route Reply Result Structure */
+struct route_reply_result {
+    int action;                    /* 0=forward to next, 1=we are originator (done), -1=error */
+    uint32_t next_hop;             /* Next hop to forward reply to */
+    uint32_t request_id;
+    uint8_t route_cost;
+    uint32_t *forward_path;
+    uint8_t forward_path_len;
+};
+
+/* Enhanced Route Discovery Functions */
+
+/**
+ * Create a route request message for a destination
+ * Returns request_id on success, -1 on failure
+ */
+int create_route_request(struct mesh_node *node, uint32_t destination_id,
+                         struct route_request *req_out);
+
+/**
+ * Handle incoming route request
+ * Returns result structure with action to take
+ */
+int handle_route_request(struct mesh_node *node, const struct route_request *req,
+                        uint32_t sender_id, struct route_request_result *result);
+
+/**
+ * Create a route reply when destination is reached
+ * The forward_path is the reverse of the reverse_path
+ */
+int create_route_reply(struct mesh_node *node, uint32_t request_id,
+                      const uint32_t *reverse_path, uint8_t reverse_path_len,
+                      struct route_reply *reply_out);
+
+/**
+ * Handle incoming route reply
+ * Returns result structure with action to take
+ */
+int handle_route_reply(struct mesh_node *node, const struct route_reply *reply,
+                      uint32_t sender_id, struct route_reply_result *result);
+
+/**
+ * Add a pending route request (for tracking timeouts)
+ */
+int add_pending_route_request(struct mesh_node *node, uint32_t request_id,
+                              uint32_t destination_id);
+
+/**
+ * Remove a pending route request
+ */
+int remove_pending_route_request(struct mesh_node *node, uint32_t request_id);
+
+/**
+ * Check for timed-out route requests
+ * Returns number of timed-out requests, fills arrays
+ */
+size_t check_route_request_timeouts(struct mesh_node *node, uint32_t current_time,
+                                   uint32_t *timed_out_destinations, size_t max_count);
+
+/**
+ * Get all connected neighbors for broadcasting route requests
+ */
+size_t get_connected_neighbors(struct mesh_node *node, uint32_t *neighbors,
+                               size_t max_count, uint32_t exclude_id);
 
 /* Packet Forwarding Functions */
 int forward_packet(struct mesh_node *node, uint32_t destination_id, uint8_t *ttl,

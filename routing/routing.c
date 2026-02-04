@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "utils.h"
+#include "protocol.h"
 #include <stdio.h>
 
 
@@ -49,6 +50,8 @@ struct mesh_node *create_mesh_node(const uint32_t device_id, const enum NODE_TYP
     node->available_connections = node->max_connections;
     node->last_discovery_time = 0;
     node->discovery_active = 1;
+    node->pending_count = 0;
+    memset(node->pending_requests, 0, sizeof(node->pending_requests));
 
     node->connection_table = create_connection_table();
     node->routing_table = create_routing_table();
@@ -608,3 +611,345 @@ int should_process_locally(struct mesh_node *node, const uint32_t destination_id
     if (!node) return 0;
     return node->device_id == destination_id;
 }
+
+/* ========================================================================== */
+/* Enhanced Route Discovery Implementation                                     */
+/* ========================================================================== */
+
+int create_route_request(struct mesh_node *node, const uint32_t destination_id,
+                         struct route_request *req_out) {
+    if (!node || !req_out) return -1;
+
+    /* Check if we already have a valid route */
+    const struct routing_entry *existing = find_route(node->routing_table, destination_id);
+    if (existing && existing->is_valid) {
+        return 0;  /* Already have route, no need for discovery */
+    }
+
+    /* Generate request ID */
+    const uint32_t request_id = generate_request_id();
+
+    /* Add to request cache */
+    add_route_request(node->request_cache, request_id, node->device_id, get_current_timestamp());
+
+    /* Add to pending requests for timeout tracking */
+    add_pending_route_request(node, request_id, destination_id);
+
+    /* Build the route request */
+    req_out->request_id = request_id;
+    req_out->destination_id = destination_id;
+    req_out->hop_count = 0;
+    req_out->reverse_path_len = 1;
+
+    /* Allocate and set reverse path with originator (this node) */
+    req_out->reverse_path = malloc(sizeof(uint32_t) * (MAX_HOP_COUNT + 1));
+    if (!req_out->reverse_path) return -1;
+
+    req_out->reverse_path[0] = node->device_id;
+
+    return (int)request_id;
+}
+
+int handle_route_request(struct mesh_node *node, const struct route_request *req,
+                        const uint32_t sender_id, struct route_request_result *result) {
+    if (!node || !req || !result) return -1;
+
+    memset(result, 0, sizeof(*result));
+    result->request_id = req->request_id;
+    result->destination_id = req->destination_id;
+    result->exclude_neighbor = sender_id;
+
+    /* Check if we've already processed this request */
+    if (has_seen_request(node->request_cache, req->request_id)) {
+        result->action = -1;  /* Drop duplicate */
+        return -1;
+    }
+
+    /* Add to request cache to prevent processing duplicates */
+    uint32_t originator_id = 0;
+    if (req->reverse_path_len > 0 && req->reverse_path) {
+        originator_id = req->reverse_path[0];
+    }
+    add_route_request(node->request_cache, req->request_id, originator_id, get_current_timestamp());
+
+    /* Increment hop count */
+    const uint8_t new_hop_count = req->hop_count + 1;
+    result->hop_count = new_hop_count;
+
+    /* Check if we are the destination */
+    if (req->destination_id == node->device_id) {
+        result->action = 1;  /* We are destination - generate route reply */
+
+        /* Build updated reverse path including us */
+        result->updated_path_len = req->reverse_path_len + 1;
+        result->updated_reverse_path = malloc(sizeof(uint32_t) * result->updated_path_len);
+        if (!result->updated_reverse_path) {
+            result->action = -1;
+            return -1;
+        }
+
+        /* Copy existing path and add ourselves at the end */
+        if (req->reverse_path && req->reverse_path_len > 0) {
+            memcpy(result->updated_reverse_path, req->reverse_path,
+                   req->reverse_path_len * sizeof(uint32_t));
+        }
+        result->updated_reverse_path[result->updated_path_len - 1] = node->device_id;
+
+        /* Add route back to originator through sender */
+        if (originator_id != 0 && originator_id != node->device_id) {
+            add_route(node->routing_table, originator_id, sender_id,
+                     new_hop_count, (float)new_hop_count, get_current_timestamp());
+        }
+
+        return 1;
+    }
+
+    /* Check if we have a cached route to the destination (for FULL_NODE and GATEWAY_NODE) */
+    if (node->node_type != EDGE_NODE) {
+        const struct routing_entry *cached_route = find_route(node->routing_table, req->destination_id);
+        if (cached_route && cached_route->is_valid) {
+            result->action = 2;  /* Can reply with cached route */
+
+            /* Build updated path including us */
+            result->updated_path_len = req->reverse_path_len + 1;
+            result->updated_reverse_path = malloc(sizeof(uint32_t) * result->updated_path_len);
+            if (!result->updated_reverse_path) {
+                result->action = -1;
+                return -1;
+            }
+
+            if (req->reverse_path && req->reverse_path_len > 0) {
+                memcpy(result->updated_reverse_path, req->reverse_path,
+                       req->reverse_path_len * sizeof(uint32_t));
+            }
+            result->updated_reverse_path[result->updated_path_len - 1] = node->device_id;
+
+            /* Add route back to originator */
+            if (originator_id != 0 && originator_id != node->device_id) {
+                add_route(node->routing_table, originator_id, sender_id,
+                         new_hop_count, (float)new_hop_count, get_current_timestamp());
+            }
+
+            return 2;
+        }
+    }
+
+    /* Check hop count limit */
+    if (new_hop_count >= MAX_HOP_COUNT) {
+        result->action = -1;  /* TTL exceeded */
+        return -1;
+    }
+
+    /* Forward the request */
+    result->action = 0;
+
+    /* Build updated reverse path including us */
+    result->updated_path_len = req->reverse_path_len + 1;
+    result->updated_reverse_path = malloc(sizeof(uint32_t) * result->updated_path_len);
+    if (!result->updated_reverse_path) {
+        result->action = -1;
+        return -1;
+    }
+
+    if (req->reverse_path && req->reverse_path_len > 0) {
+        memcpy(result->updated_reverse_path, req->reverse_path,
+               req->reverse_path_len * sizeof(uint32_t));
+    }
+    result->updated_reverse_path[result->updated_path_len - 1] = node->device_id;
+
+    /* Add route back to originator through sender */
+    if (originator_id != 0 && originator_id != node->device_id) {
+        add_route(node->routing_table, originator_id, sender_id,
+                 new_hop_count, (float)new_hop_count, get_current_timestamp());
+    }
+
+    return 0;
+}
+
+int create_route_reply(struct mesh_node *node, const uint32_t request_id,
+                      const uint32_t *reverse_path, const uint8_t reverse_path_len,
+                      struct route_reply *reply_out) {
+    if (!node || !reverse_path || reverse_path_len < 1 || !reply_out) return -1;
+
+    reply_out->request_id = request_id;
+    reply_out->route_cost = reverse_path_len - 1;  /* Number of hops */
+    reply_out->forward_path_len = reverse_path_len;
+
+    /* Allocate forward path */
+    reply_out->forward_path = malloc(sizeof(uint32_t) * reverse_path_len);
+    if (!reply_out->forward_path) return -1;
+
+    /* Forward path is the same as reverse path (originator -> destination) */
+    /* The reverse path was built in order: [originator, hop1, hop2, ..., destination] */
+    memcpy(reply_out->forward_path, reverse_path, reverse_path_len * sizeof(uint32_t));
+
+    return 0;
+}
+
+int handle_route_reply(struct mesh_node *node, const struct route_reply *reply,
+                      const uint32_t sender_id, struct route_reply_result *result) {
+    if (!node || !reply || !result) return -1;
+
+    memset(result, 0, sizeof(*result));
+    result->request_id = reply->request_id;
+    result->route_cost = reply->route_cost;
+
+    if (!reply->forward_path || reply->forward_path_len < 2) {
+        result->action = -1;
+        return -1;
+    }
+
+    /* Find our position in the forward path */
+    int our_position = -1;
+    for (uint8_t i = 0; i < reply->forward_path_len; i++) {
+        if (reply->forward_path[i] == node->device_id) {
+            our_position = (int)i;
+            break;
+        }
+    }
+
+    if (our_position < 0) {
+        /* We're not in the path - this reply is not for us */
+        result->action = -1;
+        return -1;
+    }
+
+    /* Add route to the destination (last node in forward path) */
+    const uint32_t destination_id = reply->forward_path[reply->forward_path_len - 1];
+
+    if (destination_id != node->device_id && our_position < reply->forward_path_len - 1) {
+        /* Next hop toward destination */
+        const uint32_t next_hop_to_dest = reply->forward_path[our_position + 1];
+        const uint8_t hops_to_dest = reply->forward_path_len - our_position - 1;
+        const float cost = (float)hops_to_dest;
+
+        add_route(node->routing_table, destination_id, next_hop_to_dest,
+                 hops_to_dest, cost, get_current_timestamp());
+    }
+
+    /* Check if we are the originator (first node in path) */
+    if (our_position == 0) {
+        /* We originated this request - route discovery complete */
+        result->action = 1;
+
+        /* Remove from pending requests */
+        remove_pending_route_request(node, reply->request_id);
+
+        return 1;
+    }
+
+    /* We are an intermediate node - forward toward originator */
+    result->action = 0;
+
+    /* Next hop toward originator is the previous node in path */
+    result->next_hop = reply->forward_path[our_position - 1];
+
+    /* Copy forward path for forwarding */
+    result->forward_path_len = reply->forward_path_len;
+    result->forward_path = malloc(sizeof(uint32_t) * reply->forward_path_len);
+    if (!result->forward_path) {
+        result->action = -1;
+        return -1;
+    }
+    memcpy(result->forward_path, reply->forward_path,
+           reply->forward_path_len * sizeof(uint32_t));
+
+    return 0;
+}
+
+int add_pending_route_request(struct mesh_node *node, const uint32_t request_id,
+                              const uint32_t destination_id) {
+    if (!node) return -1;
+
+    /* Check if already tracking this destination */
+    for (size_t i = 0; i < node->pending_count; i++) {
+        if (node->pending_requests[i].is_active &&
+            node->pending_requests[i].destination_id == destination_id) {
+            return -1;  /* Already pending for this destination */
+        }
+    }
+
+    /* Find empty slot */
+    size_t index = node->pending_count;
+    if (node->pending_count >= MAX_PENDING_REQUESTS) {
+        /* Find inactive slot or oldest entry */
+        uint32_t oldest_time = UINT32_MAX;
+        for (size_t i = 0; i < MAX_PENDING_REQUESTS; i++) {
+            if (!node->pending_requests[i].is_active) {
+                index = i;
+                break;
+            }
+            if (node->pending_requests[i].timestamp < oldest_time) {
+                oldest_time = node->pending_requests[i].timestamp;
+                index = i;
+            }
+        }
+    } else {
+        node->pending_count++;
+    }
+
+    node->pending_requests[index].request_id = request_id;
+    node->pending_requests[index].destination_id = destination_id;
+    node->pending_requests[index].timestamp = get_current_timestamp();
+    node->pending_requests[index].retries = 0;
+    node->pending_requests[index].is_active = 1;
+
+    return 0;
+}
+
+int remove_pending_route_request(struct mesh_node *node, const uint32_t request_id) {
+    if (!node) return -1;
+
+    for (size_t i = 0; i < node->pending_count; i++) {
+        if (node->pending_requests[i].request_id == request_id &&
+            node->pending_requests[i].is_active) {
+            node->pending_requests[i].is_active = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+size_t check_route_request_timeouts(struct mesh_node *node, const uint32_t current_time,
+                                   uint32_t *timed_out_destinations, const size_t max_count) {
+    if (!node || !timed_out_destinations || max_count == 0) return 0;
+
+    size_t timeout_count = 0;
+
+    for (size_t i = 0; i < node->pending_count && timeout_count < max_count; i++) {
+        struct pending_route_request *pending = &node->pending_requests[i];
+        if (!pending->is_active) continue;
+
+        const uint32_t elapsed = current_time - pending->timestamp;
+        if (elapsed >= ROUTE_REQUEST_TIMEOUT_SECONDS) {
+            if (pending->retries < MAX_ROUTE_REQUEST_RETRIES) {
+                /* Mark for retry */
+                pending->retries++;
+                pending->timestamp = current_time;
+                timed_out_destinations[timeout_count++] = pending->destination_id;
+            } else {
+                /* Max retries exceeded - give up */
+                pending->is_active = 0;
+            }
+        }
+    }
+
+    return timeout_count;
+}
+
+size_t get_connected_neighbors(struct mesh_node *node, uint32_t *neighbors,
+                               const size_t max_count, const uint32_t exclude_id) {
+    if (!node || !node->connection_table || !neighbors || max_count == 0) return 0;
+
+    size_t count = 0;
+
+    for (size_t i = 0; i < node->connection_table->count && count < max_count; i++) {
+        const struct connection_entry *entry = &node->connection_table->entries[i];
+        if (entry->state == STABLE && entry->neighbor_id != exclude_id) {
+            neighbors[count++] = entry->neighbor_id;
+        }
+    }
+
+    return count;
+}
+

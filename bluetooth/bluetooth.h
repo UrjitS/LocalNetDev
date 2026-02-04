@@ -84,4 +84,29 @@ guint ble_get_connected_count(ble_node_manager_t *manager);
 void ble_get_connection_table(ble_node_manager_t *manager, uint32_t *devices, guint *count, guint max_count);
 void ble_print_connection_table(ble_node_manager_t *manager);
 
+// Route discovery callbacks
+typedef void (*ble_route_found_callback)(uint32_t destination_id, uint32_t next_hop, uint8_t hop_count);
+typedef void (*ble_route_failed_callback)(uint32_t destination_id);
+
+/**
+ * Initiate route discovery for a destination
+ * Returns request_id on success, 0 on failure
+ */
+uint32_t ble_initiate_route_discovery(ble_node_manager_t *manager, uint32_t destination_id);
+
+/**
+ * Send a route request to all connected neighbors
+ */
+gboolean ble_broadcast_route_request(ble_node_manager_t *manager, uint32_t request_id,
+                                     uint32_t destination_id, uint8_t hop_count,
+                                     const uint32_t *reverse_path, uint8_t reverse_path_len,
+                                     uint32_t exclude_id);
+
+/**
+ * Send a route reply to a specific neighbor
+ */
+gboolean ble_send_route_reply(ble_node_manager_t *manager, uint32_t target_id,
+                              uint32_t request_id, uint8_t route_cost,
+                              const uint32_t *forward_path, uint8_t forward_path_len);
+
 #endif // LOCALNET_BLUETOOTH_H

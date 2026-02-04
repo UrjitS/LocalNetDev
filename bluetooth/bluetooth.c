@@ -446,6 +446,81 @@ static void on_notify(Device * device, Characteristic * characteristic, const GB
                 update_last_seen(g_manager->mesh_node->connection_table, network.source_id, heartbeat.timestamp);
             }
         }
+    } else if (header.message_type == MSG_ROUTE_REQUEST) {
+        struct route_request req;
+        memset(&req, 0, sizeof(req));
+        if (parse_route_request(byteArray->data + 16, byteArray->len - 16, &req) == 0) {
+            log_info(BT_TAG, "Received route request from 0x%08X for dest 0x%08X (hops: %u)",
+                    network.source_id, req.destination_id, req.hop_count);
+
+            if (g_manager->mesh_node) {
+                struct route_request_result result;
+                const int action = handle_route_request(g_manager->mesh_node, &req, network.source_id, &result);
+
+                if (action == 1) {
+                    // We are the destination - send route reply
+                    log_info(BT_TAG, "We are the destination - sending route reply");
+                    struct route_reply reply;
+                    if (create_route_reply(g_manager->mesh_node, req.request_id,
+                                          result.updated_reverse_path, result.updated_path_len, &reply) == 0) {
+                        // Find previous hop to send reply to
+                        if (result.updated_path_len >= 2) {
+                            const uint32_t prev_hop = result.updated_reverse_path[result.updated_path_len - 2];
+                            ble_send_route_reply(g_manager, prev_hop, reply.request_id,
+                                               reply.route_cost, reply.forward_path, reply.forward_path_len);
+                        }
+                        if (reply.forward_path) free(reply.forward_path);
+                    }
+                } else if (action == 2) {
+                    // We have cached route - send route reply with cached info
+                    log_info(BT_TAG, "Have cached route - sending route reply");
+                    struct route_reply reply;
+                    if (create_route_reply(g_manager->mesh_node, req.request_id,
+                                          result.updated_reverse_path, result.updated_path_len, &reply) == 0) {
+                        if (result.updated_path_len >= 2) {
+                            const uint32_t prev_hop = result.updated_reverse_path[result.updated_path_len - 2];
+                            ble_send_route_reply(g_manager, prev_hop, reply.request_id,
+                                               reply.route_cost, reply.forward_path, reply.forward_path_len);
+                        }
+                        if (reply.forward_path) free(reply.forward_path);
+                    }
+                } else if (action == 0) {
+                    // Forward the request to all neighbors except sender
+                    log_info(BT_TAG, "Forwarding route request (hops: %u)", result.hop_count);
+                    ble_broadcast_route_request(g_manager, req.request_id, req.destination_id,
+                                               result.hop_count, result.updated_reverse_path,
+                                               result.updated_path_len, result.exclude_neighbor);
+                }
+
+                if (result.updated_reverse_path) free(result.updated_reverse_path);
+            }
+            if (req.reverse_path) free(req.reverse_path);
+        }
+    } else if (header.message_type == MSG_ROUTE_REPLY) {
+        struct route_reply reply;
+        memset(&reply, 0, sizeof(reply));
+        if (parse_route_reply(byteArray->data + 16, byteArray->len - 16, &reply) == 0) {
+            log_info(BT_TAG, "Received route reply from 0x%08X (cost: %u, path_len: %u)",
+                    network.source_id, reply.route_cost, reply.forward_path_len);
+
+            if (g_manager->mesh_node) {
+                struct route_reply_result result;
+                const int action = handle_route_reply(g_manager->mesh_node, &reply, network.source_id, &result);
+
+                if (action == 1) {
+                    // We are the originator - route discovery complete
+                    log_info(BT_TAG, "Route discovery complete for dest 0x%08X",
+                            reply.forward_path[reply.forward_path_len - 1]);
+                } else if (action == 0) {
+                    // Forward reply toward originator
+                    log_info(BT_TAG, "Forwarding route reply to 0x%08X", result.next_hop);
+                    ble_send_route_reply(g_manager, result.next_hop, result.request_id,
+                                        result.route_cost, result.forward_path, result.forward_path_len);
+                    if (result.forward_path) free(result.forward_path);
+                }
+            }
+            if (reply.forward_path) free(reply.forward_path);
+        }
     } else if (g_manager->data_callback) {
         g_manager->data_callback(network.source_id, byteArray->data, byteArray->len);
     }
@@ -576,6 +651,59 @@ static const char * on_local_char_write(const Application * app, const char * ad
                 reset_missed_heartbeats(g_manager->mesh_node->connection_table, network.source_id);
                 update_last_seen(g_manager->mesh_node->connection_table, network.source_id, heartbeat.timestamp);
             }
+        }
+    } else if (header.message_type == MSG_ROUTE_REQUEST) {
+        struct route_request req;
+        memset(&req, 0, sizeof(req));
+        if (parse_route_request(byteArray->data + 16, byteArray->len - 16, &req) == 0) {
+            log_info(BT_TAG, "Received route request (write) from 0x%08X for dest 0x%08X",
+                    network.source_id, req.destination_id);
+
+            if (g_manager->mesh_node) {
+                struct route_request_result result;
+                const int action = handle_route_request(g_manager->mesh_node, &req, network.source_id, &result);
+
+                if (action == 1 || action == 2) {
+                    struct route_reply reply;
+                    if (create_route_reply(g_manager->mesh_node, req.request_id,
+                                          result.updated_reverse_path, result.updated_path_len, &reply) == 0) {
+                        if (result.updated_path_len >= 2) {
+                            const uint32_t prev_hop = result.updated_reverse_path[result.updated_path_len - 2];
+                            ble_send_route_reply(g_manager, prev_hop, reply.request_id,
+                                               reply.route_cost, reply.forward_path, reply.forward_path_len);
+                        }
+                        if (reply.forward_path) free(reply.forward_path);
+                    }
+                } else if (action == 0) {
+                    ble_broadcast_route_request(g_manager, req.request_id, req.destination_id,
+                                               result.hop_count, result.updated_reverse_path,
+                                               result.updated_path_len, result.exclude_neighbor);
+                }
+
+                if (result.updated_reverse_path) free(result.updated_reverse_path);
+            }
+            if (req.reverse_path) free(req.reverse_path);
+        }
+    } else if (header.message_type == MSG_ROUTE_REPLY) {
+        struct route_reply reply;
+        memset(&reply, 0, sizeof(reply));
+        if (parse_route_reply(byteArray->data + 16, byteArray->len - 16, &reply) == 0) {
+            log_info(BT_TAG, "Received route reply (write) from 0x%08X", network.source_id);
+
+            if (g_manager->mesh_node) {
+                struct route_reply_result result;
+                const int action = handle_route_reply(g_manager->mesh_node, &reply, network.source_id, &result);
+
+                if (action == 1) {
+                    log_info(BT_TAG, "Route discovery complete for dest 0x%08X",
+                            reply.forward_path[reply.forward_path_len - 1]);
+                } else if (action == 0) {
+                    ble_send_route_reply(g_manager, result.next_hop, result.request_id,
+                                        result.route_cost, result.forward_path, result.forward_path_len);
+                    if (result.forward_path) free(result.forward_path);
+                }
+            }
+            if (reply.forward_path) free(reply.forward_path);
         }
     } else if (g_manager->data_callback) {
         g_manager->data_callback(network.source_id, byteArray->data, byteArray->len);
@@ -882,3 +1010,174 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
     printf("\t Total: %u known, %u connected\n", known, connected);
     printf("--------------------------------------------------------------------\n");
 }
+
+/* ========================================================================== */
+/* Route Discovery Implementation                                              */
+/* ========================================================================== */
+
+uint32_t ble_initiate_route_discovery(ble_node_manager_t *manager, const uint32_t destination_id) {
+    if (!manager || !manager->mesh_node) return 0;
+
+    struct route_request req;
+    memset(&req, 0, sizeof(req));
+
+    const int result = create_route_request(manager->mesh_node, destination_id, &req);
+    if (result <= 0) {
+        if (req.reverse_path) free(req.reverse_path);
+        return 0;
+    }
+
+    log_info(BT_TAG, "Initiating route discovery for 0x%08X (request_id: 0x%08X)",
+            destination_id, req.request_id);
+
+    // Broadcast route request to all connected neighbors
+    const gboolean sent = ble_broadcast_route_request(manager, req.request_id, destination_id,
+                                                       req.hop_count, req.reverse_path,
+                                                       req.reverse_path_len, 0);
+
+    if (req.reverse_path) free(req.reverse_path);
+
+    return sent ? req.request_id : 0;
+}
+
+gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t request_id,
+                                     const uint32_t destination_id, const uint8_t hop_count,
+                                     const uint32_t *reverse_path, const uint8_t reverse_path_len,
+                                     const uint32_t exclude_id) {
+    if (!manager || !reverse_path || reverse_path_len == 0) return FALSE;
+
+    // Build route request structure
+    struct route_request req = {
+        .request_id = request_id,
+        .destination_id = destination_id,
+        .hop_count = hop_count,
+        .reverse_path_len = reverse_path_len,
+        .reverse_path = (uint32_t *)reverse_path  // Cast away const for serialize
+    };
+
+    // Build packet header
+    struct header header = {
+        .protocol_version = PROTOCOL_VERSION,
+        .message_type = MSG_ROUTE_REQUEST,
+        .fragmentation_flag = 0,
+        .fragmentation_number = 0,
+        .total_fragments = 1,
+        .time_to_live = MAX_HOP_COUNT,
+        .payload_length = 0,  // Will be set after serialization
+        .sequence_number = 0
+    };
+
+    struct network network = {
+        .source_id = manager->device_id,
+        .destination_id = destination_id
+    };
+
+    // Serialize route request payload
+    uint8_t payload_buffer[256];
+    const size_t payload_len = serialize_route_request(&req, payload_buffer, sizeof(payload_buffer));
+    if (payload_len == 0) {
+        log_error(BT_TAG, "Failed to serialize route request");
+        return FALSE;
+    }
+
+    header.payload_length = (uint16_t)payload_len;
+
+    // Create packet
+    const struct packet packet = {
+        .header = &header,
+        .network = &network,
+        .payload = payload_buffer,
+        .security = NULL
+    };
+
+    // Serialize complete packet
+    uint8_t buffer[MAX_BLE_PAYLOAD_SIZE];
+    const size_t total_len = serialize_packet(&packet, buffer, sizeof(buffer));
+    if (total_len == 0) {
+        log_error(BT_TAG, "Failed to serialize route request packet");
+        return FALSE;
+    }
+
+    // Send to all connected neighbors except exclude_id
+    gboolean sent_any = FALSE;
+    for (guint i = 0; i < manager->discovered_count; i++) {
+        const tracked_device_t *tracked = &manager->discovered_devices[i];
+        if (!tracked->is_connected) continue;
+        if (tracked->device_id == exclude_id) continue;
+
+        if (ble_send_data(manager, tracked->device_id, buffer, total_len)) {
+            log_debug(BT_TAG, "Sent route request to 0x%08X", tracked->device_id);
+            sent_any = TRUE;
+        }
+    }
+
+    if (sent_any) {
+        log_info(BT_TAG, "Broadcast route request for 0x%08X (hops: %u, path_len: %u)",
+                destination_id, hop_count, reverse_path_len);
+    }
+
+    return sent_any;
+}
+
+gboolean ble_send_route_reply(ble_node_manager_t *manager, const uint32_t target_id,
+                              const uint32_t request_id, const uint8_t route_cost,
+                              const uint32_t *forward_path, const uint8_t forward_path_len) {
+    if (!manager || !forward_path || forward_path_len == 0) return FALSE;
+
+    // Build route reply structure
+    struct route_reply reply = {
+        .request_id = request_id,
+        .route_cost = route_cost,
+        .forward_path_len = forward_path_len,
+        .forward_path = (uint32_t *)forward_path
+    };
+
+    // Build packet header
+    struct header header = {
+        .protocol_version = PROTOCOL_VERSION,
+        .message_type = MSG_ROUTE_REPLY,
+        .fragmentation_flag = 0,
+        .fragmentation_number = 0,
+        .total_fragments = 1,
+        .time_to_live = MAX_HOP_COUNT,
+        .payload_length = 0,
+        .sequence_number = 0
+    };
+
+    struct network network = {
+        .source_id = manager->device_id,
+        .destination_id = target_id
+    };
+
+    // Serialize route reply payload
+    uint8_t payload_buffer[256];
+    const size_t payload_len = serialize_route_reply(&reply, payload_buffer, sizeof(payload_buffer));
+    if (payload_len == 0) {
+        log_error(BT_TAG, "Failed to serialize route reply");
+        return FALSE;
+    }
+
+    header.payload_length = (uint16_t)payload_len;
+
+    // Create packet
+    const struct packet packet = {
+        .header = &header,
+        .network = &network,
+        .payload = payload_buffer,
+        .security = NULL
+    };
+
+    // Serialize complete packet
+    uint8_t buffer[MAX_BLE_PAYLOAD_SIZE];
+    const size_t total_len = serialize_packet(&packet, buffer, sizeof(buffer));
+    if (total_len == 0) {
+        log_error(BT_TAG, "Failed to serialize route reply packet");
+        return FALSE;
+    }
+
+    log_info(BT_TAG, "Sending route reply to 0x%08X (cost: %u, path_len: %u)",
+            target_id, route_cost, forward_path_len);
+
+    return ble_send_data(manager, target_id, buffer, total_len);
+}
+

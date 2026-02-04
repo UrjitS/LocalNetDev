@@ -29,6 +29,8 @@ typedef struct {
 // Command handlers
 static void cmd_show_connections(void);
 static void cmd_show_node_info(void);
+static void cmd_show_routes(void);
+static void cmd_discover_route(void);
 static void cmd_show_help(void);
 static void cmd_quit(void);
 
@@ -36,6 +38,8 @@ static void cmd_quit(void);
 static const menu_command_t g_menu_commands[] = {
     { "1", "Show connection table",     cmd_show_connections },
     { "2", "Show Node info",            cmd_show_node_info },
+    { "3", "Show routing table",        cmd_show_routes },
+    { "4", "Discover route to node",    cmd_discover_route },
     { "h", "Show help",                 cmd_show_help },
     { "q", "Quit",                      cmd_quit },
     { NULL, NULL, NULL }
@@ -63,6 +67,65 @@ static void cmd_show_node_info(void) {
     printf("\t Connected Nodes: %-49u \n", ble_get_connected_count(g_ble_manager));
     printf("--------------------------------------------------------------------\n");
     printf("\n");
+}
+
+static void cmd_show_routes(void) {
+    printf("\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("ROUTING TABLE\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("\t %-12s %-12s %-10s %-10s %-12s\n", "Destination", "Next Hop", "Hops", "Cost", "Valid");
+    printf("--------------------------------------------------------------------\n");
+
+    // Note: In a full implementation, we'd access the mesh_node through g_ble_manager
+    // For now, show a placeholder message
+    printf("\t (Routing table display requires mesh_node integration)\n");
+    printf("\t Use route discovery to populate routes.\n");
+
+    printf("--------------------------------------------------------------------\n");
+    printf("\n");
+}
+
+static void cmd_discover_route(void) {
+    if (!g_ble_manager) {
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
+        return;
+    }
+
+    printf("Enter destination node ID (hex, e.g., 0x12345678): ");
+    fflush(stdout);
+
+    char input[32];
+    if (fgets(input, sizeof(input), stdin) == NULL) {
+        fprintf(stderr, "Error reading input\n");
+        return;
+    }
+
+    // Remove newline
+    input[strcspn(input, "\n\r")] = '\0';
+
+    // Parse hex value
+    char *endptr;
+    unsigned long dest_id = strtoul(input, &endptr, 0);
+    if (endptr == input || *endptr != '\0') {
+        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        return;
+    }
+
+    if (dest_id == 0 || dest_id == g_device_id) {
+        fprintf(stderr, "Invalid destination (cannot be 0 or self)\n");
+        return;
+    }
+
+    printf("Initiating route discovery for 0x%08lX...\n", dest_id);
+    uint32_t request_id = ble_initiate_route_discovery(g_ble_manager, (uint32_t)dest_id);
+
+    if (request_id > 0) {
+        printf("Route discovery initiated (request ID: 0x%08X)\n", request_id);
+        printf("Route will be added to routing table when reply is received.\n");
+    } else {
+        printf("Route discovery failed or route already exists.\n");
+    }
 }
 
 static void cmd_show_help(void) {
