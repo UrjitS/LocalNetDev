@@ -70,6 +70,27 @@ static tracked_device_t * find_device_by_ptr(Device * device) {
     return NULL;
 }
 
+static void remove_tracked_device(const uint32_t device_id) {
+    if (!g_manager) return;
+    for (guint i = 0; i < g_manager->discovered_count; i++) {
+        if (g_manager->discovered_devices[i].device_id == device_id) {
+            // Shift remaining elements down
+            for (guint j = i; j < g_manager->discovered_count - 1; j++) {
+                g_manager->discovered_devices[j] = g_manager->discovered_devices[j + 1];
+            }
+            g_manager->discovered_count--;
+            memset(&g_manager->discovered_devices[g_manager->discovered_count], 0, sizeof(tracked_device_t));
+            return;
+        }
+    }
+}
+
+static void clear_all_tracked_devices(void) {
+    if (!g_manager || !g_manager->discovered_devices) return;
+    memset(g_manager->discovered_devices, 0, sizeof(tracked_device_t) * MAX_DISCOVERED_DEVICES);
+    g_manager->discovered_count = 0;
+}
+
 static tracked_device_t * add_device(const uint32_t device_id, const char * mac, Device * device) {
     if (!g_manager || g_manager->discovered_count >= MAX_DISCOVERED_DEVICES) return NULL;
 
@@ -172,7 +193,11 @@ static gboolean heartbeat_callback(gpointer user_data) {
     guint connected = 0;
     guint timed_out = 0;
 
-    // Check all connected devices for heartbeat timeout 
+    // Collect timed out device IDs first (iterate backwards to safely remove)
+    uint32_t timed_out_ids[MAX_DISCOVERED_DEVICES];
+    guint timed_out_count = 0;
+
+    // Check all connected devices for heartbeat timeout
     for (guint i = 0; i < g_manager->discovered_count; i++) {
         tracked_device_t * tracked = &g_manager->discovered_devices[i];
         if (!tracked->is_connected) continue;
@@ -182,6 +207,7 @@ static gboolean heartbeat_callback(gpointer user_data) {
         // Check for timeout 
         if (now - tracked->last_heartbeat > HEARTBEAT_TIMEOUT_SECONDS) {
             log_info(BT_TAG, "Heartbeat timeout: disconnecting 0x%08X", tracked->device_id);
+            timed_out_ids[timed_out_count++] = tracked->device_id;
             tracked->is_connected = FALSE;
             timed_out++;
 
@@ -196,7 +222,12 @@ static gboolean heartbeat_callback(gpointer user_data) {
         }
     }
 
-    // Create proper heartbeat message using protocol structures 
+    // Now remove timed out devices from internal tracking
+    for (guint i = 0; i < timed_out_count; i++) {
+        remove_tracked_device(timed_out_ids[i]);
+    }
+
+    // Create proper heartbeat message using protocol structures
     const struct heartbeat heartbeat = {
         .device_status = 0x01,
         .active_connection_number = (uint8_t)count_connected(),
@@ -364,12 +395,16 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
         case BINC_DISCONNECTED:
             if (tracked) {
                 const gboolean was_connected = tracked->is_connected;
+                const uint32_t tracked_device_id = tracked->device_id;
                 tracked->is_connected = FALSE;
                 tracked->device = NULL;
 
                 if (was_connected && g_manager->disconnected_callback) {
-                    g_manager->disconnected_callback(device_id);
+                    g_manager->disconnected_callback(tracked_device_id);
                 }
+
+                // Remove from internal tracking to prevent stale cache
+                remove_tracked_device(tracked_device_id);
             }
 
             // Remove device from BlueZ cache to allow fresh discovery 
@@ -756,6 +791,14 @@ gboolean ble_start(ble_node_manager_t * manager) {
 
     log_info(BT_TAG, "Using adapter: %s", binc_adapter_get_name(manager->adapter));
 
+    // Power cycle the adapter to ensure clean state - this forces BlueZ to drop
+    // any auto-reconnection attempts and cached connection state from previous sessions
+    log_debug(BT_TAG, "Power cycling adapter to clear previous session state...");
+    binc_adapter_power_off(manager->adapter);
+    g_usleep(500000);  // 500ms delay to allow adapter to fully power down
+    binc_adapter_power_on(manager->adapter);
+    g_usleep(500000);  // 500ms delay to allow adapter to fully power up
+
     // Clean up any cached LocalNet devices from previous sessions
     log_debug(BT_TAG, "Cleaning up stale LocalNet devices from previous session");
     GList * existing_devices = binc_adapter_get_devices(manager->adapter);
@@ -768,6 +811,9 @@ gboolean ble_start(ble_node_manager_t * manager) {
         }
     }
     g_list_free(existing_devices);
+
+    // Clear internal tracked device list to ensure fresh state
+    clear_all_tracked_devices();
 
     // Create agent for pairing
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
@@ -829,6 +875,9 @@ void ble_stop(ble_node_manager_t * manager) {
         }
         g_list_free(devices);
     }
+
+    // Clear internal tracked device list
+    clear_all_tracked_devices();
 
     // Unregister GATT application before freeing
     if (manager->app && manager->adapter) {
