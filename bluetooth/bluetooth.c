@@ -575,7 +575,13 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
-
+    // Reject connections if we're not actively advertising
+    if (!g_manager->advertisement) {
+        log_info(BT_TAG, "Rejecting ghost connection from %s", mac);
+        binc_device_disconnect(device);
+        binc_adapter_remove_device(adapter, device);
+        return;
+    }
     // Identify the device
     uint32_t device_id = 0;
     if (is_localnet_device(name)) {
@@ -822,6 +828,9 @@ gboolean ble_start(ble_node_manager_t * manager) {
     // Clear internal tracked device list to ensure fresh state
     clear_all_tracked_devices();
 
+    binc_adapter_pairable_off(manager->adapter);
+    log_debug(BT_TAG, "Disabled pairing to prevent ghost connections");
+
     // Create agent for pairing
     manager->agent = binc_agent_create(manager->adapter, "/org/bluez/LocalNetAgent", NO_INPUT_NO_OUTPUT);
     binc_agent_set_request_authorization_cb(manager->agent, &on_request_authorization);
@@ -877,6 +886,31 @@ void ble_stop(ble_node_manager_t * manager) {
             const char * name = binc_device_get_name(device);
             if (is_localnet_device(name)) {
                 log_debug(BT_TAG, "Removing cached device: %s", name);
+                binc_adapter_remove_device(manager->adapter, device);
+            }
+        }
+        g_list_free(devices);
+    }
+    // Disconnect ALL devices aggressively
+    log_debug(BT_TAG, "Disconnecting all devices...");
+    for (guint i = 0; i < manager->discovered_count; i++) {
+        const tracked_device_t * tracked = &manager->discovered_devices[i];
+        if (tracked->device) {
+            binc_device_disconnect(tracked->device);
+            g_usleep(100000);  // 100ms per device
+        }
+    }
+
+    // Wait for disconnections to complete
+    g_usleep(500000);  // 500ms
+
+    // Remove ALL cached LocalNet devices
+    if (manager->adapter) {
+        GList * devices = binc_adapter_get_devices(manager->adapter);
+        for (const GList * it = devices; it != NULL; it = it->next) {
+            Device * device = it->data;
+            const char * name = binc_device_get_name(device);
+            if (is_localnet_device(name)) {
                 binc_adapter_remove_device(manager->adapter, device);
             }
         }
