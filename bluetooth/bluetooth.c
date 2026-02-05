@@ -794,10 +794,17 @@ gboolean ble_start(ble_node_manager_t * manager) {
     // Power cycle the adapter to ensure clean state - this forces BlueZ to drop
     // any auto-reconnection attempts and cached connection state from previous sessions
     log_debug(BT_TAG, "Power cycling adapter to clear previous session state...");
-    binc_adapter_power_off(manager->adapter);
-    g_usleep(500000);  // 500ms delay to allow adapter to fully power down
+    // Power on
     binc_adapter_power_on(manager->adapter);
-    g_usleep(500000);  // 500ms delay to allow adapter to fully power up
+
+    // Poll until ready (max 5 seconds)
+    for (int i = 0; i < 50; i++) {
+        g_usleep(100000);  // 100ms
+        if (binc_adapter_is_discoverable(manager->adapter)) {
+            g_usleep(500000);  // Extra 500ms for stability
+            break;
+        }
+    }
 
     // Clean up any cached LocalNet devices from previous sessions
     log_debug(BT_TAG, "Cleaning up stale LocalNet devices from previous session");
