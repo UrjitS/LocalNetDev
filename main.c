@@ -117,8 +117,8 @@ static void cmd_discover_route(void) {
         return;
     }
 
-    printf("Initiating route discovery for 0x%08lX...\n", dest_id);
-    uint32_t request_id = ble_initiate_route_discovery(g_ble_manager, (uint32_t)dest_id);
+    printf("Initiating route discovery for 0x%08lX\n", dest_id);
+    const uint32_t request_id = ble_initiate_route_discovery(g_ble_manager, (uint32_t)dest_id);
 
     if (request_id > 0) {
         printf("Route discovery initiated (request ID: 0x%08X)\n", request_id);
@@ -388,9 +388,10 @@ int main(const int argc, char *argv[]) {
     if (signal(SIGTERM, signal_handler) == SIG_ERR) {
         log_error(TAG, "Cannot set SIGTERM handler");
     }
+    struct mesh_node * mesh_node = create_mesh_node(g_device_id, node_type);
 
     // Initialize BLE node manager with callbacks
-    g_ble_manager = ble_init(NULL, g_device_id,
+    g_ble_manager = ble_init(mesh_node, g_device_id,
                               on_node_discovered,
                               on_node_connected,
                               on_node_disconnected,

@@ -1108,8 +1108,7 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
 uint32_t ble_initiate_route_discovery(ble_node_manager_t *manager, const uint32_t destination_id) {
     if (!manager || !manager->mesh_node) return 0;
 
-    struct route_request req;
-    memset(&req, 0, sizeof(req));
+    struct route_request req = {0};
 
     const int result = create_route_request(manager->mesh_node, destination_id, &req);
     if (result <= 0) {
