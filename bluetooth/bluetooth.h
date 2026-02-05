@@ -84,6 +84,9 @@ guint ble_get_connected_count(ble_node_manager_t *manager);
 void ble_get_connection_table(ble_node_manager_t *manager, uint32_t *devices, guint *count, guint max_count);
 void ble_print_connection_table(ble_node_manager_t *manager);
 
+// Get mesh node for routing table access
+struct mesh_node *ble_get_mesh_node(ble_node_manager_t *manager);
+
 // Route discovery callbacks
 typedef void (*ble_route_found_callback)(uint32_t destination_id, uint32_t next_hop, uint8_t hop_count);
 typedef void (*ble_route_failed_callback)(uint32_t destination_id);

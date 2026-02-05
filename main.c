@@ -70,18 +70,48 @@ static void cmd_show_node_info(void) {
 }
 
 static void cmd_show_routes(void) {
+    if (!g_ble_manager) {
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
+        return;
+    }
+
+    struct mesh_node *node = ble_get_mesh_node(g_ble_manager);
+    if (!node || !node->routing_table) {
+        fprintf(stderr, "Error: Routing table not available\n");
+        return;
+    }
+
     printf("\n");
     printf("--------------------------------------------------------------------\n");
     printf("ROUTING TABLE\n");
     printf("--------------------------------------------------------------------\n");
-    printf("\t %-12s %-12s %-10s %-10s %-12s\n", "Destination", "Next Hop", "Hops", "Cost", "Valid");
+    printf("\t %-12s %-12s %-6s %-8s %-8s\n", "Destination", "Next Hop", "Hops", "Cost", "Valid");
     printf("--------------------------------------------------------------------\n");
 
-    // Note: In a full implementation, we'd access the mesh_node through g_ble_manager
-    // For now, show a placeholder message
-    printf("\t (Routing table display requires mesh_node integration)\n");
-    printf("\t Use route discovery to populate routes.\n");
+    struct routing_table *rt = node->routing_table;
+    size_t valid_count = 0;
 
+    for (size_t i = 0; i < rt->count; i++) {
+        struct routing_entry *entry = &rt->entries[i];
+        if (entry->destination_id == 0) continue;
+
+        const char *valid_str = entry->is_valid ? "Yes" : "No";
+        printf("\t 0x%08X   0x%08X   %-6u %-8.2f %-8s\n",
+               entry->destination_id,
+               entry->next_hop,
+               entry->hop_count,
+               entry->route_cost,
+               valid_str);
+
+        if (entry->is_valid) valid_count++;
+    }
+
+    if (rt->count == 0) {
+        printf("\t (no routes - use route discovery to find paths)\n");
+    }
+
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Total: %zu routes (%zu valid)\n", rt->count, valid_count);
     printf("--------------------------------------------------------------------\n");
     printf("\n");
 }

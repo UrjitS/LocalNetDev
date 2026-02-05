@@ -971,6 +971,11 @@ void ble_print_connection_table(ble_node_manager_t *manager) {
     printf("--------------------------------------------------------------------\n");
 }
 
+struct mesh_node *ble_get_mesh_node(ble_node_manager_t *manager) {
+    if (!manager) return NULL;
+    return manager->mesh_node;
+}
+
 /* ========================================================================== */
 /* Route Discovery Implementation                                              */
 /* ========================================================================== */
