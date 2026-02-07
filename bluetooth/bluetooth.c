@@ -424,6 +424,8 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
             break;
         case BINC_CONNECTING:
         case BINC_DISCONNECTING:
+            start_advertising();
+            start_discovery();
             break;
     }
 }
@@ -1110,7 +1112,7 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
     if (!manager || !reverse_path || reverse_path_len == 0) return FALSE;
 
     // Build route request structure
-    struct route_request req = {
+    const struct route_request req = {
         .request_id = request_id,
         .destination_id = destination_id,
         .hop_count = hop_count,
