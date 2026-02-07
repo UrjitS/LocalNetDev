@@ -447,7 +447,7 @@ static void on_services_resolved(Device * device) {
     }
 
     log_debug(BT_TAG, "Restarting advertising and discovery after successful connection");
-    start_advertising();
+    // start_advertising();
     start_discovery();
 
     if (g_manager->connected_callback) {
