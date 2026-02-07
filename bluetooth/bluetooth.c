@@ -424,8 +424,8 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
             break;
         case BINC_CONNECTING:
         case BINC_DISCONNECTING:
-            stop_discovery();
-            stop_advertising();
+            // stop_discovery();
+            // stop_advertising();
             break;
     }
 }
@@ -447,7 +447,7 @@ static void on_services_resolved(Device * device) {
     }
 
     log_debug(BT_TAG, "Restarting advertising and discovery after successful connection");
-    // start_advertising();
+    start_advertising();
     start_discovery();
 
     if (g_manager->connected_callback) {
