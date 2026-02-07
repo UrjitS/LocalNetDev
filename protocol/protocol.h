@@ -76,7 +76,7 @@ struct route_request {
     uint32_t destination_id;
     uint8_t hop_count;
     uint8_t reverse_path_len; // Number of entries in reverse_path
-    uint32_t *reverse_path;   // Pointer to array of device IDs (reverse path)
+    uint32_t * reverse_path;   // Pointer to array of device IDs (reverse path)
 };
 
 /* Route reply: forward_path is variable length array of 32-bit device ids */
@@ -84,7 +84,7 @@ struct route_reply {
     uint32_t request_id;
     uint8_t route_cost;
     uint8_t forward_path_len; // Number of entries in forward_path
-    uint32_t *forward_path;   // Pointer to array of device IDs (forward path)
+    uint32_t * forward_path;   // Pointer to array of device IDs (forward path)
 };
 
 struct heartbeat {
@@ -98,7 +98,7 @@ struct acknowledgement {
     uint16_t sequence_number;
     uint8_t status_code;
     uint8_t received_fragment_count;
-    uint8_t *received_fragment_list;
+    uint8_t * received_fragment_list;
 };
 
 /* Key exchange message: public key is 32 bytes */
@@ -135,10 +135,10 @@ struct fragment_buffer {
     uint16_t sequence_number;
     uint8_t total_fragments;
     uint8_t received_count;
-    uint8_t *received_flags;  // Bitmap of received fragments
-    uint8_t **fragments;      // Array of fragment payloads
-    uint16_t *fragment_sizes; // Size of each fragment
-    uint32_t timestamp;       // For timeout tracking
+    uint8_t * received_flags;  // Bitmap of received fragments
+    uint8_t ** fragments;      // Array of fragment payloads
+    uint16_t * fragment_sizes; // Size of each fragment
+    uint32_t timestamp;        // For timeout tracking
 };
 
 /* Serialization functions */
