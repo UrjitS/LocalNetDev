@@ -32,6 +32,8 @@ static void cmd_show_connections(void);
 static void cmd_show_node_info(void);
 static void cmd_show_routes(void);
 static void cmd_discover_route(void);
+static void cmd_send_message(void);
+static void cmd_show_pending_packets(void);
 static void cmd_show_help(void);
 static void cmd_quit(void);
 
@@ -41,6 +43,8 @@ static const menu_command_t g_menu_commands[] = {
     { "2", "Show Node info",            cmd_show_node_info },
     { "3", "Show routing table",        cmd_show_routes },
     { "4", "Discover route to node",    cmd_discover_route },
+    { "5", "Send message to node",      cmd_send_message },
+    { "6", "Show pending packets",      cmd_show_pending_packets },
     { "h", "Show help",                 cmd_show_help },
     { "q", "Quit",                      cmd_quit },
     { NULL, NULL, NULL }
@@ -157,6 +161,123 @@ static void cmd_discover_route(void) {
     } else {
         printf("Route discovery failed or route already exists.\n");
     }
+}
+
+static void cmd_send_message(void) {
+    if (!g_ble_manager) {
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
+        return;
+    }
+
+    printf("Enter destination node ID (hex, e.g., 0x12345678): ");
+    fflush(stdout);
+
+    char input[256];
+    if (fgets(input, sizeof(input), stdin) == NULL) {
+        fprintf(stderr, "Error reading input\n");
+        return;
+    }
+
+    // Remove newline
+    input[strcspn(input, "\n\r")] = '\0';
+
+    // Parse hex value
+    char * end_ptr;
+    const unsigned long dest_id = strtoul(input, &end_ptr, 0);
+    if (end_ptr == input || *end_ptr != '\0') {
+        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        return;
+    }
+
+    if (dest_id == 0 || dest_id == g_device_id) {
+        fprintf(stderr, "Invalid destination (cannot be 0 or self)\n");
+        return;
+    }
+
+    printf("Enter message: ");
+    fflush(stdout);
+
+    char message[200];
+    if (fgets(message, sizeof(message), stdin) == NULL) {
+        fprintf(stderr, "Error reading message\n");
+        return;
+    }
+    message[strcspn(message, "\n\r")] = '\0';
+
+    if (strlen(message) == 0) {
+        fprintf(stderr, "Message cannot be empty\n");
+        return;
+    }
+
+    printf("Sending message to 0x%08lX: \"%s\"\n", dest_id, message);
+
+    const uint16_t seq = ble_send_message(g_ble_manager, (uint32_t)dest_id,
+                                           (const uint8_t *)message, strlen(message));
+
+    if (seq > 0) {
+        printf("Message queued for transmission (sequence: %u)\n", seq);
+        printf("If no route exists, route discovery will be initiated automatically.\n");
+    } else {
+        printf("Failed to queue message.\n");
+    }
+}
+
+static void cmd_show_pending_packets(void) {
+    if (!g_ble_manager) {
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
+        return;
+    }
+
+    struct mesh_node * node = ble_get_mesh_node(g_ble_manager);
+    if (!node || !node->packet_queue) {
+        fprintf(stderr, "Error: Packet queue not available\n");
+        return;
+    }
+
+    printf("\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("PENDING PACKETS\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("\t %-6s %-12s %-15s %-8s %-10s\n", "Seq", "Destination", "State", "Retries", "Interval");
+    printf("--------------------------------------------------------------------\n");
+
+    const struct pending_packet_queue * queue = node->packet_queue;
+    size_t pending_count = 0;
+
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        const struct pending_packet * pkt = &queue->packets[i];
+        if (pkt->state == PACKET_STATE_EMPTY) continue;
+
+        const char * state_str;
+        switch (pkt->state) {
+            case PACKET_STATE_AWAITING_ROUTE: state_str = "AWAITING_ROUTE"; break;
+            case PACKET_STATE_AWAITING_ACK: state_str = "AWAITING_ACK"; break;
+            case PACKET_STATE_DELIVERED: state_str = "DELIVERED"; break;
+            case PACKET_STATE_FAILED: state_str = "FAILED"; break;
+            default: state_str = "UNKNOWN"; break;
+        }
+
+        printf("\t %-6u 0x%08X   %-15s %-8u %-10u ms\n",
+               pkt->sequence_number,
+               pkt->destination_id,
+               state_str,
+               pkt->retry_count,
+               pkt->retry_interval_ms);
+
+        if (pkt->state == PACKET_STATE_AWAITING_ROUTE ||
+            pkt->state == PACKET_STATE_AWAITING_ACK) {
+            pending_count++;
+        }
+    }
+
+    if (queue->count == 0) {
+        printf("\t (no pending packets)\n");
+    }
+
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Total: %zu pending, Next seq: %u\n", pending_count, queue->next_sequence_number);
+    printf("--------------------------------------------------------------------\n");
+    printf("\n");
 }
 
 static void cmd_show_help(void) {

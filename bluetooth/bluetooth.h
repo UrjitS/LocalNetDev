@@ -112,4 +112,23 @@ gboolean ble_send_route_reply(ble_node_manager_t *manager, uint32_t target_id,
                               uint32_t request_id, uint8_t route_cost,
                               const uint32_t *forward_path, uint8_t forward_path_len);
 
+/**
+ * Send a data message to a destination node
+ * If no route exists, initiates route discovery and queues the message
+ * Returns the sequence number on success, 0 on failure
+ */
+uint16_t ble_send_message(ble_node_manager_t *manager, uint32_t destination_id,
+                          const uint8_t *payload, size_t payload_len);
+
+/**
+ * Send queued packets for a destination after route discovery completes
+ */
+void ble_send_queued_packets(ble_node_manager_t *manager, uint32_t destination_id);
+
+/**
+ * Process retransmission timeouts
+ * Should be called periodically (e.g., from heartbeat timer)
+ */
+void ble_process_retransmissions(ble_node_manager_t *manager);
+
 #endif // LOCALNET_BLUETOOTH_H

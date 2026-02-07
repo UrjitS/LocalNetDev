@@ -802,6 +802,171 @@ void test_mesh_network_scenario() {
     printf("Test passed: Complete mesh network scenario\n\n");
 }
 
+/* Test Pending Packet Queue */
+void test_pending_packet_queue() {
+    printf("Testing pending packet queue...\n");
+
+    struct pending_packet_queue *queue = create_pending_packet_queue();
+    assert(queue != NULL);
+    assert(queue->count == 0);
+    assert(queue->next_sequence_number == 1);
+
+    // Queue a packet
+    uint8_t test_data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
+    uint16_t seq1 = queue_packet_for_transmission(queue, 0x123456,
+                                                  test_data, sizeof(test_data), 1000);
+    assert(seq1 == 1);
+    assert(queue->count == 1);
+
+    // Queue another packet
+    uint16_t seq2 = queue_packet_for_transmission(queue, 0x654321,
+                                                  test_data, sizeof(test_data), 1000);
+    assert(seq2 == 2);
+    assert(queue->count == 2);
+
+    // Get pending packet
+    struct pending_packet *pkt = get_pending_packet(queue, seq1);
+    assert(pkt != NULL);
+    assert(pkt->destination_id == 0x123456);
+    assert(pkt->state == PACKET_STATE_AWAITING_ACK);
+    assert(pkt->retry_count == 0);
+
+    // Test retransmission timeout check
+    uint16_t retry_seqs[10];
+    size_t retry_count = check_retransmission_timeouts(queue, 2000, retry_seqs, 10);
+    assert(retry_count == 2);  // Both packets should need retry
+
+    // Update retry timing
+    update_retry_timing(pkt, 2000);
+    assert(pkt->retry_count == 1);
+    assert(pkt->retry_interval_ms == INITIAL_RETRANSMIT_INTERVAL_MS * RETRANSMIT_BACKOFF_FACTOR);
+
+    // Test acknowledgement
+    struct routing_table *rt = create_routing_table();
+    struct connection_table *ct = create_connection_table();
+    add_connection(ct, 0x111111, -60);
+    acknowledge_packet(queue, rt, ct, seq1, 0x111111);
+    assert(pkt->state == PACKET_STATE_DELIVERED);
+
+    // Cleanup
+    size_t cleaned = cleanup_pending_packets(queue);
+    assert(cleaned == 1);  // Delivered packet cleaned
+
+    free_pending_packet_queue(queue);
+    free_routing_table(rt);
+    free_connection_table(ct);
+    printf("Test passed: Pending packet queue\n\n");
+}
+
+/* Test Forwarding Decision */
+void test_forwarding_decision() {
+    printf("Testing forwarding decision...\n");
+
+    struct mesh_node *node = create_mesh_node(0x001, FULL_NODE);
+    assert(node != NULL);
+
+    // Add a route
+    uint32_t timestamp = get_current_timestamp();
+    add_route(node->routing_table, 0x003, 0x002, 2, 2.0f, timestamp);
+
+    // Test forwarding to known destination
+    struct forwarding_decision decision;
+    uint8_t ttl = 10;
+    int result = make_forwarding_decision(node, 0x003, &ttl, &decision);
+    assert(result == 0);
+    assert(decision.action == 0);  // Forward
+    assert(decision.next_hop == 0x002);
+    assert(ttl == 9);  // TTL decremented
+
+    // Test local delivery
+    ttl = 10;
+    result = make_forwarding_decision(node, 0x001, &ttl, &decision);
+    assert(result == 0);
+    assert(decision.action == 1);  // Local delivery
+
+    // Test TTL expired
+    ttl = 0;
+    result = make_forwarding_decision(node, 0x003, &ttl, &decision);
+    assert(result == -1);
+    assert(decision.action == -1);  // TTL expired
+
+    // Test no route (needs discovery)
+    ttl = 10;
+    result = make_forwarding_decision(node, 0x999, &ttl, &decision);
+    assert(result == 0);
+    assert(decision.action == -2);  // Need route discovery
+
+    free_mesh_node(node);
+    printf("Test passed: Forwarding decision\n\n");
+}
+
+/* Test Route Cost Updates */
+void test_route_cost_updates() {
+    printf("Testing route cost updates...\n");
+
+    struct routing_table *rt = create_routing_table();
+    struct connection_table *ct = create_connection_table();
+    uint32_t timestamp = get_current_timestamp();
+
+    add_connection(ct, 0x002, -60);
+    add_route(rt, 0x003, 0x002, 2, 2.0f, timestamp);
+
+    // Simulate successful packet delivery
+    int result = update_route_cost_on_ack(rt, ct, 0x003, 0x002, 1);
+    assert(result == 0);
+
+    // Check link quality was updated
+    struct connection_entry *conn = find_connection(ct, 0x002);
+    assert(conn != NULL);
+    assert(conn->successful_packets > 0);
+
+    // Simulate failed packet delivery
+    result = update_route_cost_on_ack(rt, ct, 0x003, 0x002, 0);
+    assert(result == 0);
+
+    free_routing_table(rt);
+    free_connection_table(ct);
+    printf("Test passed: Route cost updates\n\n");
+}
+
+/* Test Route Discovery with Packet Queue */
+void test_route_discovery_with_queue() {
+    printf("Testing route discovery with packet queue...\n");
+
+    struct mesh_node *node = create_mesh_node(0x001, FULL_NODE);
+    assert(node != NULL);
+    assert(node->packet_queue != NULL);
+
+    // Queue packet to unknown destination (should be marked as awaiting route)
+    uint8_t test_data[] = {0x01, 0x02, 0x03};
+    uint16_t seq = queue_packet_for_transmission(node->packet_queue, 0x999,
+                                                  test_data, sizeof(test_data), 1000);
+    assert(seq > 0);
+
+    // Mark as awaiting route
+    struct pending_packet *pkt = get_pending_packet(node->packet_queue, seq);
+    pkt->state = PACKET_STATE_AWAITING_ROUTE;
+
+    // Simulate route request association
+    uint32_t request_id = 0x12345678;
+    int count = associate_route_request_with_packets(node->packet_queue, 0x999, request_id);
+    assert(count == 1);
+    assert(pkt->request_id == request_id);
+
+    // Simulate route discovery completion
+    size_t ready = handle_route_discovery_complete(node->packet_queue, 0x999);
+    assert(ready == 1);
+    assert(pkt->state == PACKET_STATE_AWAITING_ACK);
+
+    // Test route discovery failure
+    pkt->state = PACKET_STATE_AWAITING_ROUTE;
+    handle_route_discovery_failed(node->packet_queue, 0x999);
+    assert(pkt->state == PACKET_STATE_FAILED);
+
+    free_mesh_node(node);
+    printf("Test passed: Route discovery with packet queue\n\n");
+}
+
 int main() {
     test_node_creation();
     test_connection_management();
@@ -823,6 +988,10 @@ int main() {
     test_discovery_timing();
     test_link_quality();
     test_mesh_network_scenario();
+    test_pending_packet_queue();
+    test_forwarding_decision();
+    test_route_cost_updates();
+    test_route_discovery_with_queue();
 
     printf("ALL ROUTING TESTS PASSED\n");
 

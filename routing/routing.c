@@ -36,6 +36,7 @@ void free_mesh_node(struct mesh_node *node) {
     free_connection_table(node->connection_table);
     free_routing_table(node->routing_table);
     free_route_request_cache(node->request_cache);
+    free_pending_packet_queue(node->packet_queue);
     free(node);
 }
 
@@ -56,8 +57,9 @@ struct mesh_node *create_mesh_node(const uint32_t device_id, const enum NODE_TYP
     node->connection_table = create_connection_table();
     node->routing_table = create_routing_table();
     node->request_cache = create_route_request_cache();
+    node->packet_queue = create_pending_packet_queue();
 
-    if (!node->connection_table || !node->routing_table || !node->request_cache) {
+    if (!node->connection_table || !node->routing_table || !node->request_cache || !node->packet_queue) {
         free_mesh_node(node);
         return NULL;
     }
@@ -951,5 +953,351 @@ size_t get_connected_neighbors(struct mesh_node *node, uint32_t *neighbors,
     }
 
     return count;
+}
+
+/* ========================================================================== */
+/* Packet Forwarding Engine Implementation                                     */
+/* ========================================================================== */
+
+struct pending_packet_queue *create_pending_packet_queue(void) {
+    struct pending_packet_queue *queue = malloc(sizeof(struct pending_packet_queue));
+    if (!queue) return NULL;
+
+    memset(queue->packets, 0, sizeof(queue->packets));
+    queue->count = 0;
+    queue->next_sequence_number = 1;  /* Start from 1, 0 is reserved for invalid */
+
+    return queue;
+}
+
+void free_pending_packet_queue(struct pending_packet_queue *queue) {
+    if (!queue) return;
+
+    /* Free all pending packet data */
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        if (queue->packets[i].packet_data) {
+            free(queue->packets[i].packet_data);
+            queue->packets[i].packet_data = NULL;
+        }
+    }
+
+    free(queue);
+}
+
+uint16_t queue_packet_for_transmission(struct pending_packet_queue *queue,
+                                       const uint32_t destination_id,
+                                       const uint8_t *packet_data,
+                                       const size_t packet_len,
+                                       const uint32_t current_time_ms) {
+    if (!queue || !packet_data || packet_len == 0) return 0;
+
+    /* Find empty slot */
+    struct pending_packet *slot = NULL;
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        if (queue->packets[i].state == PACKET_STATE_EMPTY ||
+            queue->packets[i].state == PACKET_STATE_DELIVERED ||
+            queue->packets[i].state == PACKET_STATE_FAILED) {
+            /* Clear old data if present */
+            if (queue->packets[i].packet_data) {
+                free(queue->packets[i].packet_data);
+            }
+            slot = &queue->packets[i];
+            break;
+        }
+    }
+
+    if (!slot) {
+        /* No empty slot available */
+        return 0;
+    }
+
+    /* Allocate and copy packet data */
+    slot->packet_data = malloc(packet_len);
+    if (!slot->packet_data) return 0;
+    memcpy(slot->packet_data, packet_data, packet_len);
+
+    /* Initialize packet entry */
+    slot->sequence_number = queue->next_sequence_number++;
+    if (queue->next_sequence_number == 0) queue->next_sequence_number = 1;  /* Skip 0 */
+    slot->destination_id = destination_id;
+    slot->packet_len = packet_len;
+    slot->created_timestamp = current_time_ms;
+    slot->next_retry_timestamp = current_time_ms + INITIAL_RETRANSMIT_INTERVAL_MS;
+    slot->retry_interval_ms = INITIAL_RETRANSMIT_INTERVAL_MS;
+    slot->retry_count = 0;
+    slot->state = PACKET_STATE_AWAITING_ACK;
+    slot->request_id = 0;
+
+    queue->count++;
+
+    return slot->sequence_number;
+}
+
+int acknowledge_packet(struct pending_packet_queue *queue,
+                       struct routing_table *routing_table,
+                       struct connection_table *conn_table,
+                       const uint16_t sequence_number,
+                       const uint32_t sender_id) {
+    if (!queue) return -1;
+
+    struct pending_packet *packet = get_pending_packet(queue, sequence_number);
+    if (!packet) return -1;
+
+    /* Update route cost on successful acknowledgement */
+    if (routing_table && conn_table) {
+        update_route_cost_on_ack(routing_table, conn_table, packet->destination_id, sender_id, 1);
+    }
+
+    /* Mark as delivered */
+    packet->state = PACKET_STATE_DELIVERED;
+
+    return 0;
+}
+
+int associate_route_request_with_packets(struct pending_packet_queue *queue,
+                                         const uint32_t destination_id,
+                                         const uint32_t request_id) {
+    if (!queue) return -1;
+
+    int count = 0;
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        struct pending_packet *packet = &queue->packets[i];
+        if (packet->state == PACKET_STATE_AWAITING_ROUTE &&
+            packet->destination_id == destination_id) {
+            packet->request_id = request_id;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+size_t handle_route_discovery_complete(struct pending_packet_queue *queue,
+                                       const uint32_t destination_id) {
+    if (!queue) return 0;
+
+    size_t count = 0;
+    const uint32_t current_time = get_current_timestamp() * 1000;  /* Convert to ms */
+
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        struct pending_packet *packet = &queue->packets[i];
+        if (packet->state == PACKET_STATE_AWAITING_ROUTE &&
+            packet->destination_id == destination_id) {
+            /* Mark as ready for transmission */
+            packet->state = PACKET_STATE_AWAITING_ACK;
+            packet->next_retry_timestamp = current_time;  /* Send immediately */
+            packet->retry_interval_ms = INITIAL_RETRANSMIT_INTERVAL_MS;
+            packet->retry_count = 0;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+int handle_route_discovery_failed(struct pending_packet_queue *queue,
+                                  const uint32_t destination_id) {
+    if (!queue) return -1;
+
+    int count = 0;
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        struct pending_packet *packet = &queue->packets[i];
+        if (packet->state == PACKET_STATE_AWAITING_ROUTE &&
+            packet->destination_id == destination_id) {
+            packet->state = PACKET_STATE_FAILED;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+size_t check_retransmission_timeouts(struct pending_packet_queue *queue,
+                                     const uint32_t current_time_ms,
+                                     uint16_t *retry_sequence_numbers,
+                                     const size_t max_count) {
+    if (!queue || !retry_sequence_numbers || max_count == 0) return 0;
+
+    size_t retry_count = 0;
+
+    for (size_t i = 0; i < MAX_PENDING_PACKETS && retry_count < max_count; i++) {
+        struct pending_packet *packet = &queue->packets[i];
+
+        if (packet->state != PACKET_STATE_AWAITING_ACK) continue;
+
+        /* Check if retry time has been reached */
+        if (current_time_ms >= packet->next_retry_timestamp) {
+            if (packet->retry_count >= MAX_RETRANSMISSION_RETRIES) {
+                /* Max retries exceeded - mark as failed */
+                packet->state = PACKET_STATE_FAILED;
+                continue;
+            }
+
+            /* Mark for retry */
+            retry_sequence_numbers[retry_count++] = packet->sequence_number;
+        }
+    }
+
+    return retry_count;
+}
+
+struct pending_packet *get_pending_packet(struct pending_packet_queue *queue,
+                                          const uint16_t sequence_number) {
+    if (!queue || sequence_number == 0) return NULL;
+
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        if (queue->packets[i].sequence_number == sequence_number &&
+            queue->packets[i].state != PACKET_STATE_EMPTY) {
+            return &queue->packets[i];
+        }
+    }
+
+    return NULL;
+}
+
+void update_retry_timing(struct pending_packet *packet, const uint32_t current_time_ms) {
+    if (!packet) return;
+
+    packet->retry_count++;
+
+    /* Exponential backoff with cap */
+    packet->retry_interval_ms *= RETRANSMIT_BACKOFF_FACTOR;
+    if (packet->retry_interval_ms > MAX_RETRANSMIT_INTERVAL_MS) {
+        packet->retry_interval_ms = MAX_RETRANSMIT_INTERVAL_MS;
+    }
+
+    packet->next_retry_timestamp = current_time_ms + packet->retry_interval_ms;
+}
+
+int remove_pending_packet(struct pending_packet_queue *queue, const uint16_t sequence_number) {
+    if (!queue) return -1;
+
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        if (queue->packets[i].sequence_number == sequence_number) {
+            if (queue->packets[i].packet_data) {
+                free(queue->packets[i].packet_data);
+            }
+            memset(&queue->packets[i], 0, sizeof(struct pending_packet));
+            queue->count--;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+size_t cleanup_pending_packets(struct pending_packet_queue *queue) {
+    if (!queue) return 0;
+
+    size_t cleaned = 0;
+    for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
+        struct pending_packet *packet = &queue->packets[i];
+        if (packet->state == PACKET_STATE_DELIVERED ||
+            packet->state == PACKET_STATE_FAILED) {
+            if (packet->packet_data) {
+                free(packet->packet_data);
+            }
+            memset(packet, 0, sizeof(struct pending_packet));
+            cleaned++;
+            queue->count--;
+        }
+    }
+
+    return cleaned;
+}
+
+int make_forwarding_decision(struct mesh_node *node,
+                             const uint32_t destination_id,
+                             uint8_t *ttl,
+                             struct forwarding_decision *decision) {
+    if (!node || !ttl || !decision) return -1;
+
+    memset(decision, 0, sizeof(*decision));
+
+    /* Check if packet is for us */
+    if (should_process_locally(node, destination_id)) {
+        decision->action = 1;  /* Local delivery */
+        return 0;
+    }
+
+    /* Check TTL */
+    if (*ttl <= 0) {
+        decision->action = -1;
+        decision->error_code = 0x03;  /* TTL Expired */
+        return -1;
+    }
+
+    /* Decrement TTL */
+    (*ttl)--;
+
+    /* Look up route to destination */
+    struct routing_entry *route = find_best_route(node->routing_table, destination_id);
+    if (route && route->is_valid) {
+        decision->action = 0;  /* Forward to next hop */
+        decision->next_hop = route->next_hop;
+        return 0;
+    }
+
+    /* No route found - check if we already have a pending route discovery */
+    if (has_pending_route_discovery(node, destination_id)) {
+        decision->action = -2;  /* Already discovering route */
+        decision->request_id = find_pending_route_request_for_dest(node, destination_id);
+        return 0;
+    }
+
+    /* Need to initiate route discovery */
+    decision->action = -2;  /* Need route discovery */
+    decision->error_code = 0x01;  /* Route not found */
+
+    return 0;
+}
+
+int update_route_cost_on_ack(struct routing_table *table,
+                             struct connection_table *conn_table,
+                             const uint32_t destination_id,
+                             const uint32_t next_hop,
+                             const int success) {
+    if (!table) return -1;
+
+    struct routing_entry *route = find_route(table, destination_id);
+    if (!route) return -1;
+
+    /* Update link quality for the next hop connection */
+    if (conn_table) {
+        update_link_quality(conn_table, next_hop, success ? 1 : 0);
+
+        /* Recalculate route cost based on updated link quality */
+        struct connection_entry *conn = find_connection(conn_table, next_hop);
+        if (conn && conn->link_quality > 0.0f) {
+            /* Route cost is affected by link quality */
+            /* New cost = hop_count + (1/link_quality - 1) as adjustment */
+            float new_cost = (float)route->hop_count;
+            if (conn->link_quality < 1.0f) {
+                new_cost += (1.0f / conn->link_quality) - 1.0f;
+            }
+            route->route_cost = new_cost;
+        }
+    }
+
+    route->last_updated = get_current_timestamp();
+
+    return 0;
+}
+
+uint32_t find_pending_route_request_for_dest(struct mesh_node *node, const uint32_t destination_id) {
+    if (!node) return 0;
+
+    for (size_t i = 0; i < node->pending_count; i++) {
+        if (node->pending_requests[i].is_active &&
+            node->pending_requests[i].destination_id == destination_id) {
+            return node->pending_requests[i].request_id;
+        }
+    }
+
+    return 0;
+}
+
+int has_pending_route_discovery(struct mesh_node *node, const uint32_t destination_id) {
+    return find_pending_route_request_for_dest(node, destination_id) != 0;
 }
 

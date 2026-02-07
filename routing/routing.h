@@ -106,6 +106,43 @@ struct route_request_cache {
     size_t count;
 };
 
+/* Retransmission Configuration */
+#define MAX_PENDING_PACKETS 32
+#define MAX_RETRANSMISSION_RETRIES 5
+#define INITIAL_RETRANSMIT_INTERVAL_MS 500      /* 500ms initial interval */
+#define MAX_RETRANSMIT_INTERVAL_MS 30000        /* 30 seconds max interval */
+#define RETRANSMIT_BACKOFF_FACTOR 2             /* Exponential backoff multiplier */
+
+/* Pending Packet States */
+enum pending_packet_state {
+    PACKET_STATE_EMPTY = 0,
+    PACKET_STATE_AWAITING_ROUTE,     /* Waiting for route discovery */
+    PACKET_STATE_AWAITING_ACK,       /* Sent, waiting for acknowledgement */
+    PACKET_STATE_DELIVERED,          /* Successfully acknowledged */
+    PACKET_STATE_FAILED              /* Max retries exceeded */
+};
+
+/* Pending Packet Entry for retransmission queue */
+struct pending_packet {
+    uint16_t sequence_number;        /* Packet sequence number */
+    uint32_t destination_id;         /* Final destination */
+    uint8_t *packet_data;            /* Serialized packet data */
+    size_t packet_len;               /* Length of packet data */
+    uint32_t created_timestamp;      /* When packet was queued */
+    uint32_t next_retry_timestamp;   /* When to retry next */
+    uint32_t retry_interval_ms;      /* Current retry interval (grows with backoff) */
+    uint8_t retry_count;             /* Number of retries attempted */
+    enum pending_packet_state state; /* Current state */
+    uint32_t request_id;             /* Associated route request ID (if awaiting route) */
+};
+
+/* Pending Packet Queue */
+struct pending_packet_queue {
+    struct pending_packet packets[MAX_PENDING_PACKETS];
+    size_t count;
+    uint16_t next_sequence_number;   /* Global sequence counter */
+};
+
 /* Mesh Node */
 struct mesh_node {
     uint32_t device_id;
@@ -115,6 +152,7 @@ struct mesh_node {
     struct connection_table *connection_table;
     struct routing_table *routing_table;
     struct route_request_cache *request_cache;
+    struct pending_packet_queue *packet_queue;     /* Packet forwarding queue */
     struct pending_route_request pending_requests[MAX_PENDING_REQUESTS];
     size_t pending_count;
     uint32_t last_discovery_time;
@@ -259,6 +297,132 @@ int forward_packet(struct mesh_node *node, uint32_t destination_id, uint8_t *ttl
                    uint32_t *next_hop_out);
 int should_process_locally(struct mesh_node *node, uint32_t destination_id);
 
+/* ========================================================================== */
+/* Packet Forwarding Engine Functions                                          */
+/* ========================================================================== */
+
+/**
+ * Forwarding Decision Result
+ * Returned by the packet forwarding decision function
+ */
+struct forwarding_decision {
+    int action;                      /* 0=forward, 1=local delivery, -1=error, -2=need route */
+    uint32_t next_hop;               /* Next hop for forwarding */
+    uint8_t error_code;              /* Error code if action is error */
+    uint32_t request_id;             /* Route request ID if route discovery initiated */
+};
+
+/* Pending Packet Queue Functions */
+struct pending_packet_queue *create_pending_packet_queue(void);
+void free_pending_packet_queue(struct pending_packet_queue *queue);
+
+/**
+ * Queue a packet for transmission with retransmission support
+ * Returns sequence number on success, 0 on failure
+ */
+uint16_t queue_packet_for_transmission(struct pending_packet_queue *queue,
+                                       uint32_t destination_id,
+                                       const uint8_t *packet_data,
+                                       size_t packet_len,
+                                       uint32_t current_time_ms);
+
+/**
+ * Mark a packet as successfully acknowledged
+ * Updates route cost on successful delivery
+ */
+int acknowledge_packet(struct pending_packet_queue *queue,
+                       struct routing_table *routing_table,
+                       struct connection_table *conn_table,
+                       uint16_t sequence_number,
+                       uint32_t sender_id);
+
+/**
+ * Associate a route request with pending packets awaiting route
+ * Called when route discovery is initiated for a destination
+ */
+int associate_route_request_with_packets(struct pending_packet_queue *queue,
+                                         uint32_t destination_id,
+                                         uint32_t request_id);
+
+/**
+ * Handle route discovery completion
+ * Marks packets as ready to send
+ * Returns number of packets ready to send
+ */
+size_t handle_route_discovery_complete(struct pending_packet_queue *queue,
+                                       uint32_t destination_id);
+
+/**
+ * Handle route discovery failure
+ * Marks associated packets as failed
+ */
+int handle_route_discovery_failed(struct pending_packet_queue *queue,
+                                  uint32_t destination_id);
+
+/**
+ * Check for packets that need retransmission
+ * Returns number of packets needing retry, fills arrays
+ * Also handles dropping packets that exceeded max retries
+ */
+size_t check_retransmission_timeouts(struct pending_packet_queue *queue,
+                                     uint32_t current_time_ms,
+                                     uint16_t *retry_sequence_numbers,
+                                     size_t max_count);
+
+/**
+ * Get a pending packet by sequence number
+ * Returns NULL if not found
+ */
+struct pending_packet *get_pending_packet(struct pending_packet_queue *queue,
+                                          uint16_t sequence_number);
+
+/**
+ * Update retry timing after retransmission attempt
+ * Implements exponential backoff
+ */
+void update_retry_timing(struct pending_packet *packet, uint32_t current_time_ms);
+
+/**
+ * Remove a packet from the queue (after delivery or final failure)
+ */
+int remove_pending_packet(struct pending_packet_queue *queue, uint16_t sequence_number);
+
+/**
+ * Clean up failed/delivered packets from the queue
+ * Returns number of packets cleaned up
+ */
+size_t cleanup_pending_packets(struct pending_packet_queue *queue);
+
+/**
+ * Make forwarding decision for a packet
+ * Determines if packet should be forwarded, delivered locally, or needs route discovery
+ */
+int make_forwarding_decision(struct mesh_node *node,
+                             uint32_t destination_id,
+                             uint8_t *ttl,
+                             struct forwarding_decision *decision);
+
+/**
+ * Update route cost based on acknowledgement
+ * Improves route cost when acks received, degrades on failures
+ */
+int update_route_cost_on_ack(struct routing_table *table,
+                             struct connection_table *conn_table,
+                             uint32_t destination_id,
+                             uint32_t next_hop,
+                             int success);
+
+/**
+ * Find a pending route request for a destination
+ * Returns the request_id if found, 0 otherwise
+ */
+uint32_t find_pending_route_request_for_dest(struct mesh_node *node, uint32_t destination_id);
+
+/**
+ * Check if there's a pending route discovery for a destination
+ */
+int has_pending_route_discovery(struct mesh_node *node, uint32_t destination_id);
+
 /* Utility Functions */
 void free_connection_table(struct connection_table *table);
 void free_mesh_node(struct mesh_node *node);
@@ -266,3 +430,6 @@ void free_routing_table(struct routing_table *table);
 void free_route_request_cache(struct route_request_cache *cache);
 
 #endif
+
+
+
