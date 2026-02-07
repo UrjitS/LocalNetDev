@@ -1356,29 +1356,32 @@ void ble_send_queued_packets(ble_node_manager_t *manager, const uint32_t destina
         return;
     }
 
-    /* Send all queued packets for this destination */
+    /* Send all queued packets for this destination
+     * Note: handle_route_discovery_complete already changed state to AWAITING_ACK
+     * and set next_retry_timestamp to current time, so we look for those packets */
     size_t sent_count = 0;
     const uint32_t current_time_ms = get_current_timestamp() * 1000;
 
     for (size_t i = 0; i < MAX_PENDING_PACKETS; i++) {
         struct pending_packet *pkt = &queue->packets[i];
-        if (pkt->state == PACKET_STATE_AWAITING_ROUTE &&
-            pkt->destination_id == destination_id) {
+        /* Look for packets that are AWAITING_ACK, have 0 retries (fresh from route discovery),
+         * and are for this destination */
+        if (pkt->destination_id == destination_id &&
+            pkt->state == PACKET_STATE_AWAITING_ACK &&
+            pkt->retry_count == 0 &&
+            pkt->packet_data && pkt->packet_len > 0) {
 
             /* Send the packet */
-            if (pkt->packet_data && pkt->packet_len > 0) {
-                if (ble_send_data(manager, route->next_hop, pkt->packet_data, pkt->packet_len)) {
-                    log_info(BT_TAG, "Sent queued packet (seq: %u) to 0x%08X via 0x%08X",
-                            pkt->sequence_number, destination_id, route->next_hop);
-                    pkt->state = PACKET_STATE_AWAITING_ACK;
-                    pkt->next_retry_timestamp = current_time_ms + INITIAL_RETRANSMIT_INTERVAL_MS;
-                    pkt->retry_interval_ms = INITIAL_RETRANSMIT_INTERVAL_MS;
-                    pkt->retry_count = 0;
-                    sent_count++;
-                } else {
-                    log_error(BT_TAG, "Failed to send queued packet (seq: %u) to 0x%08X",
-                             pkt->sequence_number, destination_id);
-                }
+            if (ble_send_data(manager, route->next_hop, pkt->packet_data, pkt->packet_len)) {
+                log_info(BT_TAG, "Sent queued packet (seq: %u) to 0x%08X via 0x%08X",
+                        pkt->sequence_number, destination_id, route->next_hop);
+                /* Update timing so retransmit logic doesn't immediately resend */
+                pkt->next_retry_timestamp = current_time_ms + INITIAL_RETRANSMIT_INTERVAL_MS;
+                pkt->retry_interval_ms = INITIAL_RETRANSMIT_INTERVAL_MS;
+                sent_count++;
+            } else {
+                log_error(BT_TAG, "Failed to send queued packet (seq: %u) to 0x%08X",
+                         pkt->sequence_number, destination_id);
             }
         }
     }
