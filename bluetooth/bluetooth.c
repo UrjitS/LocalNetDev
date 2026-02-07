@@ -424,6 +424,8 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
             break;
         case BINC_CONNECTING:
         case BINC_DISCONNECTING:
+            stop_discovery();
+            stop_advertising();
             break;
     }
 }
