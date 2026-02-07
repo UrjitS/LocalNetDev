@@ -1,5 +1,6 @@
 #include "utils.h"
 #include <stdint.h>
+#include "routing.h"
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -12,6 +13,15 @@ uint32_t get_current_timestamp(void) {
 
 uint32_t generate_request_id(void) {
     return (uint32_t)rand(); // NOLINT(cert-msc30-c, cert-msc50-cpp)
+}
+
+const char * node_type_to_string(const enum NODE_TYPE type) {
+    switch (type) {
+        case EDGE_NODE: return "EDGE";
+        case FULL_NODE: return "FULL";
+        case GATEWAY_NODE: return "GATEWAY";
+        default: return "UNKNOWN";
+    }
 }
 
 uint32_t mac_to_device_id(const char *mac) {
@@ -43,7 +53,8 @@ uint32_t mac_to_device_id(const char *mac) {
         }
     }
 
-    return ((uint32_t)bytes[3] << 16) |
+    return ((uint32_t)bytes[2] << 24) |
+           ((uint32_t)bytes[3] << 16) |
            ((uint32_t)bytes[4] << 8)  |
            ((uint32_t)bytes[5]);
 }

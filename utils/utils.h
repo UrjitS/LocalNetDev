@@ -6,11 +6,13 @@
 #define FUNC_RETURN_SUCCESS (1)
 
 #define TAG "LOCALNET"
-
+#include "routing.h"
 #include <stdint.h>
 
 uint32_t get_current_timestamp(void);
 uint32_t generate_request_id(void);
+const char * node_type_to_string(enum NODE_TYPE type);
+
 
 /**
  * Convert a MAC address string to a device ID

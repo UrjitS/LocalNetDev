@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Forward declarations */
 struct mesh_node;
 
 /**
@@ -12,13 +11,13 @@ struct mesh_node;
  * These define what the caller should do after processing a message.
  */
 enum handler_action {
-    HANDLER_ACTION_NONE = 0,           /* No action needed */
-    HANDLER_ACTION_SEND_REPLY,         /* Send a route reply */
-    HANDLER_ACTION_FORWARD_REQUEST,    /* Forward a route request to neighbors */
-    HANDLER_ACTION_FORWARD_REPLY,      /* Forward a route reply to next hop */
-    HANDLER_ACTION_ROUTE_COMPLETE,     /* Route discovery complete (we are originator) */
-    HANDLER_ACTION_CALL_DATA_CALLBACK, /* Call data callback with raw packet */
-    HANDLER_ACTION_ERROR               /* An error occurred */
+    HANDLER_ACTION_NONE = 0,
+    HANDLER_ACTION_SEND_REPLY,
+    HANDLER_ACTION_FORWARD_REQUEST,
+    HANDLER_ACTION_FORWARD_REPLY,
+    HANDLER_ACTION_ROUTE_COMPLETE,
+    HANDLER_ACTION_CALL_DATA_CALLBACK,
+    HANDLER_ACTION_ERROR
 };
 
 /**
@@ -29,18 +28,18 @@ struct handler_result {
     enum handler_action action;
 
     /* For route reply actions */
-    uint32_t target_node;              /* Node to send reply/forward to */
+    uint32_t target_node;
     uint32_t request_id;
     uint8_t route_cost;
-    uint32_t *forward_path;            /* Allocated by handler, caller must free */
+    uint32_t *forward_path;
     uint8_t forward_path_len;
 
     /* For route request forwarding */
     uint32_t destination_id;
     uint8_t hop_count;
-    uint32_t *reverse_path;            /* Allocated by handler, caller must free */
+    uint32_t *reverse_path;
     uint8_t reverse_path_len;
-    uint32_t exclude_neighbor;         /* Neighbor to exclude when broadcasting */
+    uint32_t exclude_neighbor;
 
     /* For data callback */
     uint32_t source_id;
@@ -62,10 +61,7 @@ struct handler_result {
  * @param result        Output parameter for the result
  * @return              0 on success, -1 on parse error
  */
-int handle_incoming_packet(struct mesh_node *mesh_node,
-                           const uint8_t *data, size_t data_len,
-                           uint32_t sender_id,
-                           struct handler_result *result);
+int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, size_t data_len, uint32_t sender_id, struct handler_result *result);
 
 /**
  * Free any allocated memory in a handler result.

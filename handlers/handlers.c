@@ -1,7 +1,6 @@
 #include "handlers.h"
 #include "protocol.h"
 #include "routing.h"
-#include "utils.h"
 #include "logger.h"
 #include <string.h>
 #include <stdlib.h>
@@ -11,10 +10,7 @@
 /**
  * Process an incoming packet and determine what action to take.
  */
-int handle_incoming_packet(struct mesh_node *mesh_node,
-                           const uint8_t *data, size_t data_len,
-                           uint32_t sender_id,
-                           struct handler_result *result) {
+int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, const size_t data_len, uint32_t sender_id, struct handler_result *result) {
     if (!data || data_len == 0 || !result) {
         return -1;
     }
@@ -140,8 +136,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node,
                 return -1;
             }
 
-            log_info(HANDLER_TAG, "Received route reply from 0x%08X (cost: %u, path_len: %u)",
-                     network.source_id, reply.route_cost, reply.forward_path_len);
+            log_info(HANDLER_TAG, "Received route reply from 0x%08X (cost: %u, path_len: %u)", network.source_id, reply.route_cost, reply.forward_path_len);
 
             if (mesh_node) {
                 struct route_reply_result rr_result;
@@ -149,8 +144,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node,
 
                 if (action == 1) {
                     /* We are the originator - route discovery complete */
-                    log_info(HANDLER_TAG, "Route discovery complete for dest 0x%08X",
-                             reply.forward_path[reply.forward_path_len - 1]);
+                    log_info(HANDLER_TAG, "Route discovery complete for dest 0x%08X", reply.forward_path[reply.forward_path_len - 1]);
                     result->action = HANDLER_ACTION_ROUTE_COMPLETE;
                     result->destination_id = reply.forward_path[reply.forward_path_len - 1];
                 } else if (action == 0) {
@@ -165,8 +159,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node,
                     if (rr_result.forward_path && rr_result.forward_path_len > 0) {
                         result->forward_path = malloc(rr_result.forward_path_len * sizeof(uint32_t));
                         if (result->forward_path) {
-                            memcpy(result->forward_path, rr_result.forward_path,
-                                   rr_result.forward_path_len * sizeof(uint32_t));
+                            memcpy(result->forward_path, rr_result.forward_path, rr_result.forward_path_len * sizeof(uint32_t));
                             result->forward_path_len = rr_result.forward_path_len;
                         }
                     }

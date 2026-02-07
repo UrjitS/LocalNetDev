@@ -8,6 +8,7 @@
 #include "bluetooth/bluetooth.h"
 #include "protocol/protocol.h"
 #include "routing/routing.h"
+#include "utils/utils.h"
 #include "logger.h"
 
 #define TAG "LOCALNET"
@@ -21,8 +22,8 @@ static uint32_t g_device_id = 0;
 typedef void (*menu_command_handler)(void);
 
 typedef struct {
-    const char *key;
-    const char *description;
+    const char * key;
+    const char * description;
     menu_command_handler handler;
 } menu_command_t;
 
@@ -75,7 +76,7 @@ static void cmd_show_routes(void) {
         return;
     }
 
-    struct mesh_node *node = ble_get_mesh_node(g_ble_manager);
+    struct mesh_node * node = ble_get_mesh_node(g_ble_manager);
     if (!node || !node->routing_table) {
         fprintf(stderr, "Error: Routing table not available\n");
         return;
@@ -88,11 +89,11 @@ static void cmd_show_routes(void) {
     printf("\t %-12s %-12s %-6s %-8s %-8s\n", "Destination", "Next Hop", "Hops", "Cost", "Valid");
     printf("--------------------------------------------------------------------\n");
 
-    struct routing_table *rt = node->routing_table;
+    const struct routing_table * rt = node->routing_table;
     size_t valid_count = 0;
 
     for (size_t i = 0; i < rt->count; i++) {
-        struct routing_entry *entry = &rt->entries[i];
+        const struct routing_entry * entry = &rt->entries[i];
         if (entry->destination_id == 0) continue;
 
         const char *valid_str = entry->is_valid ? "Yes" : "No";
@@ -135,9 +136,9 @@ static void cmd_discover_route(void) {
     input[strcspn(input, "\n\r")] = '\0';
 
     // Parse hex value
-    char *endptr;
-    unsigned long dest_id = strtoul(input, &endptr, 0);
-    if (endptr == input || *endptr != '\0') {
+    char * end_ptr;
+    const unsigned long dest_id = strtoul(input, &end_ptr, 0);
+    if (end_ptr == input || *end_ptr != '\0') {
         fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
         return;
     }
@@ -282,15 +283,6 @@ static void on_data_received(const uint32_t sender_id, const uint8_t *data, cons
     }
 }
 
-const char *node_type_to_string(const enum NODE_TYPE type) {
-    switch (type) {
-        case EDGE_NODE: return "EDGE";
-        case FULL_NODE: return "FULL";
-        case GATEWAY_NODE: return "GATEWAY";
-        default: return "UNKNOWN";
-    }
-}
-
 // NOLINTNEXTLINE
 static int get_adapter_address(char *address, size_t len) {
     GDBusConnection *dbus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
@@ -313,39 +305,6 @@ static int get_adapter_address(char *address, size_t len) {
     g_object_unref(dbus);
 
     return addr ? 0 : -1;
-}
-
-// Convert MAC address to 32-bit device ID (uses last 4 bytes)
-static uint32_t mac_to_device_id(const char *mac) {
-    unsigned long bytes[6];
-    char *end = NULL;
-
-    for (int i = 0; i < 6; i++) {
-        if (!isxdigit((unsigned char)mac[0]) ||
-            !isxdigit((unsigned char)mac[1])) {
-            return 0;
-            }
-
-        bytes[i] = strtoul(mac, &end, 16);
-        if (end != mac + 2 || bytes[i] > 0xFF) {
-            return 0;
-        }
-
-        mac = end;
-
-        if (i < 5) {
-            if (*mac != ':') {
-                return 0;
-            }
-            mac++;
-        }
-    }
-
-    // Use last 4 bytes of MAC for unique 32-bit ID
-    return ((uint32_t)bytes[2] << 24) |
-           ((uint32_t)bytes[3] << 16) |
-           ((uint32_t)bytes[4] << 8)  |
-           ((uint32_t)bytes[5]);
 }
 
 
