@@ -377,6 +377,22 @@ static void on_node_disconnected(const uint32_t node_id) {
     log_info(TAG, "Disconnected from Node: 0x%08X", node_id);
 
     if (g_ble_manager) {
+        const struct mesh_node *node = ble_get_mesh_node(g_ble_manager);
+        if (node) {
+            // Invalidate all routes that use this node
+            if (node->routing_table) {
+                const size_t invalidated = invalidate_routes_via_node(node->routing_table, node_id);
+                if (invalidated > 0) {
+                    log_info(TAG, "Invalidated %zu routes via disconnected node 0x%08X", invalidated, node_id);
+                }
+            }
+
+            // Remove from connection table
+            if (node->connection_table) {
+                remove_connection(node->connection_table, node_id);
+            }
+        }
+
         const guint connected = ble_get_connected_count(g_ble_manager);
         log_info(TAG, "Remaining connected Nodes: %d", connected);
     }
@@ -394,9 +410,50 @@ static void on_data_received(const uint32_t sender_id, const uint8_t *data, cons
             case MSG_HEARTBEAT:
                 log_info(TAG, "Received heartbeat from 0x%08X", sender_id);
                 break;
-            case MSG_DATA:
-                log_info(TAG, "Received data message");
+            case MSG_DATA: {
+                // Parse network header to get source and destination
+                struct network net;
+                if (len >= 16 && parse_network(data + 8, len - 8, &net) == 0) {
+                    // Payload starts at offset 16 (8 header + 8 network)
+                    const size_t payload_offset = 16;
+                    const size_t payload_len = hdr.payload_length;
+
+                    if (payload_offset + payload_len <= len) {
+                        // Print the message content
+                        printf("\nMESSAGE FROM 0x%08X\n", net.source_id);
+                        printf("\tSequence: %u\n", hdr.sequence_number);
+                        printf("\tTTL: %u\n", hdr.time_to_live);
+                        printf("\tLength: %zu bytes\n", payload_len);
+
+                        // Print as string if printable, otherwise hex dump
+                        const uint8_t * payload = data + payload_offset;
+                        int is_printable = 1;
+                        for (size_t i = 0; i < payload_len; i++) {
+                            if (payload[i] < 32 && payload[i] != '\n' && payload[i] != '\r' && payload[i] != '\t') {
+                                if (payload[i] != 0 || i < payload_len - 1) {
+                                    is_printable = 0;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (is_printable) {
+                            printf("Message: %.*s\n", (int)payload_len, payload);
+                        } else {
+                            printf("Data (hex): ");
+                            for (size_t i = 0; i < payload_len; i++) {
+                                printf("%02X ", payload[i]);
+                                if ((i + 1) % 16 == 0 && i + 1 < payload_len) printf("\n            ");
+                            }
+                            printf("\n");
+                        }
+
+                        printf("\n");
+                    }
+                }
+                log_info(TAG, "Received data message from 0x%08X", sender_id);
                 break;
+            }
             default:
                 log_info(TAG, "Received unknown message type: %d", hdr.message_type);
                 break;

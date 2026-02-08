@@ -40,6 +40,17 @@ enum CONNECTION_STATE {
 #define MAX_HOP_COUNT 15
 #define LINK_QUALITY_WINDOW 100
 
+#define MAX_PENDING_REQUESTS 16
+#define ROUTE_REQUEST_TIMEOUT_SECONDS 10
+#define MAX_ROUTE_REQUEST_RETRIES 3
+
+/* Retransmission Configuration */
+#define MAX_PENDING_PACKETS 32
+#define MAX_RETRANSMISSION_RETRIES 5
+#define INITIAL_RETRANSMIT_INTERVAL_MS 500      /* 500ms initial interval */
+#define MAX_RETRANSMIT_INTERVAL_MS 30000        /* 30 seconds max interval */
+#define RETRANSMIT_BACKOFF_FACTOR 2             /* Exponential backoff multiplier */
+
 /* Connection Table Entry */
 struct connection_entry {
     uint32_t neighbor_id;
@@ -71,7 +82,7 @@ struct route_request_entry {
     uint32_t timestamp;
     uint8_t is_active;
     uint8_t awaiting_reply;        /* 1 if this node initiated the request */
-    uint32_t *reverse_path;        /* Path from originator to destination */
+    uint32_t * reverse_path;        /* Path from originator to destination */
     uint8_t reverse_path_len;
 };
 
@@ -84,9 +95,6 @@ struct pending_route_request {
     uint8_t is_active;
 };
 
-#define MAX_PENDING_REQUESTS 16
-#define ROUTE_REQUEST_TIMEOUT_SECONDS 10
-#define MAX_ROUTE_REQUEST_RETRIES 3
 
 /* Connection Table */
 struct connection_table {
@@ -106,12 +114,6 @@ struct route_request_cache {
     size_t count;
 };
 
-/* Retransmission Configuration */
-#define MAX_PENDING_PACKETS 32
-#define MAX_RETRANSMISSION_RETRIES 5
-#define INITIAL_RETRANSMIT_INTERVAL_MS 500      /* 500ms initial interval */
-#define MAX_RETRANSMIT_INTERVAL_MS 30000        /* 30 seconds max interval */
-#define RETRANSMIT_BACKOFF_FACTOR 2             /* Exponential backoff multiplier */
 
 /* Pending Packet States */
 enum pending_packet_state {
@@ -422,6 +424,13 @@ uint32_t find_pending_route_request_for_dest(struct mesh_node *node, uint32_t de
  * Check if there's a pending route discovery for a destination
  */
 int has_pending_route_discovery(struct mesh_node *node, uint32_t destination_id);
+
+/**
+ * Invalidate all routes that use the specified node as next_hop
+ * Called when a node disconnects
+ * Returns number of routes invalidated
+ */
+size_t invalidate_routes_via_node(struct routing_table *table, uint32_t node_id);
 
 /* Utility Functions */
 void free_connection_table(struct connection_table *table);

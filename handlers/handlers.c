@@ -2,7 +2,6 @@
 #include "protocol.h"
 #include "routing.h"
 #include "logger.h"
-#include "utils.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -18,7 +17,7 @@ int handle_acknowledgement(struct mesh_node *mesh_node, const struct acknowledge
              ack->sequence_number, sender_id, ack->status_code);
 
     if (ack->status_code == SUCCESS) {
-        /* Successful delivery - acknowledge packet and update route cost */
+        // Successful delivery - acknowledge packet and update route cost
         if (mesh_node->packet_queue) {
             acknowledge_packet(mesh_node->packet_queue,
                               mesh_node->routing_table,
@@ -27,17 +26,17 @@ int handle_acknowledgement(struct mesh_node *mesh_node, const struct acknowledge
                               sender_id);
         }
 
-        /* Update link quality for successful transmission */
+        // Update link quality for successful transmission
         if (mesh_node->connection_table) {
             update_link_quality(mesh_node->connection_table, sender_id, 1);
         }
     } else {
-        /* Failed delivery - update link quality */
+        // Failed delivery - update link quality
         if (mesh_node->connection_table) {
             update_link_quality(mesh_node->connection_table, sender_id, 0);
         }
 
-        /* Handle specific error codes */
+        // Handle specific error codes
         switch (ack->status_code) {
             case ROUTE_NOT_FOUND:
                 log_warn(HANDLER_TAG, "ACK reports route not found for seq %u", ack->sequence_number);
@@ -68,7 +67,7 @@ size_t create_acknowledgement_packet(const uint16_t sequence_number,
                                      const uint32_t dest_id) {
     if (!buffer || buffer_size < 32) return 0;
 
-    /* Build acknowledgement structure */
+    // Build acknowledgement structure
     struct acknowledgement ack = {
         .sequence_number = sequence_number,
         .status_code = status_code,
@@ -76,15 +75,15 @@ size_t create_acknowledgement_packet(const uint16_t sequence_number,
         .received_fragment_list = NULL
     };
 
-    /* Build header */
+    // Build header
     struct header header = {
-        .protocol_version = 1,  /* PROTOCOL_VERSION */
+        .protocol_version = 1,  // PROTOCOL_VERSION
         .message_type = MSG_ACKNOWLEDGEMENT,
         .fragmentation_flag = 0,
         .fragmentation_number = 0,
         .total_fragments = 1,
         .time_to_live = MAX_HOP_COUNT,
-        .payload_length = 0,  /* Will be set after serializing payload */
+        .payload_length = 0,  // Will be set after serializing payload
         .sequence_number = 0
     };
 
@@ -93,14 +92,14 @@ size_t create_acknowledgement_packet(const uint16_t sequence_number,
         .destination_id = dest_id
     };
 
-    /* Serialize acknowledgement payload */
+    // Serialize acknowledgement payload
     uint8_t payload_buffer[16];
     const size_t payload_len = serialize_acknowledgement(&ack, payload_buffer, sizeof(payload_buffer));
     if (payload_len == 0) return 0;
 
     header.payload_length = (uint16_t)payload_len;
 
-    /* Create packet */
+    // Create packet
     const struct packet packet = {
         .header = &header,
         .network = &network,
@@ -108,7 +107,7 @@ size_t create_acknowledgement_packet(const uint16_t sequence_number,
         .security = NULL
     };
 
-    /* Serialize complete packet */
+    // Serialize complete packet
     return serialize_packet(&packet, buffer, buffer_size);
 }
 
@@ -120,11 +119,11 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
         return -1;
     }
 
-    /* Initialize result */
+    // Initialize result
     memset(result, 0, sizeof(*result));
     result->action = HANDLER_ACTION_NONE;
 
-    /* Parse header */
+    // Parse header
     struct header header;
     if (parse_header(data, data_len, &header) != 0) {
         log_error(HANDLER_TAG, "Failed to parse packet header");
@@ -132,7 +131,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
         return -1;
     }
 
-    /* Parse network header */
+    // Parse network header
     struct network network;
     if (data_len < 16 || parse_network(data + 8, data_len - 8, &network) != 0) {
         log_error(HANDLER_TAG, "Failed to parse network header");
@@ -140,13 +139,13 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
         return -1;
     }
 
-    /* Use source_id from packet if sender_id not provided */
+    // Use source_id from packet if sender_id not provided
     if (sender_id == 0) {
         sender_id = network.source_id;
     }
     result->source_id = network.source_id;
 
-    /* Handle message based on type */
+    // Handle message based on type
     switch (header.message_type) {
         case MSG_HEARTBEAT: {
             struct heartbeat heartbeat;
@@ -159,7 +158,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
             log_info(HANDLER_TAG, "Received heartbeat from 0x%08X (status: %u, connections: %u)",
                      network.source_id, heartbeat.device_status, heartbeat.active_connection_number);
 
-            /* Update mesh node connection info if available */
+            // Update mesh node connection info if available
             if (mesh_node && mesh_node->connection_table) {
                 reset_missed_heartbeats(mesh_node->connection_table, network.source_id);
                 update_last_seen(mesh_node->connection_table, network.source_id, heartbeat.timestamp);
@@ -185,7 +184,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                 const int action = handle_route_request(mesh_node, &req, sender_id, &rr_result);
 
                 if (action == 1 || action == 2) {
-                    /* We are the destination or have cached route - send route reply */
+                    // We are the destination or have cached route - send route reply
                     if (action == 1) {
                         log_info(HANDLER_TAG, "We are the destination - sending route reply");
                     } else {
@@ -201,14 +200,14 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                             result->target_node = rr_result.updated_reverse_path[rr_result.updated_path_len - 2];
                             result->request_id = reply.request_id;
                             result->route_cost = reply.route_cost;
-                            result->forward_path = reply.forward_path;  /* Transfer ownership */
+                            result->forward_path = reply.forward_path;  // Transfer ownership
                             result->forward_path_len = reply.forward_path_len;
                         } else {
                             if (reply.forward_path) free(reply.forward_path);
                         }
                     }
                 } else if (action == 0) {
-                    /* Forward the request to all neighbors except sender */
+                    // Forward the request to all neighbors except sender
                     log_info(HANDLER_TAG, "Forwarding route request (hops: %u)", rr_result.hop_count);
                     result->action = HANDLER_ACTION_FORWARD_REQUEST;
                     result->request_id = req.request_id;
@@ -216,7 +215,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                     result->hop_count = rr_result.hop_count;
                     result->exclude_neighbor = rr_result.exclude_neighbor;
 
-                    /* Copy the updated reverse path */
+                    // Copy the updated reverse path
                     if (rr_result.updated_reverse_path && rr_result.updated_path_len > 0) {
                         result->reverse_path = malloc(rr_result.updated_path_len * sizeof(uint32_t));
                         if (result->reverse_path) {
@@ -248,12 +247,12 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                 const int action = handle_route_reply(mesh_node, &reply, sender_id, &rr_result);
 
                 if (action == 1) {
-                    /* We are the originator - route discovery complete */
+                    // We are the originator - route discovery complete
                     log_info(HANDLER_TAG, "Route discovery complete for dest 0x%08X", reply.forward_path[reply.forward_path_len - 1]);
                     result->action = HANDLER_ACTION_ROUTE_COMPLETE;
                     result->destination_id = reply.forward_path[reply.forward_path_len - 1];
 
-                    /* Handle any packets that were waiting for this route */
+                    // Handle any packets that were waiting for this route
                     if (mesh_node->packet_queue) {
                         const size_t ready = handle_route_discovery_complete(mesh_node->packet_queue,
                                                                              result->destination_id);
@@ -262,14 +261,14 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                         }
                     }
                 } else if (action == 0) {
-                    /* Forward reply toward originator */
+                    // Forward reply toward originator
                     log_info(HANDLER_TAG, "Forwarding route reply to 0x%08X", rr_result.next_hop);
                     result->action = HANDLER_ACTION_FORWARD_REPLY;
                     result->target_node = rr_result.next_hop;
                     result->request_id = rr_result.request_id;
                     result->route_cost = rr_result.route_cost;
 
-                    /* Copy the forward path */
+                    // Copy the forward path
                     if (rr_result.forward_path && rr_result.forward_path_len > 0) {
                         result->forward_path = malloc(rr_result.forward_path_len * sizeof(uint32_t));
                         if (result->forward_path) {
@@ -295,7 +294,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
             log_info(HANDLER_TAG, "Received ACK from 0x%08X for seq %u (status: %u)",
                      network.source_id, ack.sequence_number, ack.status_code);
 
-            /* Process the acknowledgement */
+            // Process the acknowledgement
             if (mesh_node) {
                 handle_acknowledgement(mesh_node, &ack, sender_id);
             }
@@ -307,7 +306,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
         }
 
         case MSG_DATA: {
-            /* Handle data packet forwarding */
+            // Handle data packet forwarding
             if (!mesh_node) {
                 result->action = HANDLER_ACTION_CALL_DATA_CALLBACK;
                 break;
@@ -317,18 +316,18 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                      network.source_id, network.destination_id,
                      header.sequence_number, header.time_to_live);
 
-            /* Make forwarding decision */
+            // Make forwarding decision
             struct forwarding_decision decision;
             uint8_t ttl = header.time_to_live;
             make_forwarding_decision(mesh_node, network.destination_id, &ttl, &decision);
 
             if (decision.action == 1) {
-                /* Local delivery - this packet is for us */
-                log_info(HANDLER_TAG, "Data packet is for us, delivering locally");
+                // Local delivery - this packet is for us
+                log_info(HANDLER_TAG, "Data packet is for us (seq: %u), delivering to application", header.sequence_number);
                 result->action = HANDLER_ACTION_CALL_DATA_CALLBACK;
                 result->sequence_number = header.sequence_number;
 
-                /* Send ACK back to source */
+                // Send ACK back to source
                 if (header.sequence_number != 0) {
                     result->action = HANDLER_ACTION_SEND_ACK;
                     result->target_node = network.source_id;
@@ -336,7 +335,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                     result->status_code = SUCCESS;
                 }
             } else if (decision.action == 0) {
-                /* Forward to next hop */
+                // Forward to next hop
                 log_info(HANDLER_TAG, "Forwarding data packet to next hop 0x%08X (TTL: %u)",
                          decision.next_hop, ttl);
                 result->action = HANDLER_ACTION_FORWARD_DATA;
@@ -345,16 +344,16 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                 result->destination_id = network.destination_id;
                 result->sequence_number = header.sequence_number;
 
-                /* Copy packet data for forwarding (with updated TTL) */
+                // Copy packet data for forwarding (with updated TTL)
                 result->packet_data = malloc(data_len);
                 if (result->packet_data) {
                     memcpy(result->packet_data, data, data_len);
                     result->packet_len = data_len;
-                    /* Update TTL in the copied packet */
+                    // Update TTL in the copied packet
                     result->packet_data[3] = ttl;
                 }
             } else if (decision.action == -1) {
-                /* TTL expired */
+                // TTL expired
                 log_warn(HANDLER_TAG, "TTL expired for packet from 0x%08X to 0x%08X",
                          network.source_id, network.destination_id);
                 result->action = HANDLER_ACTION_TTL_EXPIRED;
@@ -362,16 +361,16 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
                 result->sequence_number = header.sequence_number;
                 result->status_code = TTL_EXPIRED;
             } else if (decision.action == -2) {
-                /* Need route discovery */
+                // Need route discovery
                 log_info(HANDLER_TAG, "No route to 0x%08X, need route discovery",
                          network.destination_id);
                 result->action = HANDLER_ACTION_INITIATE_ROUTE_DISCOVERY;
                 result->destination_id = network.destination_id;
-                result->request_id = decision.request_id;  /* Existing request if any */
+                result->request_id = decision.request_id;  // Existing request if any
 
-                /* Queue packet for later transmission */
+                // Queue packet for later transmission
                 if (mesh_node->packet_queue) {
-                    /* Copy packet data for queuing */
+                    // Copy packet data for queuing
                     result->packet_data = malloc(data_len);
                     if (result->packet_data) {
                         memcpy(result->packet_data, data, data_len);
@@ -383,7 +382,7 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
         }
 
         default:
-            /* Unknown or other message type - let caller handle it */
+            // Unknown or other message type - let caller handle it
             result->action = HANDLER_ACTION_CALL_DATA_CALLBACK;
             break;
     }

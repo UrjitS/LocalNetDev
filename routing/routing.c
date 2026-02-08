@@ -299,6 +299,24 @@ void expire_routes(struct routing_table *table, const uint32_t current_time) {
     }
 }
 
+size_t invalidate_routes_via_node(struct routing_table *table, const uint32_t node_id) {
+    if (!table) return 0;
+
+    size_t invalidated = 0;
+    for (size_t i = 0; i < table->count; i++) {
+        struct routing_entry *entry = &table->entries[i];
+
+        // Invalidate if this route uses the disconnected node as next_hop
+        // or if the destination itself is the disconnected node
+        if (entry->is_valid && (entry->next_hop == node_id || entry->destination_id == node_id)) {
+            entry->is_valid = 0;
+            invalidated++;
+        }
+    }
+
+    return invalidated;
+}
+
 float calculate_route_cost(struct connection_table *conn_table, uint32_t *path, const uint8_t path_len) {
     if (!conn_table || !path || path_len == 0) return 99.9f;
 
