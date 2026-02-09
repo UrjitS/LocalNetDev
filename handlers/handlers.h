@@ -4,13 +4,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Forward declarations */
+#define HANDLER_TAG "HANDLER"
+
 struct mesh_node;
 struct acknowledgement;
 
 /**
- * Message Handler Action Types
- * These define what the caller should do after processing a message.
+ * Caller states for after processing a message.
  */
 enum handler_action {
     HANDLER_ACTION_NONE = 0,
@@ -19,45 +19,41 @@ enum handler_action {
     HANDLER_ACTION_FORWARD_REPLY,
     HANDLER_ACTION_ROUTE_COMPLETE,
     HANDLER_ACTION_CALL_DATA_CALLBACK,
-    HANDLER_ACTION_SEND_ACK,              /* Send acknowledgement */
-    HANDLER_ACTION_FORWARD_DATA,          /* Forward data packet to next hop */
-    HANDLER_ACTION_INITIATE_ROUTE_DISCOVERY, /* Need route discovery before forwarding */
-    HANDLER_ACTION_TTL_EXPIRED,           /* TTL expired - send error to source */
-    HANDLER_ACTION_DEST_UNREACHABLE,      /* Destination unreachable */
+    HANDLER_ACTION_SEND_ACK,
+    HANDLER_ACTION_FORWARD_DATA,
+    HANDLER_ACTION_INITIATE_ROUTE_DISCOVERY,
+    HANDLER_ACTION_TTL_EXPIRED,
+    HANDLER_ACTION_DEST_UNREACHABLE,
     HANDLER_ACTION_ERROR
 };
 
-/**
- * Message Handler Result
- * Contains the result of processing a message and any data needed for follow-up actions.
- */
 struct handler_result {
     enum handler_action action;
 
-    /* For route reply actions */
+    // For route reply actions
     uint32_t target_node;
     uint32_t request_id;
     uint8_t route_cost;
     uint32_t *forward_path;
     uint8_t forward_path_len;
 
-    /* For route request forwarding */
+    // For route request forwarding
     uint32_t destination_id;
     uint8_t hop_count;
     uint32_t *reverse_path;
     uint8_t reverse_path_len;
     uint32_t exclude_neighbor;
 
-    /* For data callback */
+    // For data callback
     uint32_t source_id;
 
-    /* For packet forwarding */
-    uint32_t next_hop;               /* Next hop for forwarding */
-    uint16_t sequence_number;        /* Sequence number for ACK */
-    uint8_t status_code;             /* Status code for ACK or error */
-    uint8_t *packet_data;            /* Packet data for forwarding */
-    size_t packet_len;               /* Length of packet data */
-    uint8_t ttl;                     /* TTL for forwarded packet */
+    // For packet forwarding
+    uint32_t next_hop;
+    uint16_t sequence_number;
+    uint8_t status_code;
+    uint8_t *packet_data;
+    size_t packet_len;
+    uint8_t ttl;
 };
 
 /**

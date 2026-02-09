@@ -812,15 +812,14 @@ void test_pending_packet_queue() {
     assert(queue->next_sequence_number == 1);
 
     // Queue a packet
-    uint8_t test_data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
-    uint16_t seq1 = queue_packet_for_transmission(queue, 0x123456,
+    const uint8_t test_data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
+    const uint16_t seq1 = queue_packet_for_transmission(queue, 0x123456,
                                                   test_data, sizeof(test_data), 1000);
     assert(seq1 == 1);
     assert(queue->count == 1);
 
     // Queue another packet
-    uint16_t seq2 = queue_packet_for_transmission(queue, 0x654321,
-                                                  test_data, sizeof(test_data), 1000);
+    const uint16_t seq2 = queue_packet_for_transmission(queue, 0x654321, test_data, sizeof(test_data), 1000);
     assert(seq2 == 2);
     assert(queue->count == 2);
 
@@ -833,7 +832,7 @@ void test_pending_packet_queue() {
 
     // Test retransmission timeout check
     uint16_t retry_seqs[10];
-    size_t retry_count = check_retransmission_timeouts(queue, 2000, retry_seqs, 10);
+    const size_t retry_count = check_retransmission_timeouts(queue, 2000, retry_seqs, 10);
     assert(retry_count == 2);  // Both packets should need retry
 
     // Update retry timing
@@ -849,7 +848,7 @@ void test_pending_packet_queue() {
     assert(pkt->state == PACKET_STATE_DELIVERED);
 
     // Cleanup
-    size_t cleaned = cleanup_pending_packets(queue);
+    const size_t cleaned = cleanup_pending_packets(queue);
     assert(cleaned == 1);  // Delivered packet cleaned
 
     free_pending_packet_queue(queue);
@@ -866,7 +865,7 @@ void test_forwarding_decision() {
     assert(node != NULL);
 
     // Add a route
-    uint32_t timestamp = get_current_timestamp();
+    const uint32_t timestamp = get_current_timestamp();
     add_route(node->routing_table, 0x003, 0x002, 2, 2.0f, timestamp);
 
     // Test forwarding to known destination
@@ -906,7 +905,7 @@ void test_route_cost_updates() {
 
     struct routing_table *rt = create_routing_table();
     struct connection_table *ct = create_connection_table();
-    uint32_t timestamp = get_current_timestamp();
+    const uint32_t timestamp = get_current_timestamp();
 
     add_connection(ct, 0x002, -60);
     add_route(rt, 0x003, 0x002, 2, 2.0f, timestamp);
@@ -916,7 +915,7 @@ void test_route_cost_updates() {
     assert(result == 0);
 
     // Check link quality was updated
-    struct connection_entry *conn = find_connection(ct, 0x002);
+    const struct connection_entry *conn = find_connection(ct, 0x002);
     assert(conn != NULL);
     assert(conn->successful_packets > 0);
 
@@ -938,8 +937,8 @@ void test_route_discovery_with_queue() {
     assert(node->packet_queue != NULL);
 
     // Queue packet to unknown destination (should be marked as awaiting route)
-    uint8_t test_data[] = {0x01, 0x02, 0x03};
-    uint16_t seq = queue_packet_for_transmission(node->packet_queue, 0x999,
+    const uint8_t test_data[] = {0x01, 0x02, 0x03};
+    const uint16_t seq = queue_packet_for_transmission(node->packet_queue, 0x999,
                                                   test_data, sizeof(test_data), 1000);
     assert(seq > 0);
 
@@ -948,13 +947,13 @@ void test_route_discovery_with_queue() {
     pkt->state = PACKET_STATE_AWAITING_ROUTE;
 
     // Simulate route request association
-    uint32_t request_id = 0x12345678;
-    int count = associate_route_request_with_packets(node->packet_queue, 0x999, request_id);
+    const uint32_t request_id = 0x12345678;
+    const int count = associate_route_request_with_packets(node->packet_queue, 0x999, request_id);
     assert(count == 1);
     assert(pkt->request_id == request_id);
 
     // Simulate route discovery completion
-    size_t ready = handle_route_discovery_complete(node->packet_queue, 0x999);
+    const size_t ready = handle_route_discovery_complete(node->packet_queue, 0x999);
     assert(ready == 1);
     assert(pkt->state == PACKET_STATE_AWAITING_ACK);
 

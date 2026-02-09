@@ -13,12 +13,10 @@
 
 #define TAG "LOCALNET"
 
-// Global BLE manager for signal handler
 static ble_node_manager_t * g_ble_manager = NULL;
 static volatile gboolean g_running = TRUE;
 static uint32_t g_device_id = 0;
 
-// Command handler function type
 typedef void (*menu_command_handler)(void);
 
 typedef struct {
@@ -37,7 +35,6 @@ static void cmd_show_pending_packets(void);
 static void cmd_show_help(void);
 static void cmd_quit(void);
 
-// Menu
 static const menu_command_t g_menu_commands[] = {
     { "1", "Show connection table",     cmd_show_connections },
     { "2", "Show Node info",            cmd_show_node_info },
@@ -100,7 +97,7 @@ static void cmd_show_routes(void) {
         const struct routing_entry * entry = &rt->entries[i];
         if (entry->destination_id == 0) continue;
 
-        const char *valid_str = entry->is_valid ? "Yes" : "No";
+        const char * valid_str = entry->is_valid ? "Yes" : "No";
         printf("\t 0x%08X   0x%08X   %-6u %-8.2f %-8s\n",
                entry->destination_id,
                entry->next_hop,
@@ -112,7 +109,7 @@ static void cmd_show_routes(void) {
     }
 
     if (rt->count == 0) {
-        printf("\t (no routes - use route discovery to find paths)\n");
+        printf("\t (no routes exist)\n");
     }
 
     printf("--------------------------------------------------------------------\n");
@@ -127,37 +124,31 @@ static void cmd_discover_route(void) {
         return;
     }
 
-    printf("Enter destination node ID (hex, e.g., 0x12345678): ");
+    printf("Enter destination node ID (e.g., 0x12345678): ");
     fflush(stdout);
 
     char input[32];
-    if (fgets(input, sizeof(input), stdin) == NULL) {
+    if (read_stdin_line(input, sizeof(input)) != 0) {
         fprintf(stderr, "Error reading input\n");
         return;
     }
 
-    // Remove newline
-    input[strcspn(input, "\n\r")] = '\0';
-
-    // Parse hex value
-    char * end_ptr;
-    const unsigned long dest_id = strtoul(input, &end_ptr, 0);
-    if (end_ptr == input || *end_ptr != '\0') {
+    uint32_t dest_id;
+    if (parse_node_id(input, &dest_id) != 0) {
         fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
         return;
     }
 
-    if (dest_id == 0 || dest_id == g_device_id) {
+    if (validate_destination_id(dest_id, g_device_id) != 0) {
         fprintf(stderr, "Invalid destination (cannot be 0 or self)\n");
         return;
     }
 
-    printf("Initiating route discovery for 0x%08lX\n", dest_id);
-    const uint32_t request_id = ble_initiate_route_discovery(g_ble_manager, (uint32_t)dest_id);
+    printf("Initiating route discovery for 0x%08X\n", dest_id);
+    const uint32_t request_id = ble_initiate_route_discovery(g_ble_manager, dest_id);
 
     if (request_id > 0) {
         printf("Route discovery initiated (request ID: 0x%08X)\n", request_id);
-        printf("Route will be added to routing table when reply is received.\n");
     } else {
         printf("Route discovery failed or route already exists.\n");
     }
@@ -169,27 +160,22 @@ static void cmd_send_message(void) {
         return;
     }
 
-    printf("Enter destination node ID (hex, e.g., 0x12345678): ");
+    printf("Enter destination node ID (e.g., 0x12345678): ");
     fflush(stdout);
 
     char input[256];
-    if (fgets(input, sizeof(input), stdin) == NULL) {
+    if (read_stdin_line(input, sizeof(input)) != 0) {
         fprintf(stderr, "Error reading input\n");
         return;
     }
 
-    // Remove newline
-    input[strcspn(input, "\n\r")] = '\0';
-
-    // Parse hex value
-    char * end_ptr;
-    const unsigned long dest_id = strtoul(input, &end_ptr, 0);
-    if (end_ptr == input || *end_ptr != '\0') {
+    uint32_t dest_id;
+    if (parse_node_id(input, &dest_id) != 0) {
         fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
         return;
     }
 
-    if (dest_id == 0 || dest_id == g_device_id) {
+    if (validate_destination_id(dest_id, g_device_id) != 0) {
         fprintf(stderr, "Invalid destination (cannot be 0 or self)\n");
         return;
     }
@@ -198,25 +184,22 @@ static void cmd_send_message(void) {
     fflush(stdout);
 
     char message[200];
-    if (fgets(message, sizeof(message), stdin) == NULL) {
+    if (read_stdin_line(message, sizeof(message)) != 0) {
         fprintf(stderr, "Error reading message\n");
         return;
     }
-    message[strcspn(message, "\n\r")] = '\0';
 
     if (strlen(message) == 0) {
         fprintf(stderr, "Message cannot be empty\n");
         return;
     }
 
-    printf("Sending message to 0x%08lX: \"%s\"\n", dest_id, message);
+    printf("Sending message to 0x%08X: \"%s\"\n", dest_id, message);
 
-    const uint16_t seq = ble_send_message(g_ble_manager, (uint32_t)dest_id,
-                                           (const uint8_t *)message, strlen(message));
+    const uint16_t seq = ble_send_message(g_ble_manager, dest_id, (const uint8_t *)message, strlen(message));
 
     if (seq > 0) {
         printf("Message queued for transmission (sequence: %u)\n", seq);
-        printf("If no route exists, route discovery will be initiated automatically.\n");
     } else {
         printf("Failed to queue message.\n");
     }
@@ -303,7 +286,7 @@ static void cmd_quit(void) {
 }
 
 // Process Command input
-static void process_command(const char *input) {
+static void process_command(const char * input) {
     while (*input && isspace(*input)) input++;
 
     if (*input == '\0') return;
@@ -318,11 +301,11 @@ static void process_command(const char *input) {
     printf("Unknown command: '%s'. Press 'h' for help.\n", input);
 }
 
-static gboolean stdin_callback(GIOChannel *source, const GIOCondition condition, gpointer data) {
+static gboolean stdin_callback(GIOChannel * source, const GIOCondition condition, gpointer data) {
     if (condition & G_IO_IN) {
-        gchar *line = NULL;
+        gchar * line = NULL;
         gsize length;
-        GError *error = NULL;
+        GError * error = NULL;
 
         if (g_io_channel_read_line(source, &line, &length, NULL, &error) == G_IO_STATUS_NORMAL) {
             if (line) {
@@ -340,7 +323,7 @@ static gboolean stdin_callback(GIOChannel *source, const GIOCondition condition,
     return TRUE;
 }
 
-void usage(const char *program_name) {
+void usage(const char * program_name) {
     printf("--------------------------------------------------------------------\n");
     printf("LocalNet Mesh Node\n");
     printf("--------------------------------------------------------------------\n");
@@ -377,7 +360,7 @@ static void on_node_disconnected(const uint32_t node_id) {
     log_info(TAG, "Disconnected from Node: 0x%08X", node_id);
 
     if (g_ble_manager) {
-        const struct mesh_node *node = ble_get_mesh_node(g_ble_manager);
+        const struct mesh_node * node = ble_get_mesh_node(g_ble_manager);
         if (node) {
             // Invalidate all routes that use this node
             if (node->routing_table) {
@@ -398,7 +381,7 @@ static void on_node_disconnected(const uint32_t node_id) {
     }
 }
 
-static void on_data_received(const uint32_t sender_id, const uint8_t *data, const size_t len) {
+static void on_data_received(const uint32_t sender_id, const uint8_t * data, const size_t len) {
     log_info(TAG, "Received %zu bytes from Node 0x%08X", len, sender_id);
 
     struct header hdr;
@@ -411,15 +394,12 @@ static void on_data_received(const uint32_t sender_id, const uint8_t *data, cons
                 log_info(TAG, "Received heartbeat from 0x%08X", sender_id);
                 break;
             case MSG_DATA: {
-                // Parse network header to get source and destination
                 struct network net;
                 if (len >= 16 && parse_network(data + 8, len - 8, &net) == 0) {
-                    // Payload starts at offset 16 (8 header + 8 network)
                     const size_t payload_offset = 16;
                     const size_t payload_len = hdr.payload_length;
 
                     if (payload_offset + payload_len <= len) {
-                        // Print the message content
                         printf("\nMESSAGE FROM 0x%08X\n", net.source_id);
                         printf("\tSequence: %u\n", hdr.sequence_number);
                         printf("\tTTL: %u\n", hdr.time_to_live);
@@ -462,17 +442,17 @@ static void on_data_received(const uint32_t sender_id, const uint8_t *data, cons
 }
 
 // NOLINTNEXTLINE
-static int get_adapter_address(char *address, size_t len) {
-    GDBusConnection *dbus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
+static int get_adapter_address(char * address, size_t len) {
+    GDBusConnection * dbus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
     if (!dbus) return -1;
 
-    Adapter *adapter = binc_adapter_get_default(dbus);
+    Adapter * adapter = binc_adapter_get_default(dbus);
     if (!adapter) {
         g_object_unref(dbus);
         return -1;
     }
 
-    const char *addr = binc_adapter_get_address(adapter);
+    const char * addr = binc_adapter_get_address(adapter);
     if (addr) {
         strncpy(address, addr, len - 1);
         address[len - 1] = '\0';
@@ -486,7 +466,7 @@ static int get_adapter_address(char *address, size_t len) {
 }
 
 
-int main(const int argc, char *argv[]) {
+int main(const int argc, char * argv[]) {
     enum NODE_TYPE node_type = FULL_NODE;
     int verbose = 0;
 
@@ -526,7 +506,7 @@ int main(const int argc, char *argv[]) {
     log_enabled(TRUE);
     log_set_level(verbose ? LOG_DEBUG : LOG_INFO);
 
-    log_debug(TAG, "LocalNet starting...");
+    log_debug(TAG, "LocalNet starting");
 
     // Get adapter MAC address
     char mac_address[18] = {0};
@@ -580,7 +560,7 @@ int main(const int argc, char *argv[]) {
     log_info(TAG, "Initiating Scanning");
 
     // Set up stdin input handling for menu commands
-    GIOChannel *stdin_channel = g_io_channel_unix_new(STDIN_FILENO);
+    GIOChannel * stdin_channel = g_io_channel_unix_new(STDIN_FILENO);
     g_io_channel_set_encoding(stdin_channel, NULL, NULL);
     g_io_channel_set_buffered(stdin_channel, TRUE);
     const guint stdin_watch_id = g_io_add_watch(stdin_channel, G_IO_IN, stdin_callback, NULL);

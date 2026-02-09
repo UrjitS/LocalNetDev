@@ -75,7 +75,7 @@ static void remove_tracked_device(const uint32_t device_id) {
     if (!g_manager) return;
     for (guint i = 0; i < g_manager->discovered_count; i++) {
         if (g_manager->discovered_devices[i].device_id == device_id) {
-            // Shift remaining elements down
+            // Shift remaining elements
             for (guint j = i; j < g_manager->discovered_count - 1; j++) {
                 g_manager->discovered_devices[j] = g_manager->discovered_devices[j + 1];
             }
@@ -95,7 +95,7 @@ static void clear_all_tracked_devices(void) {
 static tracked_device_t * add_device(const uint32_t device_id, const char * mac, Device * device) {
     if (!g_manager || g_manager->discovered_count >= MAX_DISCOVERED_DEVICES) return NULL;
 
-    // Check if already exists 
+    // Check if already exists
     tracked_device_t * existing = find_device_by_id(device_id);
     if (existing) {
         if (device) existing->device = device;
@@ -123,7 +123,7 @@ static guint count_connected(void) {
     return count;
 }
 
-// Advertising control 
+// Advertising
 static void start_advertising(void) {
     if (!g_manager || !g_manager->adapter) return;
 
@@ -150,7 +150,7 @@ static void stop_advertising(void) {
     binc_adapter_stop_advertising(g_manager->adapter, g_manager->advertisement);
 }
 
-// Discovery control 
+// Discovery
 static void start_discovery(void) {
     if (!g_manager || !g_manager->adapter) return;
     binc_adapter_set_discovery_filter(g_manager->adapter, -100, NULL, NULL);
@@ -162,7 +162,7 @@ static void stop_discovery(void) {
     binc_adapter_stop_discovery(g_manager->adapter);
 }
 
-// Connect to a device 
+// Connect
 static void connect_to_device(tracked_device_t * tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
     if (tracked->is_connected) return;
@@ -194,7 +194,7 @@ static gboolean heartbeat_callback(gpointer user_data) {
     guint connected = 0;
     guint timed_out = 0;
 
-    // Collect timed out device IDs first (iterate backwards to safely remove)
+    // Collect timed out device IDs first
     uint32_t timed_out_ids[MAX_DISCOVERED_DEVICES];
     guint timed_out_count = 0;
 
@@ -223,12 +223,11 @@ static gboolean heartbeat_callback(gpointer user_data) {
         }
     }
 
-    // Now remove timed out devices from internal tracking
+    // Remove timed out devices from internal tracking
     for (guint i = 0; i < timed_out_count; i++) {
         remove_tracked_device(timed_out_ids[i]);
     }
 
-    // Create proper heartbeat message using protocol structures
     const struct heartbeat heartbeat = {
         .device_status = 0x01,
         .active_connection_number = (uint8_t)count_connected(),
@@ -248,10 +247,9 @@ static gboolean heartbeat_callback(gpointer user_data) {
 
     struct network network = {
         .source_id = g_manager->device_id,
-        .destination_id = 0  // Broadcast
+        .destination_id = 0
     };
 
-    // Serialize the heartbeat payload 
     uint8_t payload_buffer[16];
     const size_t payload_len = serialize_heartbeat(&heartbeat, payload_buffer, sizeof(payload_buffer));
     if (payload_len == 0) {
@@ -259,7 +257,6 @@ static gboolean heartbeat_callback(gpointer user_data) {
         return TRUE;
     }
 
-    // Create the full packet 
     const struct packet packet = {
         .header = &header,
         .network = &network,
@@ -267,7 +264,6 @@ static gboolean heartbeat_callback(gpointer user_data) {
         .security = NULL
     };
 
-    // Serialize the complete packet
     uint8_t buffer[64];
     const size_t len = serialize_packet(&packet, buffer, sizeof(buffer));
     if (len == 0) {
@@ -310,7 +306,6 @@ static gboolean heartbeat_callback(gpointer user_data) {
 
     log_info(BT_TAG, "Heartbeat sent to %u connected nodes", connected - timed_out);
 
-    /* Process retransmissions and route request timeouts */
     ble_process_retransmissions(g_manager);
 
     return TRUE;
@@ -1075,9 +1070,6 @@ struct mesh_node *ble_get_mesh_node(ble_node_manager_t *manager) {
     return manager->mesh_node;
 }
 
-/* ========================================================================== */
-/* Route Discovery Implementation                                              */
-/* ========================================================================== */
 
 uint32_t ble_initiate_route_discovery(ble_node_manager_t *manager, const uint32_t destination_id) {
     if (!manager || !manager->mesh_node) return 0;
@@ -1090,8 +1082,7 @@ uint32_t ble_initiate_route_discovery(ble_node_manager_t *manager, const uint32_
         return 0;
     }
 
-    log_info(BT_TAG, "Initiating route discovery for 0x%08X (request_id: 0x%08X)",
-            destination_id, req.request_id);
+    log_info(BT_TAG, "Initiating route discovery for 0x%08X (request_id: 0x%08X)", destination_id, req.request_id);
 
     // Broadcast route request to all connected neighbors
     const gboolean sent = ble_broadcast_route_request(manager, req.request_id, destination_id,
@@ -1109,16 +1100,14 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
                                      const uint32_t exclude_id) {
     if (!manager || !reverse_path || reverse_path_len == 0) return FALSE;
 
-    // Build route request structure
     const struct route_request req = {
         .request_id = request_id,
         .destination_id = destination_id,
         .hop_count = hop_count,
         .reverse_path_len = reverse_path_len,
-        .reverse_path = (uint32_t *)reverse_path  // Cast away const for serialize
+        .reverse_path = (uint32_t *)reverse_path
     };
 
-    // Build packet header
     struct header header = {
         .protocol_version = PROTOCOL_VERSION,
         .message_type = MSG_ROUTE_REQUEST,
@@ -1126,7 +1115,7 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
         .fragmentation_number = 0,
         .total_fragments = 1,
         .time_to_live = MAX_HOP_COUNT,
-        .payload_length = 0,  // Will be set after serialization
+        .payload_length = 0,
         .sequence_number = 0
     };
 
@@ -1135,7 +1124,6 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
         .destination_id = destination_id
     };
 
-    // Serialize route request payload
     uint8_t payload_buffer[256];
     const size_t payload_len = serialize_route_request(&req, payload_buffer, sizeof(payload_buffer));
     if (payload_len == 0) {
@@ -1145,7 +1133,6 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
 
     header.payload_length = (uint16_t)payload_len;
 
-    // Create packet
     const struct packet packet = {
         .header = &header,
         .network = &network,
@@ -1153,7 +1140,6 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
         .security = NULL
     };
 
-    // Serialize complete packet
     uint8_t buffer[MAX_BLE_PAYLOAD_SIZE];
     const size_t total_len = serialize_packet(&packet, buffer, sizeof(buffer));
     if (total_len == 0) {
@@ -1161,7 +1147,6 @@ gboolean ble_broadcast_route_request(ble_node_manager_t *manager, const uint32_t
         return FALSE;
     }
 
-    // Send to all connected neighbors except exclude_id
     gboolean sent_any = FALSE;
     for (guint i = 0; i < manager->discovered_count; i++) {
         const tracked_device_t *tracked = &manager->discovered_devices[i];
@@ -1187,15 +1172,13 @@ gboolean ble_send_route_reply(ble_node_manager_t *manager, const uint32_t target
                               const uint32_t *forward_path, const uint8_t forward_path_len) {
     if (!manager || !forward_path || forward_path_len == 0) return FALSE;
 
-    // Build route reply structure
-    struct route_reply reply = {
+    const struct route_reply reply = {
         .request_id = request_id,
         .route_cost = route_cost,
         .forward_path_len = forward_path_len,
         .forward_path = (uint32_t *)forward_path
     };
 
-    // Build packet header
     struct header header = {
         .protocol_version = PROTOCOL_VERSION,
         .message_type = MSG_ROUTE_REPLY,
@@ -1212,7 +1195,6 @@ gboolean ble_send_route_reply(ble_node_manager_t *manager, const uint32_t target
         .destination_id = target_id
     };
 
-    // Serialize route reply payload
     uint8_t payload_buffer[256];
     const size_t payload_len = serialize_route_reply(&reply, payload_buffer, sizeof(payload_buffer));
     if (payload_len == 0) {
@@ -1222,7 +1204,6 @@ gboolean ble_send_route_reply(ble_node_manager_t *manager, const uint32_t target
 
     header.payload_length = (uint16_t)payload_len;
 
-    // Create packet
     const struct packet packet = {
         .header = &header,
         .network = &network,
@@ -1230,7 +1211,6 @@ gboolean ble_send_route_reply(ble_node_manager_t *manager, const uint32_t target
         .security = NULL
     };
 
-    // Serialize complete packet
     uint8_t buffer[MAX_BLE_PAYLOAD_SIZE];
     const size_t total_len = serialize_packet(&packet, buffer, sizeof(buffer));
     if (total_len == 0) {
@@ -1250,12 +1230,10 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
 
     struct mesh_node *node = manager->mesh_node;
 
-    /* Make forwarding decision to determine if we can send directly */
     struct forwarding_decision decision;
     uint8_t ttl = MAX_HOP_COUNT;
     make_forwarding_decision(node, destination_id, &ttl, &decision);
 
-    /* Build the data packet */
     uint16_t seq_num = 0;
     if (node->packet_queue) {
         seq_num = node->packet_queue->next_sequence_number;
@@ -1284,7 +1262,6 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
         .security = NULL
     };
 
-    /* Serialize the packet */
     uint8_t buffer[MAX_BLE_PAYLOAD_SIZE];
     const size_t total_len = serialize_packet(&packet, buffer, sizeof(buffer));
     if (total_len == 0) {
@@ -1295,7 +1272,6 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
     const uint32_t current_time_ms = get_current_timestamp() * 1000;
 
     if (decision.action == 0) {
-        /* Have route - send directly and queue for retransmission */
         if (node->packet_queue) {
             seq_num = queue_packet_for_transmission(node->packet_queue, destination_id,
                                                     buffer, total_len, current_time_ms);
@@ -1306,37 +1282,28 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
             return seq_num;
         }
     } else if (decision.action == -2) {
-        /* No route - queue packet and initiate route discovery */
         if (node->packet_queue) {
-            seq_num = queue_packet_for_transmission(node->packet_queue, destination_id,
-                                                    buffer, total_len, current_time_ms);
-            /* Mark as awaiting route */
+            seq_num = queue_packet_for_transmission(node->packet_queue, destination_id, buffer, total_len, current_time_ms);
             struct pending_packet *pkt = get_pending_packet(node->packet_queue, seq_num);
             if (pkt) {
                 pkt->state = PACKET_STATE_AWAITING_ROUTE;
             }
         }
 
-        /* Check if route discovery is already pending */
         if (!has_pending_route_discovery(node, destination_id)) {
             const uint32_t request_id = ble_initiate_route_discovery(manager, destination_id);
             if (request_id > 0) {
-                log_info(BT_TAG, "Queued message for 0x%08X, initiated route discovery (request: 0x%08X)",
-                        destination_id, request_id);
-                /* Associate request with queued packets */
+                log_info(BT_TAG, "Queued message for 0x%08X, initiated route discovery (request: 0x%08X)", destination_id, request_id);
                 if (node->packet_queue) {
                     associate_route_request_with_packets(node->packet_queue, destination_id, request_id);
                 }
             }
         } else {
-            log_info(BT_TAG, "Queued message for 0x%08X, route discovery already pending",
-                    destination_id);
+            log_info(BT_TAG, "Queued message for 0x%08X, route discovery already pending", destination_id);
         }
         return seq_num;
     } else {
-        /* Error - local delivery or TTL expired (shouldn't happen for new messages) */
-        log_error(BT_TAG, "Cannot send message to 0x%08X: forwarding decision=%d",
-                 destination_id, decision.action);
+        log_error(BT_TAG, "Cannot send message to 0x%08X: forwarding decision=%d", destination_id, decision.action);
     }
 
     return 0;
@@ -1345,7 +1312,7 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
 void ble_send_queued_packets(ble_node_manager_t *manager, const uint32_t destination_id) {
     if (!manager || !manager->mesh_node || !manager->mesh_node->packet_queue) return;
 
-    struct mesh_node *node = manager->mesh_node;
+    const struct mesh_node * node = manager->mesh_node;
     struct pending_packet_queue *queue = node->packet_queue;
 
     /* Find route to destination */

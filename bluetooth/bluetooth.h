@@ -51,7 +51,6 @@ typedef struct ble_node_manager {
     uint32_t device_id;
     char local_name[MAX_NAME_SIZE];
 
-    // Tracked devices
     tracked_device_t *discovered_devices;
     guint discovered_count;
 
@@ -66,7 +65,7 @@ typedef struct ble_node_manager {
 } ble_node_manager_t;
 
 // Initialization and cleanup
-ble_node_manager_t *ble_init(struct mesh_node *mesh_node, uint32_t device_id, ble_discovered_callback discovered_cb, ble_connected_callback connected_cb, ble_disconnected_callback disconnected_cb, ble_data_callback data_cb);
+ble_node_manager_t * ble_init(struct mesh_node *mesh_node, uint32_t device_id, ble_discovered_callback discovered_cb, ble_connected_callback connected_cb, ble_disconnected_callback disconnected_cb, ble_data_callback data_cb);
 gboolean ble_start(ble_node_manager_t *manager);
 void ble_stop(ble_node_manager_t *manager);
 void ble_cleanup(ble_node_manager_t *manager);
