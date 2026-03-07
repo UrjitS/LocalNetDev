@@ -10,6 +10,7 @@
 #include "routing.h"
 #include "handlers.h"
 #include "utils.h"
+#include "encryption.h"
 
 
 static ble_node_manager_t * g_manager = NULL;
@@ -1420,5 +1421,74 @@ void ble_process_retransmissions(ble_node_manager_t *manager) {
     if (cleaned > 0) {
         log_debug(BT_TAG, "Cleaned up %zu delivered/failed packets", cleaned);
     }
+}
+
+void ble_set_session_manager(ble_node_manager_t *manager, struct session_manager *mgr) {
+    if (manager) {
+        manager->session_mgr = mgr;
+    }
+}
+
+struct session_manager *ble_get_session_manager(ble_node_manager_t *manager) {
+    if (!manager) return NULL;
+    return manager->session_mgr;
+}
+
+int ble_initiate_key_exchange(ble_node_manager_t *manager, uint32_t peer_id) {
+    if (!manager || !manager->session_mgr || !manager->mesh_node) return -1;
+
+    struct key_exchange_ext_message kex_msg;
+    if (initiate_key_exchange(manager->session_mgr, peer_id, &kex_msg) != 0) {
+        log_error(BT_TAG, "Failed to initiate key exchange with 0x%08X", peer_id);
+        return -1;
+    }
+
+    /* Serialize the key exchange message */
+    uint8_t kex_payload[KEY_EXCHANGE_EXT_SIZE];
+    const size_t kex_len = serialize_key_exchange_ext(&kex_msg, kex_payload, sizeof(kex_payload));
+    if (kex_len == 0) {
+        log_error(BT_TAG, "Failed to serialize key exchange message");
+        return -1;
+    }
+
+    /* Build protocol packet */
+    struct header hdr = {
+        .protocol_version = PROTOCOL_VERSION,
+        .message_type = MSG_KEY_EXCHANGE,
+        .fragmentation_flag = 0,
+        .fragmentation_number = 0,
+        .total_fragments = 1,
+        .time_to_live = MAX_HOP_COUNT,
+        .payload_length = (uint16_t)kex_len,
+        .sequence_number = 0
+    };
+
+    struct network net = {
+        .source_id = manager->device_id,
+        .destination_id = peer_id
+    };
+
+    struct packet pkt = {
+        .header = &hdr,
+        .network = &net,
+        .payload = kex_payload,
+        .security = NULL
+    };
+
+    uint8_t buffer[256];
+    const size_t total = serialize_packet(&pkt, buffer, sizeof(buffer));
+    if (total == 0) {
+        log_error(BT_TAG, "Failed to serialize key exchange packet");
+        return -1;
+    }
+
+    /* Send to peer */
+    if (!ble_send_data(manager, peer_id, buffer, total)) {
+        log_error(BT_TAG, "Failed to send key exchange to 0x%08X", peer_id);
+        return -1;
+    }
+
+    log_info(BT_TAG, "Key exchange request sent to 0x%08X", peer_id);
+    return 0;
 }
 

@@ -24,6 +24,8 @@ enum handler_action {
     HANDLER_ACTION_INITIATE_ROUTE_DISCOVERY,
     HANDLER_ACTION_TTL_EXPIRED,
     HANDLER_ACTION_DEST_UNREACHABLE,
+    HANDLER_ACTION_SEND_KEY_EXCHANGE_REPLY,
+    HANDLER_ACTION_KEY_EXCHANGE_COMPLETE,
     HANDLER_ACTION_ERROR
 };
 
@@ -54,6 +56,10 @@ struct handler_result {
     uint8_t *packet_data;
     size_t packet_len;
     uint8_t ttl;
+
+    // For key exchange
+    uint8_t *kex_response_data;    /* Serialized key exchange response */
+    size_t kex_response_len;       /* Length of serialized response */
 };
 
 /**

@@ -8,6 +8,7 @@
 #include "agent.h"
 
 struct mesh_node;
+struct session_manager;
 
 #define LOCAL_NET_SERVICE_UUID "00001234-0000-1000-8000-00805f9b34fb"
 #define LOCAL_NET_DATA_CHAR_UUID "00001235-0000-1000-8000-00805f9b34fb"
@@ -60,6 +61,8 @@ typedef struct ble_node_manager {
     ble_connected_callback connected_callback;
     ble_disconnected_callback disconnected_callback;
     ble_discovered_callback discovered_callback;
+
+    struct session_manager *session_mgr;
 
     guint heartbeat_source;
 } ble_node_manager_t;
@@ -129,5 +132,21 @@ void ble_send_queued_packets(ble_node_manager_t *manager, uint32_t destination_i
  * Should be called periodically (e.g., from heartbeat timer)
  */
 void ble_process_retransmissions(ble_node_manager_t *manager);
+
+/**
+ * Set the session manager for encryption support
+ */
+void ble_set_session_manager(ble_node_manager_t *manager, struct session_manager *mgr);
+
+/**
+ * Get the session manager
+ */
+struct session_manager *ble_get_session_manager(ble_node_manager_t *manager);
+
+/**
+ * Initiate a key exchange with a peer node
+ * Returns 0 on success, -1 on failure
+ */
+int ble_initiate_key_exchange(ble_node_manager_t *manager, uint32_t peer_id);
 
 #endif // LOCALNET_BLUETOOTH_H

@@ -39,7 +39,6 @@ enum CONNECTION_STATE {
 #define DISCOVERY_INITIAL_DURATION 120
 #define MAX_HOP_COUNT 15
 #define LINK_QUALITY_WINDOW 100
-
 #define MAX_PENDING_REQUESTS 16
 #define ROUTE_REQUEST_TIMEOUT_SECONDS 10
 #define MAX_ROUTE_REQUEST_RETRIES 3
@@ -47,9 +46,9 @@ enum CONNECTION_STATE {
 /* Retransmission Configuration */
 #define MAX_PENDING_PACKETS 32
 #define MAX_RETRANSMISSION_RETRIES 5
-#define INITIAL_RETRANSMIT_INTERVAL_MS 500      /* 500ms initial interval */
-#define MAX_RETRANSMIT_INTERVAL_MS 30000        /* 30 seconds max interval */
-#define RETRANSMIT_BACKOFF_FACTOR 2             /* Exponential backoff multiplier */
+#define INITIAL_RETRANSMIT_INTERVAL_MS 500
+#define MAX_RETRANSMIT_INTERVAL_MS 30000
+#define RETRANSMIT_BACKOFF_FACTOR 2
 
 /* Connection Table Entry */
 struct connection_entry {

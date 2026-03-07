@@ -348,7 +348,9 @@ int handle_incoming_packet(struct mesh_node *mesh_node, const uint8_t *data, con
         }
 
         default:
-            // Unknown or other message type
+            // Unknown or other message type — including MSG_KEY_EXCHANGE
+            // Key exchange is handled via the raw data callback path so the
+            // BLE layer can pass it to the session manager.
             result->action = HANDLER_ACTION_CALL_DATA_CALLBACK;
             break;
     }
@@ -371,5 +373,9 @@ void free_handler_result(struct handler_result *result) {
     if (result->packet_data) {
         free(result->packet_data);
         result->packet_data = NULL;
+    }
+    if (result->kex_response_data) {
+        free(result->kex_response_data);
+        result->kex_response_data = NULL;
     }
 }

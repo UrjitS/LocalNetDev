@@ -13,6 +13,12 @@ find_path(BINC_INCLUDE_DIR NAMES adapter.h PATH_SUFFIXES binc PATHS "$ENV{HOME}/
 include(FindPkgConfig)
 pkg_check_modules(GLIB REQUIRED glib-2.0 gio-2.0)
 
+# Find libsodium
+pkg_check_modules(SODIUM REQUIRED libsodium)
+
+# Find OpenSSL
+find_package(OpenSSL REQUIRED)
+
 # Print found paths for debugging
 message(STATUS "BINC_LIB: ${BINC_LIB}")
 message(STATUS "BINC_INCLUDE_DIR: ${BINC_INCLUDE_DIR}")
@@ -42,12 +48,15 @@ add_executable(LocalNet
 target_include_directories(LocalNet PRIVATE
         ${BINC_INCLUDE_DIR}
         ${GLIB_INCLUDE_DIRS}
+        ${SODIUM_INCLUDE_DIRS}
 )
 
-# Link libraries - order matters: Binc, then GLib, then system libs
+# Link libraries - order matters: Binc, then GLib, then crypto libs, then system libs
 target_link_libraries(LocalNet PRIVATE
         ${BINC_LIB}
         ${GLIB_LIBRARIES}
+        ${SODIUM_LIBRARIES}
+        OpenSSL::Crypto
         m
 )
 
@@ -70,3 +79,20 @@ add_executable(routing_tests
 )
 
 target_include_directories(routing_tests PRIVATE ${CMAKE_SOURCE_DIR}/routing)
+
+# Test binary for encryption unit tests
+add_executable(encryption_tests
+        encryption/encryption.c
+        tests/test_encryption.c
+)
+
+target_include_directories(encryption_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/encryption
+        ${SODIUM_INCLUDE_DIRS}
+)
+
+target_link_libraries(encryption_tests PRIVATE
+        ${SODIUM_LIBRARIES}
+        OpenSSL::Crypto
+)
+

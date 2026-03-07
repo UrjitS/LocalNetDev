@@ -9,6 +9,7 @@
 #include "protocol/protocol.h"
 #include "routing/routing.h"
 #include "utils/utils.h"
+#include "encryption/encryption.h"
 #include "logger.h"
 
 #define TAG "LOCALNET"
@@ -16,6 +17,7 @@
 static ble_node_manager_t * g_ble_manager = NULL;
 static volatile gboolean g_running = TRUE;
 static uint32_t g_device_id = 0;
+static struct session_manager g_session_mgr;
 
 typedef void (*menu_command_handler)(void);
 
@@ -32,18 +34,26 @@ static void cmd_show_routes(void);
 static void cmd_discover_route(void);
 static void cmd_send_message(void);
 static void cmd_show_pending_packets(void);
+static void cmd_initiate_key_exchange(void);
+static void cmd_show_sessions(void);
+static void cmd_verify_oob(void);
+static void cmd_set_static_oob(void);
 static void cmd_show_help(void);
 static void cmd_quit(void);
 
 static const menu_command_t g_menu_commands[] = {
-    { "1", "Show connection table",     cmd_show_connections },
-    { "2", "Show Node info",            cmd_show_node_info },
-    { "3", "Show routing table",        cmd_show_routes },
-    { "4", "Discover route to node",    cmd_discover_route },
-    { "5", "Send message to node",      cmd_send_message },
-    { "6", "Show pending packets",      cmd_show_pending_packets },
-    { "h", "Show help",                 cmd_show_help },
-    { "q", "Quit",                      cmd_quit },
+    { "1", "Show connection table",       cmd_show_connections },
+    { "2", "Show Node info",              cmd_show_node_info },
+    { "3", "Show routing table",          cmd_show_routes },
+    { "4", "Discover route to node",      cmd_discover_route },
+    { "5", "Send message to node",        cmd_send_message },
+    { "6", "Show pending packets",        cmd_show_pending_packets },
+    { "7", "Initiate key exchange",       cmd_initiate_key_exchange },
+    { "8", "Show encryption sessions",    cmd_show_sessions },
+    { "9", "Verify OOB code",            cmd_verify_oob },
+    { "0", "Set static OOB token",       cmd_set_static_oob },
+    { "h", "Show help",                   cmd_show_help },
+    { "q", "Quit",                        cmd_quit },
     { NULL, NULL, NULL }
 };
 
@@ -263,6 +273,215 @@ static void cmd_show_pending_packets(void) {
     printf("\n");
 }
 
+/* ========================================================================== */
+/* OOB Display Callback                                                        */
+/* ========================================================================== */
+
+/**
+ * Default OOB display callback.
+ * Displays the OOB short code on the terminal.
+ * Users should replace this with their own implementation
+ * (e.g., QR code display, LED blink pattern, NFC write).
+ */
+static void on_oob_display(const uint32_t peer_id,
+                           const uint8_t short_code[OOB_COMMITMENT_SIZE],
+                           const enum oob_method method) {
+    printf("\n");
+    printf("************************************************************\n");
+    printf("  OOB VERIFICATION REQUIRED\n");
+    printf("************************************************************\n");
+    printf("  Peer Node:  0x%08X\n", peer_id);
+    printf("  OOB Method: %s\n", oob_method_to_string(method));
+    printf("  Short Code: %02X%02X%02X%02X\n",
+           short_code[0], short_code[1], short_code[2], short_code[3]);
+    printf("\n");
+    printf("  Verify this code matches on the peer device.\n");
+    printf("  Then use menu option [9] to confirm.\n");
+    printf("************************************************************\n");
+    printf("\n");
+}
+
+/* ========================================================================== */
+/* Encryption Menu Commands                                                    */
+/* ========================================================================== */
+
+static void cmd_initiate_key_exchange(void) {
+    if (!g_ble_manager) {
+        fprintf(stderr, "Error: BLE Manager not initialized\n");
+        return;
+    }
+
+    printf("Enter peer node ID (e.g., 0x12345678): ");
+    fflush(stdout);
+
+    char input[32];
+    if (read_stdin_line(input, sizeof(input)) != 0) {
+        fprintf(stderr, "Error reading input\n");
+        return;
+    }
+
+    uint32_t peer_id;
+    if (parse_node_id(input, &peer_id) != 0) {
+        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        return;
+    }
+
+    if (validate_destination_id(peer_id, g_device_id) != 0) {
+        fprintf(stderr, "Invalid destination (cannot be 0 or self)\n");
+        return;
+    }
+
+    printf("Initiating key exchange with 0x%08X...\n", peer_id);
+
+    if (ble_initiate_key_exchange(g_ble_manager, peer_id) == 0) {
+        printf("Key exchange request sent to 0x%08X\n", peer_id);
+    } else {
+        printf("Failed to initiate key exchange.\n");
+    }
+}
+
+static void cmd_show_sessions(void) {
+    printf("\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("ENCRYPTION SESSIONS\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("\t %-12s %-14s %-12s %-8s %-8s\n",
+           "Peer", "State", "OOB Method", "TX Cnt", "RX Cnt");
+    printf("--------------------------------------------------------------------\n");
+
+    size_t count = 0;
+    for (size_t i = 0; i < MAX_SESSIONS; i++) {
+        const struct encryption_session * session = &g_session_mgr.sessions[i];
+        if (session->state == SESSION_STATE_EMPTY) continue;
+
+        printf("\t 0x%08X   %-14s %-12s %-8u %-8u\n",
+               session->peer_id,
+               session_state_to_string(session->state),
+               oob_method_to_string(session->negotiated_oob_method),
+               session->send_frame_counter,
+               session->recv_frame_counter);
+        count++;
+    }
+
+    if (count == 0) {
+        printf("\t (no active sessions)\n");
+    }
+
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Total: %zu session(s)\n", count);
+    printf("--------------------------------------------------------------------\n");
+    printf("\n");
+}
+
+static void cmd_verify_oob(void) {
+    printf("Enter peer node ID (e.g., 0x12345678): ");
+    fflush(stdout);
+
+    char input[32];
+    if (read_stdin_line(input, sizeof(input)) != 0) {
+        fprintf(stderr, "Error reading input\n");
+        return;
+    }
+
+    uint32_t peer_id;
+    if (parse_node_id(input, &peer_id) != 0) {
+        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        return;
+    }
+
+    /* Show the local OOB code for reference */
+    uint8_t local_code[OOB_COMMITMENT_SIZE];
+    if (get_oob_code(&g_session_mgr, peer_id, local_code) == 0) {
+        printf("Local OOB code: %02X%02X%02X%02X\n",
+               local_code[0], local_code[1], local_code[2], local_code[3]);
+    } else {
+        fprintf(stderr, "No OOB_PENDING session found for 0x%08X\n", peer_id);
+        return;
+    }
+
+    printf("Enter OOB code from peer (8 hex digits, e.g., A1B2C3D4): ");
+    fflush(stdout);
+
+    char code_input[32];
+    if (read_stdin_line(code_input, sizeof(code_input)) != 0) {
+        fprintf(stderr, "Error reading input\n");
+        return;
+    }
+
+    /* Parse hex code */
+    if (strlen(code_input) != 8) {
+        fprintf(stderr, "OOB code must be exactly 8 hex digits\n");
+        return;
+    }
+
+    uint8_t user_code[OOB_COMMITMENT_SIZE];
+    for (int i = 0; i < OOB_COMMITMENT_SIZE; i++) {
+        char byte_str[3] = { code_input[i * 2], code_input[i * 2 + 1], '\0' };
+        char *end_ptr;
+        const unsigned long val = strtoul(byte_str, &end_ptr, 16);
+        if (*end_ptr != '\0') {
+            fprintf(stderr, "Invalid hex character in OOB code\n");
+            return;
+        }
+        user_code[i] = (uint8_t)val;
+    }
+
+    const int result = verify_oob_code(&g_session_mgr, peer_id, user_code);
+    switch (result) {
+        case ENC_SUCCESS:
+            printf("OOB verification successful! Session with 0x%08X is now VERIFIED.\n", peer_id);
+            break;
+        case ENC_ERROR_OOB_MISMATCH:
+            printf("OOB verification FAILED! Codes do not match.\n");
+            printf("Session has been torn down. Please re-initiate key exchange.\n");
+            break;
+        case ENC_ERROR_NO_SESSION:
+            printf("No session found for 0x%08X\n", peer_id);
+            break;
+        default:
+            printf("OOB verification error: %d\n", result);
+            break;
+    }
+}
+
+static void cmd_set_static_oob(void) {
+    printf("Enter static OOB token (hex string, e.g., DEADBEEF01020304): ");
+    fflush(stdout);
+
+    char input[256];
+    if (read_stdin_line(input, sizeof(input)) != 0) {
+        fprintf(stderr, "Error reading input\n");
+        return;
+    }
+
+    const size_t hex_len = strlen(input);
+    if (hex_len == 0 || hex_len % 2 != 0 || hex_len > STATIC_OOB_TOKEN_MAX_SIZE * 2) {
+        fprintf(stderr, "Invalid token: must be even-length hex string (max %d bytes)\n",
+                STATIC_OOB_TOKEN_MAX_SIZE);
+        return;
+    }
+
+    const size_t token_len = hex_len / 2;
+    uint8_t token[STATIC_OOB_TOKEN_MAX_SIZE];
+
+    for (size_t i = 0; i < token_len; i++) {
+        char byte_str[3] = { input[i * 2], input[i * 2 + 1], '\0' };
+        char *end_ptr;
+        const unsigned long val = strtoul(byte_str, &end_ptr, 16);
+        if (*end_ptr != '\0') {
+            fprintf(stderr, "Invalid hex character at position %zu\n", i * 2);
+            return;
+        }
+        token[i] = (uint8_t)val;
+    }
+
+    if (session_manager_set_static_oob_token(&g_session_mgr, token, token_len) == 0) {
+        printf("Static OOB token set (%zu bytes)\n", token_len);
+    } else {
+        fprintf(stderr, "Failed to set static OOB token\n");
+    }
+}
+
 static void cmd_show_help(void) {
     printf("\n");
     printf("--------------------------------------------------------------------\n");
@@ -434,6 +653,76 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                 log_info(TAG, "Received data message from 0x%08X", sender_id);
                 break;
             }
+            case MSG_KEY_EXCHANGE: {
+                log_info(TAG, "Received key exchange message from 0x%08X", sender_id);
+
+                if (hdr.payload_length < KEY_EXCHANGE_EXT_SIZE || len < 16 + KEY_EXCHANGE_EXT_SIZE) {
+                    log_error(TAG, "Key exchange message too short");
+                    break;
+                }
+
+                struct key_exchange_ext_message kex_msg;
+                if (parse_key_exchange_ext(data + 16, hdr.payload_length, &kex_msg) != 0) {
+                    log_error(TAG, "Failed to parse key exchange message");
+                    break;
+                }
+
+                struct key_exchange_ext_message response;
+                int need_response = 0;
+
+                if (handle_key_exchange(&g_session_mgr, sender_id,
+                                        &kex_msg, &response, &need_response) != 0) {
+                    log_error(TAG, "Failed to handle key exchange from 0x%08X", sender_id);
+                    break;
+                }
+
+                if (need_response && g_ble_manager) {
+                    /* Serialize and send response */
+                    uint8_t resp_payload[KEY_EXCHANGE_EXT_SIZE];
+                    const size_t resp_len = serialize_key_exchange_ext(&response, resp_payload,
+                                                                      sizeof(resp_payload));
+                    if (resp_len > 0) {
+                        struct header resp_hdr = {
+                            .protocol_version = 1,
+                            .message_type = MSG_KEY_EXCHANGE,
+                            .fragmentation_flag = 0,
+                            .fragmentation_number = 0,
+                            .total_fragments = 1,
+                            .time_to_live = 15,
+                            .payload_length = (uint16_t)resp_len,
+                            .sequence_number = 0
+                        };
+
+                        struct network resp_net = {
+                            .source_id = g_device_id,
+                            .destination_id = sender_id
+                        };
+
+                        struct packet resp_pkt = {
+                            .header = &resp_hdr,
+                            .network = &resp_net,
+                            .payload = resp_payload,
+                            .security = NULL
+                        };
+
+                        uint8_t resp_buffer[256];
+                        const size_t total = serialize_packet(&resp_pkt, resp_buffer,
+                                                             sizeof(resp_buffer));
+                        if (total > 0) {
+                            ble_send_data(g_ble_manager, sender_id, resp_buffer, total);
+                            log_info(TAG, "Key exchange response sent to 0x%08X", sender_id);
+                        }
+                    }
+                }
+
+                log_info(TAG, "Key exchange with 0x%08X: session in %s state",
+                         sender_id,
+                         session_state_to_string(
+                             session_find_by_peer(&g_session_mgr, sender_id)
+                                 ? session_find_by_peer(&g_session_mgr, sender_id)->state
+                                 : SESSION_STATE_EMPTY));
+                break;
+            }
             default:
                 log_info(TAG, "Received unknown message type: %d", hdr.message_type);
                 break;
@@ -508,6 +797,12 @@ int main(const int argc, char * argv[]) {
 
     log_debug(TAG, "LocalNet starting");
 
+    // Initialize crypto library
+    if (crypto_init() != 0) {
+        log_error(TAG, "Failed to initialize crypto library");
+        return EXIT_FAILURE;
+    }
+
     // Get adapter MAC address
     char mac_address[18] = {0};
     if (get_adapter_address(mac_address, sizeof(mac_address)) != 0) {
@@ -548,6 +843,16 @@ int main(const int argc, char * argv[]) {
         return EXIT_FAILURE;
     }
 
+    // Initialize encryption session manager
+    if (session_manager_init(&g_session_mgr, g_device_id) != 0) {
+        log_error(TAG, "Failed to initialize encryption session manager");
+        ble_cleanup(g_ble_manager);
+        return EXIT_FAILURE;
+    }
+    session_manager_set_oob_callback(&g_session_mgr, on_oob_display);
+    ble_set_session_manager(g_ble_manager, &g_session_mgr);
+    log_info(TAG, "Encryption session manager initialized");
+
     // Start the BLE node
     if (!ble_start(g_ble_manager)) {
         log_error(TAG, "Failed to start BLE node manager");
@@ -574,6 +879,7 @@ int main(const int argc, char * argv[]) {
 
     // Cleanup
     log_info(TAG, "Shutting down");
+    session_manager_cleanup(&g_session_mgr);
     ble_cleanup(g_ble_manager);
     g_ble_manager = NULL;
 
