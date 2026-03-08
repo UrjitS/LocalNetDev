@@ -64,6 +64,11 @@ typedef struct ble_node_manager {
 
     struct session_manager *session_mgr;
 
+    gboolean connecting_in_progress;
+    uint32_t connecting_to_id;
+    uint32_t last_connect_attempt_time;
+    uint8_t connect_retry_count;
+
     guint heartbeat_source;
 } ble_node_manager_t;
 

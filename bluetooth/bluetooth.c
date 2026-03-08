@@ -168,11 +168,23 @@ static void connect_to_device(tracked_device_t * tracked) {
     if (!g_manager || !tracked || !tracked->device) return;
     if (tracked->is_connected) return;
 
+    // Guard against duplicate connection attempts
+    if (g_manager->connecting_in_progress) {
+        log_debug(BT_TAG, "Connection already in progress to 0x%08X, skipping connect to 0x%08X",
+                  g_manager->connecting_to_id, tracked->device_id);
+        return;
+    }
+
     log_info(BT_TAG, "Connecting to device 0x%08X", tracked->device_id);
 
-    // Stop advertising and discovery before connecting to avoid conflicts 
-    log_debug(BT_TAG, "Stopping advertising before connection attempt");
-    stop_advertising();
+    g_manager->connecting_in_progress = TRUE;
+    g_manager->connecting_to_id = tracked->device_id;
+    g_manager->last_connect_attempt_time = get_current_timestamp();
+
+    // Stop discovery before connecting to avoid scan interference
+    // Note: We do NOT stop advertising - the node must remain visible as a
+    // peripheral so that incoming connections from other nodes are not disrupted.
+    // BLE supports simultaneous central and peripheral roles.
     log_debug(BT_TAG, "Stopping discovery before connection attempt");
     stop_discovery();
 
@@ -361,7 +373,25 @@ static void on_scan_result(Adapter * adapter, Device * device) {
     }
 
     if (g_manager->device_id > device_id) {
-        log_debug(BT_TAG, "Connecting to 0x%08X", device_id);
+        // Check if we already have an incoming connection from this device
+        tracked_device_t *existing = find_device_by_id(device_id);
+        if (existing && existing->is_connected) {
+            log_debug(BT_TAG, "Already connected to 0x%08X (incoming), skipping outbound", device_id);
+            return;
+        }
+
+        // Backoff: don't retry too quickly after a failed connection attempt
+        const uint32_t now = get_current_timestamp();
+        const uint32_t backoff_seconds = (g_manager->connect_retry_count < 5)
+            ? (uint32_t)(RECONNECT_DELAY_MS / 1000) * (g_manager->connect_retry_count + 1)
+            : 30;
+        if (g_manager->last_connect_attempt_time > 0 &&
+            (now - g_manager->last_connect_attempt_time) < backoff_seconds) {
+            log_debug(BT_TAG, "Backoff: waiting before reconnecting to 0x%08X (%u/%u sec)",
+                      device_id, now - g_manager->last_connect_attempt_time, backoff_seconds);
+            return;
+        }
+
         connect_to_device(tracked);
     } else {
         log_debug(BT_TAG, "Waiting for 0x%08X to connect to us", device_id);
@@ -386,14 +416,28 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
         log_error(BT_TAG, "Connection error for 0x%08X: %s", device_id, error->message);
     }
 
-    log_debug(BT_TAG, "Connection state changed for 0x%08X: %s", device_id, state_name);
+    log_info(BT_TAG, "Connection state changed for 0x%08X: %s", device_id, state_name);
 
     switch (state) {
         case BINC_CONNECTED:
-            start_advertising();
+            // Clear connecting flag
+            if (g_manager->connecting_in_progress && g_manager->connecting_to_id == device_id) {
+                g_manager->connecting_in_progress = FALSE;
+                g_manager->connecting_to_id = 0;
+                g_manager->connect_retry_count = 0;
+            }
+            // Restart discovery (advertising was never stopped)
             start_discovery();
             break;
         case BINC_DISCONNECTED:
+            // Clear connecting flag
+            if (g_manager->connecting_in_progress && g_manager->connecting_to_id == device_id) {
+                g_manager->connecting_in_progress = FALSE;
+                g_manager->connecting_to_id = 0;
+                g_manager->connect_retry_count++;
+                log_info(BT_TAG, "Outbound connection to 0x%08X failed (attempt %u)",
+                         device_id, g_manager->connect_retry_count);
+            }
             if (tracked) {
                 const gboolean was_connected = tracked->is_connected;
                 const uint32_t tracked_device_id = tracked->device_id;
@@ -413,9 +457,9 @@ static void on_connection_state_changed(Device * device, ConnectionState state, 
                 binc_adapter_remove_device(g_manager->adapter, device);
             }
 
-            // Restart advertising and discovery after disconnection
-            log_debug(BT_TAG, "Restarting advertising and discovery after disconnection");
-            start_advertising();
+            // Restart discovery after disconnection
+            // Note: advertising is maintained continuously and never stopped
+            log_debug(BT_TAG, "Restarting discovery after disconnection");
             start_discovery();
             break;
         case BINC_CONNECTING:
@@ -440,8 +484,7 @@ static void on_services_resolved(Device * device) {
         binc_characteristic_start_notify(characteristic);
     }
 
-    log_debug(BT_TAG, "Restarting advertising and discovery after successful connection");
-    start_advertising();
+    log_debug(BT_TAG, "Restarting discovery after successful connection");
     start_discovery();
 
     if (g_manager->connected_callback) {
@@ -612,9 +655,9 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
 
     const char * name = binc_device_get_name(device);
     const char * mac = binc_device_get_address(device);
-    // Reject connections if we're not actively advertising
-    if (!g_manager->advertisement) {
-        log_info(BT_TAG, "Rejecting ghost connection from %s", mac);
+    // Reject connections if we're not actively running
+    if (!g_manager->running) {
+        log_info(BT_TAG, "Rejecting connection while shutting down from %s", mac);
         binc_device_disconnect(device);
         binc_adapter_remove_device(adapter, device);
         return;
@@ -633,6 +676,15 @@ static void on_remote_central_connected(Adapter * adapter, Device * device) {
     }
 
     log_info(BT_TAG, "Remote connected: %s (%s)", name ? name : "unknown", mac);
+
+    // If we were trying to connect outbound to this device, cancel that attempt
+    // and accept the incoming connection instead
+    if (g_manager->connecting_in_progress && g_manager->connecting_to_id == device_id) {
+        log_info(BT_TAG, "Accepting incoming connection from 0x%08X (cancelling outbound attempt)", device_id);
+        g_manager->connecting_in_progress = FALSE;
+        g_manager->connecting_to_id = 0;
+        g_manager->connect_retry_count = 0;
+    }
 
     // Track device
     tracked_device_t * tracked = add_device(device_id, mac, device);
@@ -733,6 +785,10 @@ ble_node_manager_t* ble_init(struct mesh_node * mesh_node, uint32_t device_id, b
 
     manager->discovered_devices = g_new0(tracked_device_t, MAX_DISCOVERED_DEVICES);
     manager->discovered_count = 0;
+    manager->connecting_in_progress = FALSE;
+    manager->connecting_to_id = 0;
+    manager->last_connect_attempt_time = 0;
+    manager->connect_retry_count = 0;
 
     g_manager = manager;
     log_debug(BT_TAG, "Initialized BLE node manager for device ID: 0x%08X", device_id);
