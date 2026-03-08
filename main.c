@@ -283,9 +283,9 @@ static void cmd_show_pending_packets(void) {
  * Users should replace this with their own implementation
  * (e.g., QR code display, LED blink pattern, NFC write).
  */
-static void on_oob_display(const uint32_t peer_id,
+static void on_oob_display(uint32_t peer_id,
                            const uint8_t short_code[OOB_COMMITMENT_SIZE],
-                           const enum oob_method method) {
+                           enum oob_method method) {
     printf("\n");
     printf("************************************************************\n");
     printf("  OOB VERIFICATION REQUIRED\n");
@@ -389,7 +389,7 @@ static void cmd_verify_oob(void) {
         return;
     }
 
-    /* Show the local OOB code for reference */
+    // Show the local OOB code for reference
     uint8_t local_code[OOB_COMMITMENT_SIZE];
     if (get_oob_code(&g_session_mgr, peer_id, local_code) == 0) {
         printf("Local OOB code: %02X%02X%02X%02X\n",
@@ -408,7 +408,7 @@ static void cmd_verify_oob(void) {
         return;
     }
 
-    /* Parse hex code */
+    // Parse hex code
     if (strlen(code_input) != 8) {
         fprintf(stderr, "OOB code must be exactly 8 hex digits\n");
         return;
@@ -617,19 +617,67 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                 if (len >= 16 && parse_network(data + 8, len - 8, &net) == 0) {
                     const size_t payload_offset = 16;
                     const size_t payload_len = hdr.payload_length;
+                    const size_t expected_unencrypted = payload_offset + payload_len;
+                    const size_t expected_encrypted = expected_unencrypted + 24; // 24 = security block size
 
-                    if (payload_offset + payload_len <= len) {
-                        printf("\nMESSAGE FROM 0x%08X\n", net.source_id);
+                    if (payload_offset + payload_len > len) {
+                        log_error(TAG, "Invalid payload length in data message");
+                        break;
+                    }
+
+                    const uint8_t * raw_payload = data + payload_offset;
+
+                    // Check if frame has a security block appended (encrypted)
+                    if (len >= expected_encrypted) {
+                        // Parse the security block
+                        struct security sec;
+                        if (parse_security(data + expected_unencrypted, len - expected_unencrypted, &sec) != 0) {
+                            log_error(TAG, "Failed to parse security block");
+                            break;
+                        }
+
+                        // Build the security_block for the encryption module
+                        struct security_block sec_block = {
+                            .key_id = sec.key_id,
+                            .frame_counter = sec.frame_counter,
+                        };
+                        memcpy(sec_block.nonce, sec.nonce, 7);
+                        memcpy(sec_block.mac, sec.mac, 12);
+
+                        // Serialize header and network for MAC verification
+                        uint8_t header_bytes[8];
+                        uint8_t network_bytes[8];
+                        memcpy(header_bytes, data, 8);
+                        memcpy(network_bytes, data + 8, 8);
+
+                        // Decrypt the payload
+                        uint8_t * plaintext = NULL;
+                        size_t plaintext_len = 0;
+                        int dec_result = decrypt_frame(&g_session_mgr, net.source_id,
+                                                       header_bytes, sizeof(header_bytes),
+                                                       network_bytes, sizeof(network_bytes),
+                                                       raw_payload, payload_len,
+                                                       &sec_block,
+                                                       &plaintext, &plaintext_len);
+
+                        if (dec_result != ENC_SUCCESS) {
+                            log_error(TAG, "Failed to decrypt message from 0x%08X (error: %d)",
+                                      net.source_id, dec_result);
+                            break;
+                        }
+
+                        // Display decrypted message
+                        printf("\n\xF0\x9F\x94\x92 ENCRYPTED MESSAGE FROM 0x%08X\n", net.source_id);
                         printf("\tSequence: %u\n", hdr.sequence_number);
                         printf("\tTTL: %u\n", hdr.time_to_live);
-                        printf("\tLength: %zu bytes\n", payload_len);
+                        printf("\tLength: %zu bytes (encrypted)\n", plaintext_len);
+                        printf("\tFrame Counter: %u\n", sec_block.frame_counter);
 
                         // Print as string if printable, otherwise hex dump
-                        const uint8_t * payload = data + payload_offset;
                         int is_printable = 1;
-                        for (size_t i = 0; i < payload_len; i++) {
-                            if (payload[i] < 32 && payload[i] != '\n' && payload[i] != '\r' && payload[i] != '\t') {
-                                if (payload[i] != 0 || i < payload_len - 1) {
+                        for (size_t i = 0; i < plaintext_len; i++) {
+                            if (plaintext[i] < 32 && plaintext[i] != '\n' && plaintext[i] != '\r' && plaintext[i] != '\t') {
+                                if (plaintext[i] != 0 || i < plaintext_len - 1) {
                                     is_printable = 0;
                                     break;
                                 }
@@ -637,12 +685,43 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                         }
 
                         if (is_printable) {
-                            printf("Message: %.*s\n", (int)payload_len, payload);
+                            printf("\tMessage: %.*s\n", (int)plaintext_len, plaintext);
                         } else {
-                            printf("Data (hex): ");
+                            printf("\tData (hex): ");
+                            for (size_t i = 0; i < plaintext_len; i++) {
+                                printf("%02X ", plaintext[i]);
+                                if ((i + 1) % 16 == 0 && i + 1 < plaintext_len) printf("\n\t            ");
+                            }
+                            printf("\n");
+                        }
+
+                        printf("\n");
+                        free(plaintext);
+                    } else {
+                        // Unencrypted message (no security block)
+                        printf("\nMESSAGE FROM 0x%08X\n", net.source_id);
+                        printf("\tSequence: %u\n", hdr.sequence_number);
+                        printf("\tTTL: %u\n", hdr.time_to_live);
+                        printf("\tLength: %zu bytes\n", payload_len);
+
+                        // Print as string if printable, otherwise hex dump
+                        int is_printable = 1;
+                        for (size_t i = 0; i < payload_len; i++) {
+                            if (raw_payload[i] < 32 && raw_payload[i] != '\n' && raw_payload[i] != '\r' && raw_payload[i] != '\t') {
+                                if (raw_payload[i] != 0 || i < payload_len - 1) {
+                                    is_printable = 0;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (is_printable) {
+                            printf("\tMessage: %.*s\n", (int)payload_len, raw_payload);
+                        } else {
+                            printf("\tData (hex): ");
                             for (size_t i = 0; i < payload_len; i++) {
-                                printf("%02X ", payload[i]);
-                                if ((i + 1) % 16 == 0 && i + 1 < payload_len) printf("\n            ");
+                                printf("%02X ", raw_payload[i]);
+                                if ((i + 1) % 16 == 0 && i + 1 < payload_len) printf("\n\t            ");
                             }
                             printf("\n");
                         }
@@ -677,7 +756,7 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                 }
 
                 if (need_response && g_ble_manager) {
-                    /* Serialize and send response */
+                    // Serialize and send response
                     uint8_t resp_payload[KEY_EXCHANGE_EXT_SIZE];
                     const size_t resp_len = serialize_key_exchange_ext(&response, resp_payload,
                                                                       sizeof(resp_payload));

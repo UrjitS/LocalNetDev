@@ -1281,11 +1281,11 @@ gboolean ble_send_route_reply(ble_node_manager_t *manager, const uint32_t target
     return ble_send_data(manager, target_id, buffer, total_len);
 }
 
-uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destination_id,
-                          const uint8_t *payload, const size_t payload_len) {
+uint16_t ble_send_message(ble_node_manager_t * manager, const uint32_t destination_id,
+                          const uint8_t * payload, const size_t payload_len) {
     if (!manager || !manager->mesh_node || !payload || payload_len == 0) return 0;
 
-    struct mesh_node *node = manager->mesh_node;
+    struct mesh_node * node = manager->mesh_node;
 
     struct forwarding_decision decision;
     uint8_t ttl = MAX_HOP_COUNT;
@@ -1296,6 +1296,126 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
         seq_num = node->packet_queue->next_sequence_number;
     }
 
+    // Check if we have an OOB_VERIFIED session for this destination
+    struct encryption_session * session = NULL;
+    if (manager->session_mgr) {
+        session = session_find_by_peer(manager->session_mgr, destination_id);
+        if (session && session->state != SESSION_STATE_OOB_VERIFIED) {
+            session = NULL;
+        }
+    }
+
+    if (session) {
+        // Encrypted send path
+        struct header header = {
+            .protocol_version = PROTOCOL_VERSION,
+            .message_type = MSG_DATA,
+            .fragmentation_flag = 0,
+            .fragmentation_number = 0,
+            .total_fragments = 1,
+            .time_to_live = MAX_HOP_COUNT,
+            .payload_length = (uint16_t)payload_len,
+            .sequence_number = seq_num
+        };
+
+        struct network network = {
+            .source_id = manager->device_id,
+            .destination_id = destination_id
+        };
+
+        // Serialize header and network for MAC computation
+        uint8_t header_bytes[8];
+        uint8_t network_bytes[8];
+        serialize_header(&header, header_bytes, sizeof(header_bytes));
+        serialize_network(&network, network_bytes, sizeof(network_bytes));
+
+        // Encrypt the payload
+        uint8_t * ciphertext = NULL;
+        size_t ciphertext_len = 0;
+        struct security_block sec_block;
+
+        int enc_result = encrypt_frame(manager->session_mgr, destination_id,
+                                       header_bytes, sizeof(header_bytes),
+                                       network_bytes, sizeof(network_bytes),
+                                       payload, payload_len,
+                                       &ciphertext, &ciphertext_len, &sec_block);
+
+        if (enc_result != ENC_SUCCESS) {
+            log_error(BT_TAG, "Failed to encrypt payload for 0x%08X (error: %d)",
+                      destination_id, enc_result);
+            return 0;
+        }
+
+        // Build the protocol security struct from our security_block
+        struct security sec = {
+            .key_id = sec_block.key_id,
+            .frame_counter = sec_block.frame_counter,
+        };
+        memcpy(sec.nonce, sec_block.nonce, 7);
+        memcpy(sec.mac, sec_block.mac, 12);
+
+        // Assemble and serialize the encrypted packet
+        const struct packet pkt = {
+            .header = &header,
+            .network = &network,
+            .payload = ciphertext,
+            .security = &sec
+        };
+
+        uint8_t buffer[MAX_BLE_PAYLOAD_SIZE];
+        const size_t total_len = serialize_packet(&pkt, buffer, sizeof(buffer));
+        free(ciphertext);
+
+        if (total_len == 0) {
+            log_error(BT_TAG, "Failed to serialize encrypted data packet");
+            return 0;
+        }
+
+        const uint32_t current_time_ms = get_current_timestamp() * 1000;
+
+        if (decision.action == 0) {
+            if (node->packet_queue) {
+                seq_num = queue_packet_for_transmission(node->packet_queue, destination_id,
+                                                        buffer, total_len, current_time_ms);
+            }
+            if (ble_send_data(manager, decision.next_hop, buffer, total_len)) {
+                log_info(BT_TAG, "Sent encrypted message to 0x%08X via 0x%08X (seq: %u, fc: %u)",
+                         destination_id, decision.next_hop, seq_num, sec_block.frame_counter);
+                return seq_num;
+            }
+        } else if (decision.action == -2) {
+            if (node->packet_queue) {
+                seq_num = queue_packet_for_transmission(node->packet_queue, destination_id,
+                                                        buffer, total_len, current_time_ms);
+                struct pending_packet * pkt_entry = get_pending_packet(node->packet_queue, seq_num);
+                if (pkt_entry) {
+                    pkt_entry->state = PACKET_STATE_AWAITING_ROUTE;
+                }
+            }
+
+            if (!has_pending_route_discovery(node, destination_id)) {
+                const uint32_t request_id = ble_initiate_route_discovery(manager, destination_id);
+                if (request_id > 0) {
+                    log_info(BT_TAG, "Queued encrypted message for 0x%08X, initiated route discovery (request: 0x%08X)",
+                             destination_id, request_id);
+                    if (node->packet_queue) {
+                        associate_route_request_with_packets(node->packet_queue, destination_id, request_id);
+                    }
+                }
+            } else {
+                log_info(BT_TAG, "Queued encrypted message for 0x%08X, route discovery already pending",
+                         destination_id);
+            }
+            return seq_num;
+        } else {
+            log_error(BT_TAG, "Cannot send encrypted message to 0x%08X: forwarding decision=%d",
+                      destination_id, decision.action);
+        }
+
+        return 0;
+    }
+
+    // Unencrypted send path (no verified session)
     struct header header = {
         .protocol_version = PROTOCOL_VERSION,
         .message_type = MSG_DATA,
@@ -1341,9 +1461,9 @@ uint16_t ble_send_message(ble_node_manager_t *manager, const uint32_t destinatio
     } else if (decision.action == -2) {
         if (node->packet_queue) {
             seq_num = queue_packet_for_transmission(node->packet_queue, destination_id, buffer, total_len, current_time_ms);
-            struct pending_packet *pkt = get_pending_packet(node->packet_queue, seq_num);
-            if (pkt) {
-                pkt->state = PACKET_STATE_AWAITING_ROUTE;
+            struct pending_packet * pkt_entry = get_pending_packet(node->packet_queue, seq_num);
+            if (pkt_entry) {
+                pkt_entry->state = PACKET_STATE_AWAITING_ROUTE;
             }
         }
 
@@ -1490,7 +1610,7 @@ struct session_manager *ble_get_session_manager(ble_node_manager_t *manager) {
     return manager->session_mgr;
 }
 
-int ble_initiate_key_exchange(ble_node_manager_t *manager, uint32_t peer_id) {
+int ble_initiate_key_exchange(ble_node_manager_t * manager, uint32_t peer_id) {
     if (!manager || !manager->session_mgr || !manager->mesh_node) return -1;
 
     struct key_exchange_ext_message kex_msg;
@@ -1499,7 +1619,7 @@ int ble_initiate_key_exchange(ble_node_manager_t *manager, uint32_t peer_id) {
         return -1;
     }
 
-    /* Serialize the key exchange message */
+    // Serialize the key exchange message
     uint8_t kex_payload[KEY_EXCHANGE_EXT_SIZE];
     const size_t kex_len = serialize_key_exchange_ext(&kex_msg, kex_payload, sizeof(kex_payload));
     if (kex_len == 0) {
@@ -1507,7 +1627,7 @@ int ble_initiate_key_exchange(ble_node_manager_t *manager, uint32_t peer_id) {
         return -1;
     }
 
-    /* Build protocol packet */
+    // Build protocol packet
     struct header hdr = {
         .protocol_version = PROTOCOL_VERSION,
         .message_type = MSG_KEY_EXCHANGE,
@@ -1538,7 +1658,7 @@ int ble_initiate_key_exchange(ble_node_manager_t *manager, uint32_t peer_id) {
         return -1;
     }
 
-    /* Send to peer */
+    // Send to peer
     if (!ble_send_data(manager, peer_id, buffer, total)) {
         log_error(BT_TAG, "Failed to send key exchange to 0x%08X", peer_id);
         return -1;

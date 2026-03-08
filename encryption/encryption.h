@@ -18,7 +18,7 @@
 #define NONCE_SIZE                    7
 #define OOB_COMMITMENT_SIZE           4     /* 4 bytes = 8 hex digits */
 #define MASTER_KEY_SIZE               32
-#define AUTH_KEY_SIZE                  32
+#define AUTH_KEY_SIZE                 32
 #define ENCRYPTION_KEY_SIZE           16
 #define STATIC_OOB_TOKEN_MAX_SIZE     64
 #define FRAME_COUNTER_MAX             0xFFFFFFFF
@@ -146,7 +146,7 @@ struct encryption_session {
  * The user must implement this callback to handle OOB presentation
  * (e.g., display on screen, blink LED, generate QR code, etc.)
  */
-typedef void (*oob_display_callback_t)(uint32_t peer_id,
+typedef void (* oob_display_callback_t)(uint32_t peer_id,
                                         const uint8_t short_code[OOB_COMMITMENT_SIZE],
                                         enum oob_method oob_method);
 
@@ -201,18 +201,18 @@ struct key_exchange_ext_message {
  * Initialize the session manager.
  * Must call crypto_init() before this function.
  */
-int session_manager_init(struct session_manager *mgr, uint32_t local_device_id);
+int session_manager_init(struct session_manager * mgr, uint32_t local_device_id);
 
 /** Clean up session manager and securely wipe all key material */
-void session_manager_cleanup(struct session_manager *mgr);
+void session_manager_cleanup(struct session_manager * mgr);
 
 /** Set the OOB display callback */
-void session_manager_set_oob_callback(struct session_manager *mgr,
+void session_manager_set_oob_callback(struct session_manager * mgr,
                                        oob_display_callback_t callback);
 
 /** Set a static OOB token for Static OOB method */
-int session_manager_set_static_oob_token(struct session_manager *mgr,
-                                          const uint8_t *token, size_t token_len);
+int session_manager_set_static_oob_token(struct session_manager * mgr,
+                                          const uint8_t * token, size_t token_len);
 
 /* ========================================================================== */
 /* Key Exchange Functions                                                      */
@@ -223,8 +223,8 @@ int session_manager_set_static_oob_token(struct session_manager *mgr,
  * Generates ephemeral X25519 keypair, creates a PENDING session,
  * and fills kex_out with the message to send.
  */
-int initiate_key_exchange(struct session_manager *mgr, uint32_t peer_id,
-                          struct key_exchange_ext_message *kex_out);
+int initiate_key_exchange(struct session_manager * mgr, uint32_t peer_id,
+                          struct key_exchange_ext_message * kex_out);
 
 /**
  * Handle an incoming key exchange message.
@@ -234,10 +234,10 @@ int initiate_key_exchange(struct session_manager *mgr, uint32_t peer_id,
  * @param need_response  Output: 1 if response_out should be sent, 0 otherwise
  * @return 0 on success, negative on error
  */
-int handle_key_exchange(struct session_manager *mgr, uint32_t peer_id,
-                        const struct key_exchange_ext_message *kex_msg,
-                        struct key_exchange_ext_message *response_out,
-                        int *need_response);
+int handle_key_exchange(struct session_manager * mgr, uint32_t peer_id,
+                        const struct key_exchange_ext_message * kex_msg,
+                        struct key_exchange_ext_message * response_out,
+                        int * need_response);
 
 /* ========================================================================== */
 /* OOB Verification Functions                                                  */
@@ -248,14 +248,14 @@ int handle_key_exchange(struct session_manager *mgr, uint32_t peer_id,
  * On match: session becomes OOB_VERIFIED.
  * On mismatch: session is torn down, keys purged.
  */
-int verify_oob_code(struct session_manager *mgr, uint32_t peer_id,
+int verify_oob_code(struct session_manager * mgr, uint32_t peer_id,
                     const uint8_t user_code[OOB_COMMITMENT_SIZE]);
 
 /**
  * Get the OOB short code for a session (for display purposes).
  * @return 0 on success, -1 if no OOB_PENDING session exists
  */
-int get_oob_code(struct session_manager *mgr, uint32_t peer_id,
+int get_oob_code(struct session_manager * mgr, uint32_t peer_id,
                  uint8_t code_out[OOB_COMMITMENT_SIZE]);
 
 /* ========================================================================== */
@@ -271,13 +271,13 @@ int get_oob_code(struct session_manager *mgr, uint32_t peer_id,
  * @param security_out       Output: security block to attach to frame
  * @return 0 on success, negative error code on failure
  */
-int encrypt_frame(struct session_manager *mgr,
+int encrypt_frame(struct session_manager * mgr,
                   uint32_t destination_id,
-                  const uint8_t *header_data, size_t header_len,
-                  const uint8_t *network_data, size_t network_len,
-                  const uint8_t *plaintext, size_t plaintext_len,
-                  uint8_t **ciphertext_out, size_t *ciphertext_len_out,
-                  struct security_block *security_out);
+                  const uint8_t * header_data, size_t header_len,
+                  const uint8_t * network_data, size_t network_len,
+                  const uint8_t * plaintext, size_t plaintext_len,
+                  uint8_t ** ciphertext_out, size_t * ciphertext_len_out,
+                  struct security_block * security_out);
 
 /**
  * Decrypt an incoming encrypted frame.
@@ -287,36 +287,36 @@ int encrypt_frame(struct session_manager *mgr,
  * @param plaintext_len_out  Output: length of plaintext
  * @return 0 on success, negative error code on failure
  */
-int decrypt_frame(struct session_manager *mgr,
+int decrypt_frame(struct session_manager * mgr,
                   uint32_t source_id,
-                  const uint8_t *header_data, size_t header_len,
-                  const uint8_t *network_data, size_t network_len,
-                  const uint8_t *ciphertext, size_t ciphertext_len,
-                  const struct security_block *security,
-                  uint8_t **plaintext_out, size_t *plaintext_len_out);
+                  const uint8_t * header_data, size_t header_len,
+                  const uint8_t * network_data, size_t network_len,
+                  const uint8_t * ciphertext, size_t ciphertext_len,
+                  const struct security_block * security,
+                  uint8_t ** plaintext_out, size_t * plaintext_len_out);
 
 /* ========================================================================== */
 /* Session Query Functions                                                     */
 /* ========================================================================== */
 
-struct encryption_session *session_find_by_peer(struct session_manager *mgr,
+struct encryption_session *session_find_by_peer(struct session_manager * mgr,
                                                  uint32_t peer_id);
 
-struct encryption_session *session_find_by_key_id(struct session_manager *mgr,
+struct encryption_session *session_find_by_key_id(struct session_manager * mgr,
                                                    uint8_t key_id);
 
-void session_destroy(struct session_manager *mgr, uint32_t peer_id);
+void session_destroy(struct session_manager * mgr, uint32_t peer_id);
 
-int session_needs_rotation(const struct encryption_session *session,
+int session_needs_rotation(const struct encryption_session * session,
                            uint32_t current_time);
 
-size_t session_check_oob_timeouts(struct session_manager *mgr,
+size_t session_check_oob_timeouts(struct session_manager * mgr,
                                    uint32_t current_time);
 
-size_t session_check_lifetimes(struct session_manager *mgr,
+size_t session_check_lifetimes(struct session_manager * mgr,
                                 uint32_t current_time);
 
-size_t session_get_count(const struct session_manager *mgr);
+size_t session_get_count(const struct session_manager * mgr);
 
 const char *session_state_to_string(enum session_state state);
 
@@ -326,11 +326,11 @@ const char *oob_method_to_string(enum oob_method method);
 /* Serialization for Extended Key Exchange Message                             */
 /* ========================================================================== */
 
-size_t serialize_key_exchange_ext(const struct key_exchange_ext_message *kex,
-                                  uint8_t *buffer, size_t buffer_size);
+size_t serialize_key_exchange_ext(const struct key_exchange_ext_message * kex,
+                                  uint8_t * buffer, size_t buffer_size);
 
-int parse_key_exchange_ext(const uint8_t *buffer, size_t buffer_size,
-                           struct key_exchange_ext_message *kex);
+int parse_key_exchange_ext(const uint8_t * buffer, size_t buffer_size,
+                           struct key_exchange_ext_message * kex);
 
 /* ========================================================================== */
 /* Low-Level Crypto Primitives (exposed for testing)                           */
@@ -349,31 +349,31 @@ int ecdh_compute_shared_secret(uint8_t shared_secret[X25519_SHARED_SECRET_SIZE],
                                const uint8_t remote_public_key[X25519_KEY_SIZE]);
 
 /** HKDF-SHA256 derive key material */
-int hkdf_sha256(const uint8_t *input_key_material, size_t ikm_len,
-                const uint8_t *info, size_t info_len,
-                uint8_t *output_key_material, size_t okm_len);
+int hkdf_sha256(const uint8_t * input_key_material, size_t ikm_len,
+                const uint8_t * info, size_t info_len,
+                uint8_t * output_key_material, size_t okm_len);
 
 /** AES-128-CTR encrypt/decrypt (same operation for CTR mode) */
 int aes128_ctr_crypt(const uint8_t key[AES128_KEY_SIZE],
                      const uint8_t iv[AES128_IV_SIZE],
-                     const uint8_t *input, size_t input_len,
-                     uint8_t *output);
+                     const uint8_t * input, size_t input_len,
+                     uint8_t * output);
 
 /** HMAC-SHA256 full output */
-int hmac_sha256(const uint8_t *key, size_t key_len,
-                const uint8_t *data, size_t data_len,
+int hmac_sha256(const uint8_t * key, size_t key_len,
+                const uint8_t * data, size_t data_len,
                 uint8_t output[HMAC_SHA256_SIZE]);
 
 /** HMAC-SHA256 truncated to 96 bits (12 bytes) */
-int hmac_sha256_truncated(const uint8_t *key, size_t key_len,
-                          const uint8_t *data, size_t data_len,
+int hmac_sha256_truncated(const uint8_t * key, size_t key_len,
+                          const uint8_t * data, size_t data_len,
                           uint8_t output[HMAC_SHA256_TRUNCATED_SIZE]);
 
 /** Generate cryptographically secure random bytes */
-void crypto_random_bytes(uint8_t *buffer, size_t len);
+void crypto_random_bytes(uint8_t * buffer, size_t len);
 
 /** Securely wipe memory */
-void crypto_secure_wipe(void *buffer, size_t len);
+void crypto_secure_wipe(void * buffer, size_t len);
 
 #endif /* LOCALNET_ENCRYPTION_H */
 
