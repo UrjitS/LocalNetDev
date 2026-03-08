@@ -2,7 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Utility functions */
+// Utility functions 
 uint16_t calculate_checksum(const uint8_t *data, const size_t length) {
     uint32_t sum = 0;
     for (size_t i = 0; i < length; i++) {
@@ -13,7 +13,7 @@ uint16_t calculate_checksum(const uint8_t *data, const size_t length) {
     return (uint16_t)(sum & 0xFFFF);
 }
 
-/* Serialization functions */
+// Serialization functions 
 size_t serialize_header(const struct header *hdr, uint8_t *buffer, const size_t buffer_size) {
     if (!hdr || !buffer || buffer_size < sizeof(struct header)) return 0;
 
@@ -197,7 +197,7 @@ size_t serialize_packet(const struct packet *pkt, uint8_t *buffer, const size_t 
     return offset;
 }
 
-/* Parsing functions */
+// Parsing functions 
 int parse_header(const uint8_t *buffer, const size_t buffer_size, struct header *hdr) {
     if (!buffer || !hdr || buffer_size < sizeof(struct header)) return -1;
 
@@ -417,7 +417,7 @@ int parse_packet(const uint8_t *buffer, const size_t buffer_size, struct packet 
     return 0;
 }
 
-/* Fragmentation functions */
+// Fragmentation functions 
 int fragment_payload(const uint8_t *payload, const size_t payload_size,
                      struct packet ***fragments_out, size_t *fragment_count_out,
                      const uint32_t source_id, const uint32_t dest_id, const uint16_t sequence_number) {
@@ -494,7 +494,7 @@ void free_fragments(struct packet **fragments, const size_t fragment_count) {
     free(fragments);
 }
 
-/* Reassembly functions */
+// Reassembly functions 
 struct fragment_buffer *create_fragment_buffer(const uint16_t sequence_number, const uint8_t total_fragments) {
     if (total_fragments == 0) return NULL;
 

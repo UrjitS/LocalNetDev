@@ -6,7 +6,7 @@
 #include "../routing/routing.h"
 #include "../protocol/protocol.h"
 
-/* Test Node Creation */
+// Test Node Creation 
 void test_node_creation() {
     printf("Testing node creation...\n");
 
@@ -30,7 +30,7 @@ void test_node_creation() {
     printf("Test passed: Node creation\n\n");
 }
 
-/* Test Connection Management */
+// Test Connection Management 
 void test_connection_management() {
     printf("Testing connection management...\n");
 
@@ -82,7 +82,7 @@ void test_connection_management() {
     printf("Test passed: Connection management\n\n");
 }
 
-/* Test Routing Table */
+// Test Routing Table 
 void test_routing_table() {
     printf("Testing routing table...\n");
 
@@ -132,7 +132,7 @@ void test_routing_table() {
     printf("Test passed: Routing table\n\n");
 }
 
-/* Test Route Discovery */
+// Test Route Discovery 
 void test_route_discovery() {
     printf("Testing route discovery...\n");
 
@@ -168,7 +168,7 @@ void test_route_discovery() {
     printf("Test passed: Route discovery\n\n");
 }
 
-/* Test Enhanced Route Request Creation */
+// Test Enhanced Route Request Creation 
 void test_create_route_request() {
     printf("Testing create_route_request...\n");
 
@@ -196,7 +196,7 @@ void test_create_route_request() {
     printf("Test passed: Create route request\n\n");
 }
 
-/* Test Handle Route Request - Destination Case */
+// Test Handle Route Request - Destination Case 
 void test_handle_route_request_destination() {
     printf("Testing handle_route_request (destination case)...\n");
 
@@ -237,7 +237,7 @@ void test_handle_route_request_destination() {
     printf("Test passed: Handle route request (destination)\n\n");
 }
 
-/* Test Handle Route Request - Intermediate Node Case */
+// Test Handle Route Request - Intermediate Node Case 
 void test_handle_route_request_intermediate() {
     printf("Testing handle_route_request (intermediate case)...\n");
 
@@ -272,7 +272,7 @@ void test_handle_route_request_intermediate() {
     printf("Test passed: Handle route request (intermediate)\n\n");
 }
 
-/* Test Handle Route Request - Cached Route Case */
+// Test Handle Route Request - Cached Route Case 
 void test_handle_route_request_cached() {
     printf("Testing handle_route_request (cached route case)...\n");
 
@@ -305,7 +305,7 @@ void test_handle_route_request_cached() {
     printf("Test passed: Handle route request (cached)\n\n");
 }
 
-/* Test Create Route Reply */
+// Test Create Route Reply 
 void test_create_route_reply() {
     printf("Testing create_route_reply...\n");
 
@@ -333,7 +333,7 @@ void test_create_route_reply() {
     printf("Test passed: Create route reply\n\n");
 }
 
-/* Test Handle Route Reply - Originator Case */
+// Test Handle Route Reply - Originator Case 
 void test_handle_route_reply_originator() {
     printf("Testing handle_route_reply (originator case)...\n");
 
@@ -383,7 +383,7 @@ void test_handle_route_reply_originator() {
     printf("Test passed: Handle route reply (originator)\n\n");
 }
 
-/* Test Handle Route Reply - Intermediate Node Case */
+// Test Handle Route Reply - Intermediate Node Case 
 void test_handle_route_reply_intermediate() {
     printf("Testing handle_route_reply (intermediate case)...\n");
 
@@ -421,7 +421,7 @@ void test_handle_route_reply_intermediate() {
     printf("Test passed: Handle route reply (intermediate)\n\n");
 }
 
-/* Test Pending Route Request Management */
+// Test Pending Route Request Management 
 void test_pending_route_requests() {
     printf("Testing pending route request management...\n");
 
@@ -453,7 +453,7 @@ void test_pending_route_requests() {
     printf("Test passed: Pending route request management\n\n");
 }
 
-/* Test Route Request Timeouts */
+// Test Route Request Timeouts 
 void test_route_request_timeouts() {
     printf("Testing route request timeouts...\n");
 
@@ -492,7 +492,7 @@ void test_route_request_timeouts() {
     printf("Test passed: Route request timeouts\n\n");
 }
 
-/* Test Get Connected Neighbors */
+// Test Get Connected Neighbors 
 void test_get_connected_neighbors() {
     printf("Testing get_connected_neighbors...\n");
 
@@ -521,7 +521,7 @@ void test_get_connected_neighbors() {
     printf("Test passed: Get connected neighbors\n\n");
 }
 
-/* Test Full Route Discovery Scenario */
+// Test Full Route Discovery Scenario 
 void test_full_route_discovery_scenario() {
     printf("Testing full route discovery scenario...\n");
 
@@ -608,7 +608,7 @@ void test_full_route_discovery_scenario() {
     printf("Test passed: Full route discovery scenario\n\n");
 }
 
-/* Test Packet Forwarding */
+// Test Packet Forwarding 
 void test_packet_forwarding() {
     printf("Testing packet forwarding...\n");
 
@@ -650,7 +650,7 @@ void test_packet_forwarding() {
     printf("Test passed: Packet forwarding\n\n");
 }
 
-/* Test Heartbeat and Timeouts */
+// Test Heartbeat and Timeouts 
 void test_heartbeat() {
     printf("Testing heartbeat mechanism...\n");
 
@@ -684,7 +684,7 @@ void test_heartbeat() {
     printf("Test passed: Heartbeats\n\n");
 }
 
-/* Test Discovery Timing */
+// Test Discovery Timing 
 void test_discovery_timing() {
     printf("Testing discovery timing...\n");
 
@@ -720,7 +720,7 @@ void test_discovery_timing() {
     printf("Test passed: Discovery timing\n\n");
 }
 
-/* Test Link Quality Calculation */
+// Test Link Quality Calculation 
 void test_link_quality() {
     printf("Testing link quality calculation...\n");
 
@@ -744,7 +744,7 @@ void test_link_quality() {
     printf("Test passed: Link quality calculation\n\n");
 }
 
-/* Test Complete Mesh Network Scenario */
+// Test Complete Mesh Network Scenario 
 void test_mesh_network_scenario() {
     printf("Testing complete mesh network scenario...\n");
 
@@ -802,7 +802,7 @@ void test_mesh_network_scenario() {
     printf("Test passed: Complete mesh network scenario\n\n");
 }
 
-/* Test Pending Packet Queue */
+// Test Pending Packet Queue 
 void test_pending_packet_queue() {
     printf("Testing pending packet queue...\n");
 
@@ -857,7 +857,7 @@ void test_pending_packet_queue() {
     printf("Test passed: Pending packet queue\n\n");
 }
 
-/* Test Forwarding Decision */
+// Test Forwarding Decision 
 void test_forwarding_decision() {
     printf("Testing forwarding decision...\n");
 
@@ -899,7 +899,7 @@ void test_forwarding_decision() {
     printf("Test passed: Forwarding decision\n\n");
 }
 
-/* Test Route Cost Updates */
+// Test Route Cost Updates 
 void test_route_cost_updates() {
     printf("Testing route cost updates...\n");
 
@@ -928,7 +928,7 @@ void test_route_cost_updates() {
     printf("Test passed: Route cost updates\n\n");
 }
 
-/* Test Route Discovery with Packet Queue */
+// Test Route Discovery with Packet Queue 
 void test_route_discovery_with_queue() {
     printf("Testing route discovery with packet queue...\n");
 

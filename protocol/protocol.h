@@ -31,7 +31,7 @@ struct header {
     uint16_t sequence_number;
 };
 
-/* Network header: 8 bytes */
+// Network header: 8 bytes 
 struct network {
     // Origin device unique identifier. 32 bits
     uint32_t source_id;
@@ -39,7 +39,7 @@ struct network {
     uint32_t destination_id;
 };
 
-/* Security block (1 + 4 + 7 + 12 = 24 bytes) */
+// Security block (1 + 4 + 7 + 12 = 24 bytes) 
 struct security {
     // Which session key to use. 8 bits (1 byte)
     uint8_t key_id;
@@ -51,7 +51,7 @@ struct security {
     uint8_t mac[12];
 };
 
-/* Packet */
+// Packet 
 struct packet {
     struct header *header;
     struct network *network;
@@ -70,7 +70,7 @@ struct discovery_message {
     uint32_t timestamp;
 };
 
-/* Route request: reverse_path is variable length array of 32-bit device ids */
+// Route request: reverse_path is variable length array of 32-bit device ids 
 struct route_request {
     uint32_t request_id;
     uint32_t destination_id;
@@ -79,7 +79,7 @@ struct route_request {
     uint32_t * reverse_path;   // Pointer to array of device IDs (reverse path)
 };
 
-/* Route reply: forward_path is variable length array of 32-bit device ids */
+// Route reply: forward_path is variable length array of 32-bit device ids 
 struct route_reply {
     uint32_t request_id;
     uint8_t route_cost;
@@ -93,7 +93,7 @@ struct heartbeat {
     uint32_t timestamp;
 };
 
-/* Acknowledgement: received_fragment_list is a list of received fragment indices */
+// Acknowledgement: received_fragment_list is a list of received fragment indices 
 struct acknowledgement {
     uint16_t sequence_number;
     uint8_t status_code;
@@ -101,14 +101,14 @@ struct acknowledgement {
     uint8_t * received_fragment_list;
 };
 
-/* Key exchange message: public key is 32 bytes */
+// Key exchange message: public key is 32 bytes 
 struct key_exchange_message {
     uint8_t public_key[32];
     uint32_t timestamp;
 };
 
 
-/* Status codes */
+// Status codes 
 enum STATUS_CODE {
     SUCCESS = 0x00,
     ROUTE_NOT_FOUND = 0x01,
@@ -119,7 +119,7 @@ enum STATUS_CODE {
     INVALID_MESSAGE = 0x06
 };
 
-/* Message types */
+// Message types 
 enum MESSAGE_TYPE {
     MSG_DATA = 0x0,
     MSG_DISCOVERY = 0x1,
@@ -130,7 +130,7 @@ enum MESSAGE_TYPE {
     MSG_KEY_EXCHANGE = 0x6
 };
 
-/* Fragment reassembly state */
+// Fragment reassembly state 
 struct fragment_buffer {
     uint16_t sequence_number;
     uint8_t total_fragments;
@@ -141,7 +141,7 @@ struct fragment_buffer {
     uint32_t timestamp;        // For timeout tracking
 };
 
-/* Serialization functions */
+// Serialization functions 
 size_t serialize_header(const struct header *hdr, uint8_t *buffer, size_t buffer_size);
 size_t serialize_network(const struct network *net, uint8_t *buffer, size_t buffer_size);
 size_t serialize_security(const struct security *sec, uint8_t *buffer, size_t buffer_size);
@@ -153,7 +153,7 @@ size_t serialize_acknowledgement(const struct acknowledgement *ack, uint8_t *buf
 size_t serialize_key_exchange(const struct key_exchange_message *kex, uint8_t *buffer, size_t buffer_size);
 size_t serialize_packet(const struct packet *pkt, uint8_t *buffer, size_t buffer_size);
 
-/* Parsing functions */
+// Parsing functions 
 int parse_header(const uint8_t *buffer, size_t buffer_size, struct header *hdr);
 int parse_network(const uint8_t *buffer, size_t buffer_size, struct network *net);
 int parse_security(const uint8_t *buffer, size_t buffer_size, struct security *sec);
@@ -165,20 +165,20 @@ int parse_acknowledgement(const uint8_t *buffer, size_t buffer_size, struct ackn
 int parse_key_exchange(const uint8_t *buffer, size_t buffer_size, struct key_exchange_message *kex);
 int parse_packet(const uint8_t *buffer, size_t buffer_size, struct packet *pkt);
 
-/* Fragmentation functions */
+// Fragmentation functions 
 int fragment_payload(const uint8_t *payload, size_t payload_size,
                      struct packet ***fragments_out, size_t *fragment_count_out,
                      uint32_t source_id, uint32_t dest_id, uint16_t sequence_number);
 void free_fragments(struct packet **fragments, size_t fragment_count);
 
-/* Reassembly functions */
+// Reassembly functions 
 struct fragment_buffer *create_fragment_buffer(uint16_t sequence_number, uint8_t total_fragments);
 void free_fragment_buffer(struct fragment_buffer *fragment_buffer);
 int add_fragment(struct fragment_buffer *fragment_buffer, uint8_t fragment_num, const uint8_t *payload, uint16_t payload_size);
 int is_complete(const struct fragment_buffer *fragment_buffer);
 size_t reassemble_payload(const struct fragment_buffer *fragment_buffer, uint8_t *output, size_t output_size);
 
-/* Utility functions */
+// Utility functions 
 uint16_t calculate_checksum(const uint8_t *data, size_t length);
 
 #endif
