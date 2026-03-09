@@ -145,7 +145,7 @@ static void cmd_discover_route(void) {
 
     uint32_t dest_id;
     if (parse_node_id(input, &dest_id) != 0) {
-        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        fprintf(stderr, "Invalid node ID format.\n");
         return;
     }
 
@@ -181,7 +181,7 @@ static void cmd_send_message(void) {
 
     uint32_t dest_id;
     if (parse_node_id(input, &dest_id) != 0) {
-        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        fprintf(stderr, "Invalid node ID format.\n");
         return;
     }
 
@@ -273,37 +273,21 @@ static void cmd_show_pending_packets(void) {
     printf("\n");
 }
 
-/* ========================================================================== */
-/* OOB Display Callback                                                        */
-/* ========================================================================== */
-
-/**
- * Default OOB display callback.
- * Displays the OOB short code on the terminal.
- * Users should replace this with their own implementation
- * (e.g., QR code display, LED blink pattern, NFC write).
- */
-static void on_oob_display(uint32_t peer_id,
-                           const uint8_t short_code[OOB_COMMITMENT_SIZE],
-                           enum oob_method method) {
+static void on_oob_display(const uint32_t peer_id, const uint8_t short_code[OOB_COMMITMENT_SIZE], const enum oob_method method) {
     printf("\n");
-    printf("************************************************************\n");
-    printf("  OOB VERIFICATION REQUIRED\n");
-    printf("************************************************************\n");
-    printf("  Peer Node:  0x%08X\n", peer_id);
-    printf("  OOB Method: %s\n", oob_method_to_string(method));
-    printf("  Short Code: %02X%02X%02X%02X\n",
+    printf("--------------------------------------------------------------------\n");
+    printf("OOB VERIFICATION REQUIRED\n");
+    printf("--------------------------------------------------------------------\n");
+    printf("\t Peer Node:  0x%08X\n", peer_id);
+    printf("\t OOB Method: %s\n", oob_method_to_string(method));
+    printf("\t Short Code: %02X%02X%02X%02X\n",
            short_code[0], short_code[1], short_code[2], short_code[3]);
     printf("\n");
-    printf("  Verify this code matches on the peer device.\n");
-    printf("  Then use menu option [9] to confirm.\n");
-    printf("************************************************************\n");
+    printf("\t Verify this code matches on the peer device.\n");
+    printf("\t Then use menu option [9] to confirm.\n");
+    printf("--------------------------------------------------------------------\n");
     printf("\n");
 }
-
-/* ========================================================================== */
-/* Encryption Menu Commands                                                    */
-/* ========================================================================== */
 
 static void cmd_initiate_key_exchange(void) {
     if (!g_ble_manager) {
@@ -322,7 +306,7 @@ static void cmd_initiate_key_exchange(void) {
 
     uint32_t peer_id;
     if (parse_node_id(input, &peer_id) != 0) {
-        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        fprintf(stderr, "Invalid node ID format.\n");
         return;
     }
 
@@ -345,8 +329,7 @@ static void cmd_show_sessions(void) {
     printf("--------------------------------------------------------------------\n");
     printf("ENCRYPTION SESSIONS\n");
     printf("--------------------------------------------------------------------\n");
-    printf("\t %-12s %-14s %-12s %-8s %-8s\n",
-           "Peer", "State", "OOB Method", "TX Cnt", "RX Cnt");
+    printf("\t %-12s %-14s %-12s %-8s %-8s\n", "Peer", "State", "OOB Method", "TX Cnt", "RX Cnt");
     printf("--------------------------------------------------------------------\n");
 
     size_t count = 0;
@@ -385,7 +368,7 @@ static void cmd_verify_oob(void) {
 
     uint32_t peer_id;
     if (parse_node_id(input, &peer_id) != 0) {
-        fprintf(stderr, "Invalid node ID format. Use hex format like 0x12345678\n");
+        fprintf(stderr, "Invalid node ID format.\n");
         return;
     }
 
@@ -618,7 +601,7 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                     const size_t payload_offset = 16;
                     const size_t payload_len = hdr.payload_length;
                     const size_t expected_unencrypted = payload_offset + payload_len;
-                    const size_t expected_encrypted = expected_unencrypted + 24; // 24 = security block size
+                    const size_t expected_encrypted = expected_unencrypted + 24;
 
                     if (payload_offset + payload_len > len) {
                         log_error(TAG, "Invalid payload length in data message");
@@ -653,7 +636,7 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                         // Decrypt the payload
                         uint8_t * plaintext = NULL;
                         size_t plaintext_len = 0;
-                        int dec_result = decrypt_frame(&g_session_mgr, net.source_id,
+                        const int dec_result = decrypt_frame(&g_session_mgr, net.source_id,
                                                        header_bytes, sizeof(header_bytes),
                                                        network_bytes, sizeof(network_bytes),
                                                        raw_payload, payload_len,
@@ -661,13 +644,12 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                                                        &plaintext, &plaintext_len);
 
                         if (dec_result != ENC_SUCCESS) {
-                            log_error(TAG, "Failed to decrypt message from 0x%08X (error: %d)",
-                                      net.source_id, dec_result);
+                            log_error(TAG, "Failed to decrypt message from 0x%08X (error: %d)", net.source_id, dec_result);
                             break;
                         }
 
                         // Display decrypted message
-                        printf("\n\xF0\x9F\x94\x92 ENCRYPTED MESSAGE FROM 0x%08X\n", net.source_id);
+                        printf("\nENCRYPTED MESSAGE FROM 0x%08X\n", net.source_id);
                         printf("\tSequence: %u\n", hdr.sequence_number);
                         printf("\tTTL: %u\n", hdr.time_to_live);
                         printf("\tLength: %zu bytes (encrypted)\n", plaintext_len);
@@ -698,7 +680,7 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                         printf("\n");
                         free(plaintext);
                     } else {
-                        // Unencrypted message (no security block)
+                        // Unencrypted message
                         printf("\nMESSAGE FROM 0x%08X\n", net.source_id);
                         printf("\tSequence: %u\n", hdr.sequence_number);
                         printf("\tTTL: %u\n", hdr.time_to_live);
@@ -777,7 +759,7 @@ static void on_data_received(const uint32_t sender_id, const uint8_t * data, con
                             .destination_id = sender_id
                         };
 
-                        struct packet resp_pkt = {
+                        const struct packet resp_pkt = {
                             .header = &resp_hdr,
                             .network = &resp_net,
                             .payload = resp_payload,

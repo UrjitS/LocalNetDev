@@ -874,8 +874,11 @@ int decrypt_frame(struct session_manager * mgr,
         return ENC_ERROR_SESSION_UNVERIFIED;
     }
 
-    // Replay protection 
-    if (security->frame_counter != session->recv_frame_counter) {
+    // Replay protection: reject frames with a counter below expected
+    // (duplicates / replays, e.g. same frame arriving via a relay node).
+    // Accept frames with counter >= expected to tolerate gaps caused by
+    // frames the sender transmitted while we were still in OOB_PENDING.
+    if (security->frame_counter < session->recv_frame_counter) {
         return ENC_ERROR_COUNTER_MISMATCH;
     }
 
@@ -917,8 +920,11 @@ int decrypt_frame(struct session_manager * mgr,
     * plaintext_out = plaintext;
     * plaintext_len_out = ciphertext_len;
 
-    // Advance expected counter 
-    session->recv_frame_counter++;
+    // Advance expected counter past the received frame counter.
+    // This may skip values when frames were dropped while we were
+    // in OOB_PENDING state (the sender's counter advanced but we
+    // never processed those frames).
+    session->recv_frame_counter = security->frame_counter + 1;
     session->last_activity = (uint32_t)time(NULL);
 
     return ENC_SUCCESS;
